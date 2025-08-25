@@ -1,0 +1,18 @@
+{
+  "name": "passobot-pro",
+  "version": "1.0.0",
+  "description": "Two-browser Passo seat transfer bot — professionally modularized.",
+  "type": "commonjs",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "@antiadmin/anticaptchaofficial": "^1.0.52",
+    "axios": "^1.10.0",
+    "express": "^5.1.0",
+    "puppeteer-real-browser": "^1.4.2"
+  }
+}
