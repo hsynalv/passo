@@ -9,10 +9,13 @@
     "dev": "nodemon src/index.js"
   },
   "dependencies": {
-    "dotenv": "^16.4.5",
     "@antiadmin/anticaptchaofficial": "^1.0.52",
     "axios": "^1.10.0",
+    "dotenv": "^16.4.5",
     "express": "^5.1.0",
-    "puppeteer-real-browser": "^1.4.2"
+    "express-rate-limit": "^8.2.1",
+    "puppeteer-real-browser": "^1.4.2",
+    "winston": "^3.19.0",
+    "zod": "^4.2.1"
   }
 }

@@ -1,0 +1,26 @@
+{
+  "team": "GS",
+  "ticketType": "combined",
+  "eventAddress": "https://www.passo.com.tr/tr/etkinlik/...",
+  "categoryType": "Kategori 1",
+  "alternativeCategory": "Kategori 2",
+  "prioritySale": false,
+  "fanCardCode": null,
+  "identity": null,
+  "email": "accountA@mail.com",
+  "password": "passA",
+  "cardHolder": "NAME SURNAME",
+  "cardNumber": "4111 1111 1111 1111",
+  "expiryMonth": "12",
+  "expiryYear": "29",
+  "cvv": "123",
+  "proxyHost": null,
+  "proxyPort": null,
+  "proxyUsername": null,
+  "proxyPassword": null,
+  "email2": "accountB@mail.com",
+  "password2": "passB"
+}
+
+
+
