@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Passobot Panel</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div>
+        <div class="title">Passobot Panel</div>
+        <div class="subtitle">Bot başlat / durumu izle / canlı log</div>
+      </div>
+      <div class="status" id="connStatus">Disconnected</div>
+    </header>
+
+    <main class="grid">
+      <section class="card">
+        <h2>Bot Ayarları</h2>
+        <form id="botForm" class="form">
+          <div class="row">
+            <label>Event URL</label>
+            <input name="eventAddress" type="url" placeholder="https://www.passo.com.tr/.../koltuk-secim" required />
+          </div>
+
+          <div class="row2">
+            <div class="row">
+              <label>Team</label>
+              <input name="team" type="text" placeholder="GS" required />
+            </div>
+            <div class="row">
+              <label>Ticket Type</label>
+              <select name="ticketType">
+                <option value="regular">regular</option>
+                <option value="combined">combined</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="row2">
+            <div class="row">
+              <label>Category Mode</label>
+              <select name="categorySelectionMode">
+                <option value="svg">svg</option>
+                <option value="scan">scan</option>
+                <option value="legacy">legacy</option>
+              </select>
+            </div>
+            <div class="row">
+              <label>Priority Sale</label>
+              <select name="prioritySale">
+                <option value="on">on</option>
+                <option value="off">off</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="row2">
+            <div class="row">
+              <label>Kategori (categoryType)</label>
+              <input name="categoryType" type="text" placeholder="Maraton" />
+            </div>
+            <div class="row">
+              <label>Alternatif Kategori</label>
+              <input name="alternativeCategory" type="text" placeholder="Kale Arkası" />
+            </div>
+          </div>
+
+          <div class="row2">
+            <div class="row">
+              <label>A Hesapları</label>
+              <div class="pill muted">Birden fazla A hesabı ekleyebilirsin</div>
+            </div>
+            <div class="row" style="align-items:flex-end">
+              <button type="button" id="btnAddA">+ A Ekle</button>
+            </div>
+          </div>
+
+          <div id="aAccounts" class="accountList"></div>
+
+          <div class="row2">
+            <div class="row">
+              <label>B Hesapları</label>
+              <div class="pill muted">Birden fazla B hesabı ekleyebilirsin</div>
+            </div>
+            <div class="row" style="align-items:flex-end">
+              <button type="button" id="btnAddB">+ B Ekle</button>
+            </div>
+          </div>
+
+          <div id="bAccounts" class="accountList"></div>
+
+          <details class="details">
+            <summary>Öncelikli Satış Bilgileri (opsiyonel)</summary>
+            <div class="row2">
+              <div class="row">
+                <label>TCKN (identity)</label>
+                <input name="identity" type="text" inputmode="numeric" placeholder="12345678901" />
+              </div>
+              <div class="row">
+                <label>Fan Card</label>
+                <input name="fanCardCode" type="text" placeholder="" />
+              </div>
+            </div>
+          </details>
+
+          <div class="actions">
+            <button type="submit" id="btnStart">Start (Async)</button>
+            <button type="button" id="btnClear">Clear Logs</button>
+          </div>
+
+          <div class="run">
+            <div><span class="muted">runId:</span> <code id="runId">-</code></div>
+            <div><span class="muted">status:</span> <code id="runStatus">-</code></div>
+          </div>
+
+          <section class="subcard">
+            <h3>Run Kontrolleri</h3>
+            <div class="hint" style="margin-top:0">Bu işlemler için önce run başlatılmış olmalı.</div>
+
+            <div class="row2" style="margin-top:10px">
+              <div class="row">
+                <label>C Email</label>
+                <input id="cEmail" type="email" placeholder="c@mail.com" />
+              </div>
+              <div class="row">
+                <label>C Password</label>
+                <input id="cPassword" type="password" placeholder="******" />
+              </div>
+            </div>
+            <div class="actions" style="margin-top:10px">
+              <button type="button" id="btnRegisterC">C Register</button>
+            </div>
+
+            <details class="details" style="margin-top:10px">
+              <summary>Finalize (Ödeme) Bilgileri (opsiyonel)</summary>
+              <div class="row2" style="margin-top:10px">
+                <div class="row">
+                  <label>Identity (TCKN)</label>
+                  <input id="finIdentity" type="text" inputmode="numeric" placeholder="12345678901" />
+                </div>
+                <div class="row">
+                  <label>Card Holder</label>
+                  <input id="finCardHolder" type="text" placeholder="AD SOYAD" />
+                </div>
+              </div>
+              <div class="row2">
+                <div class="row">
+                  <label>Card Number</label>
+                  <input id="finCardNumber" type="text" inputmode="numeric" placeholder="0000 0000 0000 0000" />
+                </div>
+                <div class="row">
+                  <label>Expiry (MM / YY)</label>
+                  <div class="expiryRow">
+                    <input id="finExpiryMonth" type="text" inputmode="numeric" placeholder="MM" />
+                    <input id="finExpiryYear" type="text" inputmode="numeric" placeholder="YY" />
+                  </div>
+                </div>
+              </div>
+              <div class="row2">
+                <div class="row">
+                  <label>CVV</label>
+                  <input id="finCvv" type="password" inputmode="numeric" placeholder="***" />
+                </div>
+                <div class="row" style="justify-content:flex-end">
+                  <label class="chk" style="margin-top:22px"><input id="finAutoPay" type="checkbox" /> autoPay</label>
+                </div>
+              </div>
+            </details>
+
+            <div class="actions" style="margin-top:10px">
+              <button type="button" id="btnFinalize" class="btnDanger">Finalize İste (Soft)</button>
+            </div>
+          </section>
+
+          <div class="hint">
+            Not: Şimdilik UI global log stream gösterir. Sonraki adımda runId bazlı filtre ekleyebiliriz.
+          </div>
+        </form>
+      </section>
+
+      <section class="card logs">
+        <div class="logsHeader">
+          <h2>Durum & Bilgilendirme</h2>
+          <div class="logsControls">
+            <label class="chk"><input id="autoScrollStatus" type="checkbox" checked /> auto-scroll</label>
+          </div>
+        </div>
+        <pre id="statusBox" class="logBox statusBox"></pre>
+
+        <div class="logsHeader" style="margin-top:12px;border-top:1px dashed var(--border);padding-top:8px">
+          <h2>Tüm Loglar</h2>
+          <div class="logsControls">
+            <input id="logFilter" type="text" placeholder="Filter (text)" />
+            <label class="chk"><input id="autoScroll" type="checkbox" checked /> auto-scroll</label>
+          </div>
+        </div>
+        <pre id="logBox" class="logBox"></pre>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

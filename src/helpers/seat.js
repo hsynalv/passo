@@ -175,13 +175,30 @@ async function recoverIfRedirected(page, context, label, expectedUrlIncludes, re
     }
   }
 
+  // If recoveryUrl is a login page with returnUrl, navigate directly to decoded returnUrl.
+  // Otherwise we can get stuck in a loop: /giris -> /giris.
+  let effectiveRecoveryUrl = String(recoveryUrl);
   try {
-    await page.goto(String(recoveryUrl), { waitUntil: 'domcontentloaded', timeout: 45000 });
+    if (/\/giris(\?|$)/i.test(effectiveRecoveryUrl)) {
+      const u = new URL(effectiveRecoveryUrl);
+      let ru = u.searchParams.get('returnUrl');
+      if (ru) {
+        try { ru = decodeURIComponent(ru); } catch {}
+        if (!/^https?:\/\//i.test(ru)) {
+          ru = `https://www.passo.com.tr${ru.startsWith('/') ? '' : '/'}${ru}`;
+        }
+        effectiveRecoveryUrl = ru;
+      }
+    }
+  } catch {}
+
+  try {
+    await page.goto(String(effectiveRecoveryUrl), { waitUntil: 'domcontentloaded', timeout: 45000 });
   } catch {}
 
   if (ensureTurnstileFn && email) {
     try {
-      await ensureTurnstileFn(page, email, `seatPick:${context}:${label}`);
+      await ensureTurnstileFn(page, email, `seatPick:${context}:${label}`, { background: true });
     } catch {}
   }
 
@@ -284,7 +301,7 @@ async function ensureSingleProductQuantity(page, context) {
 
 /** A: random seat seç + sepet doğrulaması (re-click yok) */
 async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
-  maxMs = maxMs || cfg.TIMEOUTS.SEAT_PICK_MAX;
+  maxMs = maxMs || cfg.TIMEOUTS.SEAT_PICK_MAX || cfg.TIMEOUTS.SEAT_SELECTION_MAX;
   const startTs = Date.now();
   const initialEnd = startTs + maxMs;
   let end = initialEnd;
@@ -293,6 +310,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
   const recoveryUrl = options.recoveryUrl || null;
   const context = options.context || 'A';
   const email = options.email || null;
+  const roamCategoryTexts = Array.isArray(options.roamCategoryTexts) ? options.roamCategoryTexts.filter(Boolean).map(x => String(x).trim()).filter(Boolean) : [];
   const ensureTurnstileFn = options.ensureTurnstileTokenOnPage || options.ensureTurnstileFn || null;
   const reloginIfRedirected = typeof options.reloginIfRedirected === 'function' ? options.reloginIfRedirected : null;
   const password = options.password || null;
@@ -323,25 +341,73 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
     lastDiagAt = now;
     try {
       const snap = await page.evaluate((lbl, sel) => {
-        const bodyText = (document.body?.innerText || '').toLowerCase();
+        const seatmapEl = document.querySelector('svg.seatmap-svg')
+          || document.querySelector('#seatmap, .seatmap, .seatmapArea, .seatMap, .seatmap-container')
+          || null;
+        const rect = seatmapEl ? seatmapEl.getBoundingClientRect() : null;
+        const vh = (window.innerHeight || document.documentElement.clientHeight || 0);
+        const vw = (window.innerWidth || document.documentElement.clientWidth || 0);
+        const inViewport = !!(rect && rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < vh && rect.left < vw);
+
+        const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
         const allRects = Array.from(document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect'));
+        const normFill = (r) => {
+          const attr = (r.getAttribute('fill') || '').toLowerCase();
+          if (attr) return attr;
+          const st = (r.getAttribute('style') || '').toLowerCase();
+          const m = st.match(/fill\s*:\s*([^;]+)/i);
+          return (m && m[1] ? m[1].trim() : '');
+        };
         const selectableRects = allRects.filter(r => {
           const pe = (r.getAttribute('pointer-events') || '').toLowerCase();
           if (pe === 'none') return false;
-          const fill = (r.getAttribute('fill') || '').toLowerCase();
+          const fill = normFill(r);
           if (fill === '#89a0a3') return false;
-          return fill === '#00a5ff' || (r.getAttribute('stroke') || '').toLowerCase() === '#00a5ff';
+          const opacity = (r.getAttribute('opacity') || '').toLowerCase();
+          const style = (r.getAttribute('style') || '').toLowerCase();
+          if (opacity === '0' || /opacity\s*:\s*0/.test(style)) return false;
+          const cls = (r.getAttribute('class') || '').toLowerCase();
+          if (/(occupied|disabled|unavailable|dolu|sold|reserved)/i.test(cls)) return false;
+          return true;
         });
+        const topN = (obj, n = 8) => Object.entries(obj)
+          .sort((a, b) => (b[1] || 0) - (a[1] || 0))
+          .slice(0, n)
+          .map(([k, v]) => ({ k, v }));
+
+        let seatRectStats = null;
+        if (allRects.length && selectableRects.length === 0) {
+          const fillCounts = {};
+          const strokeCounts = {};
+          const peCounts = {};
+          for (const r of allRects) {
+            const fill = (String(normFill(r) || '').toLowerCase()) || '(empty)';
+            const stroke = ((r.getAttribute('stroke') || '') + '').toLowerCase() || '(empty)';
+            const pe = ((r.getAttribute('pointer-events') || '') + '').toLowerCase() || '(empty)';
+            fillCounts[fill] = (fillCounts[fill] || 0) + 1;
+            strokeCounts[stroke] = (strokeCounts[stroke] || 0) + 1;
+            peCounts[pe] = (peCounts[pe] || 0) + 1;
+          }
+          seatRectStats = {
+            allRects: allRects.length,
+            fillsTop: topN(fillCounts),
+            strokesTop: topN(strokeCounts),
+            pointerEventsTop: topN(peCounts)
+          };
+        }
         const hasActiveSelection = !!document.querySelector('svg.seatmap-svg g.seatActive rect');
         return {
           label: lbl,
           title: document.title,
           url: location.href,
+          viewport: { w: vw, h: vh, y: window.scrollY || 0 },
+          seatmapViewport: rect ? { top: rect.top, left: rect.left, bottom: rect.bottom, right: rect.right, w: rect.width, h: rect.height, inViewport } : null,
           hasVerifyHuman: bodyText.includes('verify you are human'),
           hasTurnstileWidget: !!document.querySelector('.cf-turnstile'),
           hasTurnstileTokenField: !!document.querySelector('input[name="cf-turnstile-response"]'),
           seatCount: document.querySelectorAll(sel).length,
           selectableCount: selectableRects.length,
+          seatRectStats,
           hasActiveSelection,
           hasSeatButton: !!document.getElementById('custom_seat_button')
         };
@@ -350,6 +416,23 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
     } catch (e) {
       logger.warn(`seatPick:${context}:diag_failed`, { label, error: e?.message || String(e) });
     }
+  };
+
+  const ensureSeatmapInView = async (label) => {
+    try {
+      await page.evaluate((lbl) => {
+        const seatmapEl = document.querySelector('svg.seatmap-svg')
+          || document.querySelector('#seatmap, .seatmap, .seatmapArea, .seatMap, .seatmap-container')
+          || null;
+        if (!seatmapEl) return { ok: false, reason: 'no_seatmap_el' };
+        try { seatmapEl.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+        const r = seatmapEl.getBoundingClientRect();
+        const vh = (window.innerHeight || document.documentElement.clientHeight || 0);
+        const vw = (window.innerWidth || document.documentElement.clientWidth || 0);
+        const inViewport = (r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw);
+        return { ok: true, inViewport, rect: { top: r.top, left: r.left, w: r.width, h: r.height }, label: lbl };
+      }, label);
+    } catch {}
   };
 
   const ensureOnSeatPage = async (label) => {
@@ -390,7 +473,35 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
 
   await ensureOnSeatPage('start');
   const seatMapOk = await openSeatMapStrict(page);
-  if (!seatMapOk) logger.warn(`seatPick:${context}:seatmap_not_ready`);
+  if (!seatMapOk) {
+    logger.warn(`seatPick:${context}:seatmap_not_ready`);
+    try {
+      const frames = (typeof page.frames === 'function') ? page.frames() : [];
+      const frameDiag = [];
+      for (let i = 0; i < Math.min(frames.length, 8); i++) {
+        const f = frames[i];
+        let url = '';
+        try { url = f.url() || ''; } catch {}
+        const d = await f.evaluate((sel) => {
+          const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+          const seatNodes = document.querySelectorAll(String(sel || '')).length;
+          const hasSvg = !!document.querySelector('svg.seatmap-svg');
+          const hasSvgLayout = !!document.querySelector('svg.svgLayout, .svgLayout');
+          const hasSeatBtn = !!document.getElementById('custom_seat_button') || Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
+            .some(el => {
+              const t = norm(el.innerText || el.textContent || el.value || '');
+              return t === 'seçimi değiştir' || t.includes('kendim seçmek istiyorum');
+            });
+          const hasIframe = !!document.querySelector('iframe');
+          const hasCanvas = !!document.querySelector('canvas');
+          return { seatNodes, hasSvg, hasSvgLayout, hasSeatBtn, hasIframe, hasCanvas, title: document.title };
+        }, SEAT_NODE_SELECTOR).catch(() => null);
+        frameDiag.push({ idx: i, url: url ? url.slice(0, 140) : '', diag: d });
+      }
+      logger.warn(`seatPick:${context}:seatmap_frame_diag`, { frameCount: frames.length, frameDiag });
+    } catch {}
+  }
+  await ensureSeatmapInView('afterOpenSeatMapStrict');
   await diag('afterOpenSeatMapStrict');
   await page.evaluate(()=>{ window.__passobot = {clicked:false, done:false}; });
 
@@ -398,10 +509,16 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
   let lockedMiss = 0;
   let lastContinueAttemptAt = 0;
   let lastContinueClickedAt = 0;
+  let turnstileWarmStartedAt = 0;
+  let lastTurnstileBlockingAt = 0;
   let postContinueVerifyUntil = 0;
   let postContinueRetryCount = 0;
   let noSeatStreak = 0;
   let lastRecoverAt = 0;
+  let noSelectableStreak = 0;
+  let lastNoSelectableActionAt = 0;
+  let lastSeatmapUnlockAt = 0;
+  let seatmapUnlockAttempts = 0;
 
   const POST_CONTINUE_VERIFY_MS = 45000;
   const POST_CONTINUE_STUCK_MS = 45000;
@@ -410,6 +527,13 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
   const tryPickAdditionalSeat = async () => {
     try {
       const info = await page.evaluate(() => {
+        const normFill = (r) => {
+          const attr = (r.getAttribute('fill') || '').toLowerCase();
+          if (attr) return attr;
+          const st = (r.getAttribute('style') || '').toLowerCase();
+          const m = st.match(/fill\s*:\s*([^;]+)/i);
+          return (m && m[1] ? m[1].trim() : '');
+        };
         const selectedNow = Array.from(document.querySelectorAll(
           'circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"], svg.seatmap-svg g.seatActive rect, svg.seatmap-svg g.selected rect, svg.seatmap-svg rect.selected'
         ));
@@ -419,14 +543,11 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
           const pe = (r.getAttribute('pointer-events') || '').toLowerCase();
           if (pe === 'none') return false;
           const cls = (r.getAttribute('class') || '').toLowerCase();
-          const fill = (r.getAttribute('fill') || '').toLowerCase();
+          const fill = normFill(r);
           const opacity = (r.getAttribute('opacity') || '').toLowerCase();
           const style = (r.getAttribute('style') || '').toLowerCase();
           if (opacity === '0' || /opacity\s*:\s*0/.test(style)) return false;
           if (/(occupied|disabled|unavailable|dolu|sold|reserved)/i.test(cls) || fill === '#89a0a3') return false;
-          // prefer selectable color
-          const isSelectable = fill === '#00a5ff' || (r.getAttribute('stroke') || '').toLowerCase() === '#00a5ff';
-          if (!isSelectable) return false;
           // avoid already selected/active rects
           const g = r.closest('g');
           if (g && (g.classList.contains('seatActive') || g.classList.contains('selected'))) return false;
@@ -515,6 +636,306 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
       await ensureOnSeatPage('loop');
       await diag('loop');
 
+      const selectableState = await page.evaluate(() => {
+        const normFill = (r) => {
+          const attr = (r.getAttribute('fill') || '').toLowerCase();
+          if (attr) return attr;
+          const st = (r.getAttribute('style') || '').toLowerCase();
+          const m = st.match(/fill\s*:\s*([^;]+)/i);
+          return (m && m[1] ? m[1].trim() : '');
+        };
+        const allRects = Array.from(document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect'));
+        const selectableRects = allRects.filter(r => {
+          const pe = (r.getAttribute('pointer-events') || '').toLowerCase();
+          if (pe === 'none') return false;
+          const fill = normFill(r);
+          if (fill === '#89a0a3') return false;
+          const opacity = (r.getAttribute('opacity') || '').toLowerCase();
+          const style = (r.getAttribute('style') || '').toLowerCase();
+          if (opacity === '0' || /opacity\s*:\s*0/.test(style)) return false;
+          const cls = (r.getAttribute('class') || '').toLowerCase();
+          if (/(occupied|disabled|unavailable|dolu|sold|reserved)/i.test(cls)) return false;
+          return true;
+        });
+
+        // Provide extra diag when seatmap exists but we detect 0 selectable seats.
+        let diag = null;
+        if (allRects.length && selectableRects.length === 0) {
+          const fillCounts = {};
+          for (const r of allRects) {
+            const fill = (String(normFill(r) || '').toLowerCase()) || '(empty)';
+            fillCounts[fill] = (fillCounts[fill] || 0) + 1;
+          }
+          diag = {
+            allRects: allRects.length,
+            fillsTop: Object.entries(fillCounts).sort((a, b) => (b[1] || 0) - (a[1] || 0)).slice(0, 8).map(([k, v]) => ({ k, v }))
+          };
+        }
+
+        return { seatmapPresent: !!document.querySelector('svg.seatmap-svg'), selectableCount: selectableRects.length, diag };
+      }).catch(() => null);
+
+      if (selectableState && selectableState.seatmapPresent && selectableState.selectableCount <= 0) {
+        noSelectableStreak++;
+      } else {
+        noSelectableStreak = 0;
+      }
+
+      if (noSelectableStreak >= 3) {
+        const now = Date.now();
+        if (now - lastNoSelectableActionAt > 8000) {
+          lastNoSelectableActionAt = now;
+          logger.warn(`seatPick:${context}:no_selectable_seats_back`, { noSelectableStreak, selectableState });
+
+          // Heuristic: if the seatmap exists but is overwhelmingly gray/disabled, this is usually
+          // a true "no seats" situation (not a captcha lock). In that case, do NOT try unlock/reload;
+          // bubble up NO_SELECTABLE_SEATS so the caller can reselect category/block.
+          const soldOutLike = (() => {
+            try {
+              const diag = selectableState?.diag;
+              const allRects = Number(diag?.allRects || 0);
+              const top = Array.isArray(diag?.fillsTop) ? diag.fillsTop[0] : null;
+              const topFill = String(top?.k || '').toLowerCase();
+              const topCount = Number(top?.v || 0);
+              if (!allRects || !topFill) return false;
+              // #89a0a3 is the common "unavailable" fill in Passo seatmaps.
+              if (topFill === '#89a0a3' && (topCount / allRects) >= 0.92) return true;
+              return false;
+            } catch {
+              return false;
+            }
+          })();
+
+          // Packed match "snipe" mode:
+          // If the map looks sold-out, reselecting blocks is slow (loader), and we can miss seats
+          // that are freed from other users' baskets. Poll the current seatmap for a short window.
+          if (soldOutLike) {
+            const snipeMaxMs = Number(cfg?.TIMEOUTS?.SEAT_SNIPE_MAX_MS || 0) || 0;
+            const pollMs = Number(cfg?.TIMEOUTS?.SEAT_SNIPE_POLL_MS || 0) || 350;
+            const roamMs = Number(cfg?.TIMEOUTS?.SVG_CATEGORY_ROAM_MS || 0) || 0;
+            if (snipeMaxMs > 0) {
+              const until = Date.now() + snipeMaxMs;
+              let lastRoamAt = 0;
+              logger.info(`seatPick:${context}:snipe_wait_start`, { snipeMaxMs, pollMs });
+              while (Date.now() < until) {
+                try {
+                  await ensureOnSeatPage('snipe_wait');
+                } catch {}
+
+                // SVG category roam: do not stay on the same category longer than roamMs.
+                if (roamMs > 0 && roamCategoryTexts.length >= 2) {
+                  const now2 = Date.now();
+                  if (!lastRoamAt || (now2 - lastRoamAt) >= roamMs) {
+                    lastRoamAt = now2;
+                    try {
+                      const roamRes = await page.evaluate((texts) => {
+                        const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+                        const isVisible = (el) => {
+                          if (!el) return false;
+                          const st = window.getComputedStyle(el);
+                          if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || '1') === 0)) return false;
+                          const r = el.getBoundingClientRect?.();
+                          if (!r) return true;
+                          return r.width > 6 && r.height > 6;
+                        };
+                        const tNorms = (texts || []).map(norm).filter(Boolean);
+                        if (tNorms.length < 2) return { ok: false, reason: 'texts_insufficient' };
+
+                        const btns = Array.from(document.querySelectorAll('button, a, [role="tab"], [role="button"], li, div'))
+                          .filter(isVisible)
+                          .slice(0, 400);
+                        const candidates = btns
+                          .map((el) => {
+                            const t = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+                            return { el, t };
+                          })
+                          .filter(x => x.t && tNorms.some(tt => x.t.includes(tt)));
+                        if (!candidates.length) return { ok: false, reason: 'no_candidates' };
+
+                        // Try to infer current active category by aria-selected/active class.
+                        let activeText = '';
+                        try {
+                          const active = candidates.find(x => x.el.getAttribute('aria-selected') === 'true')
+                            || candidates.find(x => (x.el.getAttribute('class') || '').toLowerCase().includes('active'))
+                            || null;
+                          activeText = active ? active.t : '';
+                        } catch {}
+
+                        // Pick a different category than current active (simple round-robin: first that differs)
+                        const pick = candidates.find(x => x.t && x.t !== activeText) || candidates[0];
+                        try { pick.el.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+                        try { pick.el.click(); } catch {}
+                        return { ok: true, clickedText: pick.t, activeText };
+                      }, roamCategoryTexts);
+                      if (roamRes && roamRes.ok) {
+                        logger.info(`seatPick:${context}:svg_category_roam`, roamRes);
+                      }
+                    } catch {}
+                  }
+                }
+
+                try {
+                  const st = await page.evaluate(() => {
+                    const allRects = Array.from(document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect'));
+                    const normFill = (r) => {
+                      const attr = (r.getAttribute('fill') || '').toLowerCase();
+                      if (attr) return attr;
+                      const s = (r.getAttribute('style') || '').toLowerCase();
+                      const m = s.match(/fill\s*:\s*([^;]+)/i);
+                      return (m && m[1] ? m[1].trim() : '');
+                    };
+                    let selectable = 0;
+                    for (const r of allRects) {
+                      const pe = (r.getAttribute('pointer-events') || '').toLowerCase();
+                      if (pe === 'none') continue;
+                      const fill = normFill(r);
+                      if (fill === '#89a0a3') continue;
+                      const cls = (r.getAttribute('class') || '').toLowerCase();
+                      if (/(occupied|disabled|unavailable|dolu|sold|reserved)/i.test(cls)) continue;
+                      selectable++;
+                      if (selectable >= 1) break;
+                    }
+                    return { all: allRects.length, selectable };
+                  }).catch(() => null);
+                  if (st && Number(st.selectable || 0) > 0) {
+                    logger.info(`seatPick:${context}:snipe_wait_hit`, st);
+                    noSelectableStreak = 0;
+                    // continue outer loop; we should now be able to pick a seat.
+                    break;
+                  }
+                } catch {}
+                await delay(Math.max(120, pollMs));
+              }
+              logger.info(`seatPick:${context}:snipe_wait_end`);
+              if (noSelectableStreak === 0) {
+                continue;
+              }
+            }
+          }
+
+          // If seat nodes exist but ALL seat rects are non-interactive (pointer-events:none), the seatmap is effectively locked.
+          // In that case, try a limited unlock recovery (turnstile + re-open seat map) instead of immediately failing.
+          const lockDiag = await page.evaluate(() => {
+            const rects = Array.from(document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect'));
+            if (!rects.length) return { allRects: 0, peNone: 0, peNoneRatio: 0 };
+            let peNone = 0;
+            for (const r of rects) {
+              const pe = (r.getAttribute('pointer-events') || '').toLowerCase();
+              if (pe === 'none') peNone++;
+            }
+            return { allRects: rects.length, peNone, peNoneRatio: peNone / rects.length };
+          }).catch(() => null);
+
+          if (!soldOutLike && lockDiag && lockDiag.allRects > 0 && lockDiag.peNoneRatio >= 0.98) {
+            const unlockCooldownMs = 12000;
+            if (seatmapUnlockAttempts < 3 && (now - lastSeatmapUnlockAt) > unlockCooldownMs) {
+              seatmapUnlockAttempts++;
+              lastSeatmapUnlockAt = now;
+              logger.warn(`seatPick:${context}:seatmap_locked_unlock_attempt`, { attempt: seatmapUnlockAttempts, lockDiag });
+
+              if (ensureTurnstileFn && email) {
+                try {
+                  const t0 = Date.now();
+                  await ensureTurnstileFn(page, email, `seatPick:${context}:seatmapUnlock${seatmapUnlockAttempts}`, { background: false });
+                  const dt = Date.now() - t0;
+                  extendDeadline(dt + 6000, 'turnstile_seatmap_unlock');
+                } catch {}
+              }
+
+              try { await openSeatMapStrict(page); } catch {}
+
+              // If still locked, try a UI reset (go back to layout and re-enter self-select).
+              try {
+                const stillLocked = await page.evaluate(() => {
+                  const rects = Array.from(document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect'));
+                  if (!rects.length) return false;
+                  let peNone = 0;
+                  for (const r of rects) {
+                    const pe = (r.getAttribute('pointer-events') || '').toLowerCase();
+                    if (pe === 'none') peNone++;
+                  }
+                  return (peNone / rects.length) >= 0.98;
+                }).catch(() => false);
+
+                if (stillLocked) {
+                  logger.warn(`seatPick:${context}:seatmap_locked_ui_reset`, { attempt: seatmapUnlockAttempts });
+                  await page.evaluate(() => {
+                    const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+                    const btns = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"], div[role="button"]'));
+                    const change = btns.find(b => norm(b.innerText || b.textContent || b.value || '') === 'seçimi değiştir');
+                    if (change) { try { change.click(); } catch {} return; }
+                    const back = btns.find(b => norm(b.innerText || b.textContent || b.value || '').includes('geri dön'));
+                    if (back) { try { back.click(); } catch {} }
+                  }).catch(() => {});
+                  await delay(800);
+                  try { await openSeatMapStrict(page); } catch {}
+                }
+              } catch {}
+
+              // If UI reset didn't help and we have a recoveryUrl, do a soft reload back to seat page.
+              try {
+                const stillLocked2 = await page.evaluate(() => {
+                  const rects = Array.from(document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect'));
+                  if (!rects.length) return false;
+                  let peNone = 0;
+                  for (const r of rects) {
+                    const pe = (r.getAttribute('pointer-events') || '').toLowerCase();
+                    if (pe === 'none') peNone++;
+                  }
+                  return (peNone / rects.length) >= 0.98;
+                }).catch(() => false);
+                if (stillLocked2 && recoveryUrl) {
+                  logger.warn(`seatPick:${context}:seatmap_locked_soft_reload`, { attempt: seatmapUnlockAttempts, recoveryUrl });
+                  try { await page.goto(String(recoveryUrl), { waitUntil: 'domcontentloaded', timeout: 45000 }); } catch {}
+                  await delay(600);
+                  if (ensureTurnstileFn && email) {
+                    try {
+                      logger.info(`seatPick:${context}:seatmap_unlock_reload_turnstile_ensure_start`, { attempt: seatmapUnlockAttempts });
+                      // After reload the widget can mount late; wait a bit so ensureTurnstileFn actually runs.
+                      await page.waitForFunction(() => {
+                        return !!document.querySelector('.cf-turnstile') || !!document.querySelector('input[name="cf-turnstile-response"]');
+                      }, { timeout: 8000 }).catch(() => {});
+                      await ensureTurnstileFn(page, email, `seatPick:${context}:seatmapUnlockReload${seatmapUnlockAttempts}`, { background: false });
+                      logger.info(`seatPick:${context}:seatmap_unlock_reload_turnstile_ensure_done`, { attempt: seatmapUnlockAttempts });
+                    } catch (e) {
+                      logger.warn(`seatPick:${context}:seatmap_unlock_reload_turnstile_ensure_failed`, { attempt: seatmapUnlockAttempts, error: e?.message || String(e) });
+                    }
+                  }
+                  try { await openSeatMapStrict(page); } catch {}
+                }
+              } catch {}
+
+              await delay(700);
+              noSelectableStreak = 0;
+              continue;
+            }
+          }
+
+          try {
+            await page.evaluate(() => {
+              const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+              const btns = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
+              const change = btns.find(b => norm(b.innerText || b.textContent || b.value || '') === 'seçimi değiştir');
+              if (change) { try { change.click(); } catch {} return; }
+              const back = btns.find(b => norm(b.innerText || b.textContent || b.value || '').includes('geri dön'));
+              if (back) { try { back.click(); } catch {} }
+            });
+          } catch {}
+
+          try {
+            await page.waitForFunction(() => {
+              const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+              const els = Array.from(document.querySelectorAll('button, a, [role="button"], div[role="button"], input[type="button"], input[type="submit"]'));
+              const hasSelfSelect = els.some(x => norm(x.innerText || x.textContent || x.value || '').includes('kendim seçmek istiyorum'));
+              const hasLayout = !!document.querySelector('svg.svgLayout, .svgLayout');
+              const hasLegacy = !!document.querySelector('.custom-select-box');
+              return hasSelfSelect || hasLayout || hasLegacy;
+            }, { timeout: 15000 });
+          } catch {}
+          throw new Error(formatError('NO_SELECTABLE_SEATS'));
+        }
+      }
+
       // bazen seatmap DOM'dan kaybolabiliyor (seatCount 0, button yok). bu durumda recover dene.
       const seatState = await page.evaluate((sel) => {
         return {
@@ -550,7 +971,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
 
           if (ensureTurnstileFn && email) {
             try {
-              await ensureTurnstileFn(page, email, `seatPick:${context}:postContinueRetry${postContinueRetryCount}`);
+              await ensureTurnstileFn(page, email, `seatPick:${context}:postContinueRetry${postContinueRetryCount}`, { background: true });
             } catch {}
           }
           const r = await clickContinueInsidePage(page);
@@ -583,8 +1004,105 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
           lockedSeat = null;
           lockedMiss = 0;
           await ensureOnSeatPage('seatmap_recover');
+
+          // After soft reloads or route changes, Turnstile token field can disappear.
+          // Without a token the seatmap may never mount; resolve token before reopening the seatmap.
+          if (ensureTurnstileFn && email) {
+            let tokenState = null;
+            try {
+              const tokenState0 = await page.evaluate(() => {
+                const field = document.querySelector('input[name="cf-turnstile-response"]');
+                const hasToken = field && field.value && field.value.length > 100;
+                const hasWidget = !!document.querySelector('.cf-turnstile');
+                return { hasToken, hasWidget, hasTokenField: !!field, tokenLen: field?.value?.length || 0 };
+              }).catch(() => null);
+
+              // If the token field/widget isn't mounted yet, give it a short chance to appear.
+              if (tokenState0 && !tokenState0.hasToken && (!tokenState0.hasWidget && !tokenState0.hasTokenField)) {
+                await page.waitForFunction(() => {
+                  return !!document.querySelector('.cf-turnstile') || !!document.querySelector('input[name="cf-turnstile-response"]');
+                }, { timeout: 8000 }).catch(() => {});
+              }
+
+              tokenState = await page.evaluate(() => {
+                const field = document.querySelector('input[name="cf-turnstile-response"]');
+                const hasToken = field && field.value && field.value.length > 100;
+                const hasWidget = !!document.querySelector('.cf-turnstile');
+                return { hasToken, hasWidget, hasTokenField: !!field, tokenLen: field?.value?.length || 0 };
+              }).catch(() => tokenState0);
+            } catch (e) {
+              logger.warn(`seatPick:${context}:seatmap_recover_turnstile_state_eval_failed`, { error: e?.message || String(e) });
+            }
+
+            // Deterministic: if we cannot prove we have a token, try blocking ensure.
+            if (!tokenState || !tokenState.hasToken) {
+              logger.info(`seatPick:${context}:seatmap_recover_turnstile_state`, tokenState);
+              logger.info(`seatPick:${context}:seatmap_recover_turnstile_blocking`, tokenState);
+              try {
+                const t0 = Date.now();
+                await ensureTurnstileFn(page, email, `seatPick:${context}:seatmapRecover`, { background: false });
+                const dt = Date.now() - t0;
+                extendDeadline(dt + 6000, 'turnstile_seatmap_recover');
+              } catch (e) {
+                logger.warn(`seatPick:${context}:seatmap_recover_turnstile_blocking_failed`, { error: e?.message || String(e) });
+              }
+            }
+          }
+
+          // After soft reload, the selected SVG block context can be lost; re-click the last block to re-mount seatmap.
+          try {
+            const bid = await page.evaluate(() => {
+              try { return String(window.__passobotLastSvgBlockId || '').trim(); } catch { return ''; }
+            }).catch(() => '');
+            if (bid) {
+              const pt = await page.evaluate((id) => {
+                const el = document.getElementById(String(id || ''));
+                if (!el) return null;
+                try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+                try {
+                  const r = el.getBoundingClientRect();
+                  const x = r.left + (r.width / 2);
+                  const y = r.top + (r.height / 2);
+                  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+                  return { x, y, w: r.width, h: r.height, tag: el.tagName };
+                } catch {
+                  return null;
+                }
+              }, bid).catch(() => null);
+              if (pt && Number.isFinite(pt.x) && Number.isFinite(pt.y)) {
+                logger.warn(`seatPick:${context}:seatmap_recover_reclick_block`, { blockId: bid, pt });
+                try {
+                  await page.mouse.move(pt.x, pt.y);
+                  await page.mouse.down();
+                  await page.mouse.up();
+                } catch {}
+                await delay(450);
+              }
+            }
+          } catch {}
+
           const ok = await openSeatMapStrict(page);
           if (!ok) logger.warn(`seatPick:${context}:seatmap_recover_failed`);
+
+          // If reopen failed and we have a recoveryUrl, do one navigation attempt and retry once.
+          if (!ok && recoveryUrl) {
+            try {
+              await page.goto(String(recoveryUrl), { waitUntil: 'domcontentloaded', timeout: 45000 });
+              await delay(600);
+              if (ensureTurnstileFn && email) {
+                await page.waitForFunction(() => {
+                  return !!document.querySelector('.cf-turnstile') || !!document.querySelector('input[name="cf-turnstile-response"]');
+                }, { timeout: 8000 }).catch(() => {});
+                try { await ensureTurnstileFn(page, email, `seatPick:${context}:seatmapRecoverNav`, { background: false }); } catch {}
+              }
+              await openSeatMapStrict(page);
+            } catch {}
+          }
+
+          // Give the seatmap a chance to mount after reopening.
+          try {
+            await page.waitForFunction((sel) => document.querySelectorAll(sel).length > 0, { timeout: 8000 }, SEAT_NODE_SELECTOR);
+          } catch {}
           await delay(500);
         }
       }
@@ -622,10 +1140,13 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                       const isDisabled = /(occupied|disabled|unavailable|dolu|sold|reserved)/i.test(cls) || fill === '#89a0a3';
                       if (isDisabled) return false;
 
-                      // Observed in Passo seatmap: selectable seats are typically #00a5ff, selected becomes #A9CC14 with stroke #00a5ff.
-                      // Keep this as a preference filter to avoid selecting non-seat blocks.
-                      const isPreferredSelectable = fill === '#00a5ff' || stroke === '#00a5ff' || /\bblock\d+\b/.test(cls);
-                      return isPreferredSelectable;
+                      // Available seat colors are dynamic; rely on interactivity and later selection verification.
+                      // Keep a light guard to avoid obvious non-seat placeholders.
+                      if (!fill || fill === '#000000') {
+                        // If fill is empty/black, still allow when cursor suggests clickability.
+                        return !!cur && cur !== 'none';
+                      }
+                      return true;
                   });
                   if (!clickable.length) return null;
                   const r0 = clickable[Math.floor(Math.random() * clickable.length)];
@@ -678,7 +1199,10 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                 seatId: null
               };
           }, SEAT_NODE_SELECTOR);
-          if (!clickInfo || !Number.isFinite(clickInfo.x) || !Number.isFinite(clickInfo.y)) { await delay(200); continue; }
+          if (!clickInfo || !Number.isFinite(clickInfo.x) || !Number.isFinite(clickInfo.y) || clickInfo.x <= 0 || clickInfo.y <= 0) {
+            await delay(200);
+            continue;
+          }
 
           if (!lockedSeat) {
             lockedSeat = clickInfo;
@@ -761,9 +1285,28 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
         
         if (tokenState.hasWidget && !tokenState.hasToken) {
           logger.warn(`seatPick:${context}:no_turnstile_token`, tokenState);
-          // Token yok - yeniden çözmeyi dene
+
+          // Token yok: önce background warmup başlat (akışı kilitlemeden).
           if (ensureTurnstileFn && email) {
-            logger.info(`seatPick:${context}:resolving_turnstile`);
+            try {
+              if (!turnstileWarmStartedAt || (Date.now() - turnstileWarmStartedAt) > 120000) {
+                turnstileWarmStartedAt = Date.now();
+                await ensureTurnstileFn(page, email, `seatPick:${context}:turnstileWarmup`, { background: true });
+              }
+            } catch {}
+          }
+
+          // Warmup'a biraz süre tanı; çoğu durumda token bu arada hazır oluyor.
+          if (turnstileWarmStartedAt && (Date.now() - turnstileWarmStartedAt) < 6000) {
+            await delay(600);
+            continue;
+          }
+
+          // Hala token yoksa: belirli aralıklarla blocking ensure yap.
+          const blockingCooldownMs = 20000;
+          if (ensureTurnstileFn && email && (!lastTurnstileBlockingAt || (Date.now() - lastTurnstileBlockingAt) > blockingCooldownMs)) {
+            lastTurnstileBlockingAt = Date.now();
+            logger.info(`seatPick:${context}:resolving_turnstile_blocking`);
             try {
               const t0 = Date.now();
               await ensureTurnstileFn(page, email, `seatPick:${context}:beforeContinue`);
@@ -774,7 +1317,8 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
               logger.warn(`seatPick:${context}:turnstile_resolve_failed`, { error: e?.message });
             }
           }
-          await delay(500);
+
+          await delay(700);
           continue;
         }
         
@@ -946,7 +1490,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
 }
 
 /** B: aynı koltuğu seç (KİLİTLİ — seçiliyken re-click YOK) */
-async function pickExactSeatWithVerify_Locked(page, target, maxMs = null){
+async function pickExactSeatWithVerify_Locked(page, target, maxMs = null, options = null) {
   maxMs = maxMs || cfg.TIMEOUTS.SEAT_PICK_EXACT_MAX;
   const end = Date.now() + maxMs;
   await openSeatMapStrict(page);
@@ -1146,8 +1690,17 @@ async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) 
     // Seçili seat kontrolü
     const selectedMatches = await page.evaluate(({ wantSeatId, wantRow, wantSeat }) => {
       const norm = (s) => (s || '').toString().trim().toLowerCase();
-      const sel = document.querySelector('circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"]');
+      const sel = document.querySelector('circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"], svg.seatmap-svg g.seatActive, svg.seatmap-svg g.seatActive rect, svg.seatmap-svg g.selected, svg.seatmap-svg g.selected rect');
       if (!sel) return false;
+
+      // Passo SVG map: seat id can be embedded in class names (g<id>, block<id>)
+      if (wantSeatId) {
+        const cls = ((sel.getAttribute && sel.getAttribute('class')) ? sel.getAttribute('class') : (sel.className && sel.className.baseVal ? sel.className.baseVal : sel.className)) || '';
+        const key = String(cls || '').toLowerCase();
+        if (key.includes(`g${String(wantSeatId).toLowerCase()}`) || key.includes(`block${String(wantSeatId).toLowerCase()}`)) {
+          return true;
+        }
+      }
       const idMatch = !!wantSeatId && (
         sel.getAttribute('seat-id') === wantSeatId ||
         sel.getAttribute('data-seat-id') === wantSeatId ||
@@ -1200,8 +1753,48 @@ async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) 
     // Seat bul ve tıkla
     const clickResult = await page.evaluate(({ wantSeatId, wantRow, wantSeat }) => {
       const norm = (s) => (s || '').toString().trim().toLowerCase();
-      // Genişletilmiş selector - tüm olası seat elementleri
-      const nodes = [...document.querySelectorAll('circle.seat-circle, [seat-id], [data-seat-id], [data-id], .seat, [class*="seat"]')];
+      const pickRectCenterClick = (el) => {
+        try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+        const r = el.getBoundingClientRect();
+        if (!r || !r.width || !r.height) return false;
+
+        const events = ['mouseover', 'mouseenter', 'pointerover', 'pointerenter', 'pointerdown', 'mousedown', 'mouseup', 'pointerup', 'click'];
+        events.forEach((type) => {
+          try {
+            const evt = new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 });
+            el.dispatchEvent(evt);
+          } catch {}
+        });
+        try { el.click(); } catch {}
+        return true;
+      };
+
+      // 1) First try Passo-specific seat selectors by seatId (observed: g<id> / block<id>)
+      if (wantSeatId) {
+        const id = String(wantSeatId).trim();
+        const candidates = [
+          `svg.seatmap-svg rect.block${CSS.escape(id)}`,
+          `svg.seatmap-svg g.g${CSS.escape(id)} rect`,
+          `svg.seatmap-svg g#${CSS.escape(id)} rect`,
+          `svg.seatmap-svg [data-id="${id}"]`,
+          `svg.seatmap-svg [data-seat-id="${id}"]`,
+          `svg.seatmap-svg [seat-id="${id}"]`
+        ];
+        for (const sel of candidates) {
+          const el = document.querySelector(sel);
+          if (!el) continue;
+
+          const cls = (el.getAttribute('class') || '').toLowerCase();
+          const fill = (el.getAttribute('fill') || '').toLowerCase();
+          const isBlocked = /(occupied|disabled|unavailable|dolu|sold|reserved)/i.test(cls) || el.getAttribute('aria-disabled') === 'true' || fill === '#89a0a3';
+          if (isBlocked) return 'blocked';
+
+          return pickRectCenterClick(el) ? 'clicked' : 'notfound';
+        }
+      }
+
+      // 2) Fallback: generic seat nodes
+      const nodes = [...document.querySelectorAll('circle.seat-circle, [seat-id], [data-seat-id], [data-id], .seat, [class*="seat"], svg.seatmap-svg g[id^="seat"], svg.seatmap-svg g[id^="seat"] rect')];
       if (!nodes.length) return 'notfound';
       let el = null;
       if (wantSeatId) {
@@ -1228,22 +1821,7 @@ async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) 
       const isBlocked = /(occupied|disabled|unavailable|dolu|sold|reserved)/i.test(cls) || el.getAttribute('aria-disabled') === 'true';
       if (isBlocked) return 'blocked';
 
-      el.scrollIntoView({ block: 'center', inline: 'center' });
-      const r = el.getBoundingClientRect();
-
-      // Agresif event dispatch
-      const events = ['mouseover', 'mouseenter', 'pointerover', 'pointerenter', 'pointerdown', 'mousedown', 'mouseup', 'pointerup', 'click'];
-      events.forEach((type) => {
-        try {
-          const evt = new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 });
-          el.dispatchEvent(evt);
-        } catch {}
-      });
-
-      // Direct click on element center via element method
-      try { el.click(); } catch {}
-
-      return 'clicked';
+      return pickRectCenterClick(el) ? 'clicked' : 'notfound';
     }, { wantSeatId, wantRow, wantSeat });
 
     if (clickResult === 'clicked') {
@@ -1257,7 +1835,7 @@ async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) 
       }
 
       const selectedNow = await page.evaluate(() => !!document.querySelector(
-        'circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"]'
+        'circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"], svg.seatmap-svg g.seatActive, svg.seatmap-svg g.seatActive rect, svg.seatmap-svg g.selected, svg.seatmap-svg g.selected rect'
       ));
 
       if (selectedNow) {

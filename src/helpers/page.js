@@ -1,7 +1,7 @@
 const delay = require('../utils/delay');
 const cfg = require('../config');
 
-const SEAT_NODE_SELECTOR = 'circle.seat-circle, svg.seatmap-svg g[id^="seat"] rect, svg.seatmap-svg rect[class^="block"], [seat-id], [data-seat-id], [data-id][class*="seat"], [class*="seat-circle"], svg circle[class*="seat"], .seat-circle';
+const SEAT_NODE_SELECTOR = 'circle.seat-circle, .seat-circle, [seat-id], [data-seat-id], [data-id][class*="seat"], [class*="seat-circle"], svg circle[class*="seat"], svg.seatmap-svg g[id^="seat"], svg.seatmap-svg g[id^="seat"] rect, svg.seatmap-svg g[id^="seat"] circle, svg.seatmap-svg g[id^="seat"] path, svg.seatmap-svg g[id^="seat"] polygon, svg.seatmap-svg g[id^="seat"] line, svg.seatmap-svg rect[class^="block"]';
 
 const isHomeUrl = (u) => {
   if (!u) return false;
@@ -14,7 +14,324 @@ const isHomeUrl = (u) => {
   } catch {
     return false;
   }
+
 };
+
+async function ensureTcAssignedOnBasket(page, identity, options = null) {
+  if (!page) return false;
+  const opts = options && typeof options === 'object' ? options : {};
+  const preferAssignToMyId = opts.preferAssignToMyId !== false;
+  const maxAttempts = Number.isFinite(opts.maxAttempts) ? opts.maxAttempts : 3;
+
+  const tc = identity != null ? String(identity).trim() : '';
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const done = await page.evaluate((tcValue, preferMyId) => {
+        const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim();
+        const lower = (s) => norm(s).toLowerCase();
+
+        const getRowEls = () => {
+          const inputs = Array.from(document.querySelectorAll('input[placeholder="T.C. Kimlik No"][maxlength="11"]'));
+          return inputs.map((inp) => {
+            const td = inp.closest('td') || inp.closest('tr') || inp.parentElement;
+            return { inp, td };
+          });
+        };
+
+        const rows = getRowEls();
+        if (!rows.length) return { ok: true, reason: 'no_tc_ui' };
+
+        let anyTouched = false;
+        for (const r of rows) {
+          const inp = r.inp;
+          const td = r.td || document.body;
+
+          const assign = td.querySelector('input[type="checkbox"][id^="checkassign-to-my-id"]');
+          const notCitizen = td.querySelector('input[type="checkbox"][id^="checknot-tc-citizen"]');
+          if (notCitizen && notCitizen.checked) continue;
+
+          const curVal = norm(inp.value || '');
+          if (curVal && curVal.length === 11) continue;
+
+          if (preferMyId && assign && !assign.checked) {
+            try { assign.click(); } catch {}
+            anyTouched = true;
+            continue;
+          }
+
+          if (tcValue && tcValue.length === 11) {
+            try {
+              inp.focus();
+              inp.value = '';
+              inp.dispatchEvent(new Event('input', { bubbles: true }));
+              inp.value = tcValue;
+              inp.dispatchEvent(new Event('input', { bubbles: true }));
+              inp.dispatchEvent(new Event('change', { bubbles: true }));
+            } catch {}
+
+            const btns = Array.from(td.querySelectorAll('button')).filter(b => !b.disabled);
+            const defineBtn = btns.find(b => lower(b.innerText || b.textContent) === 'tanımla');
+            if (defineBtn) {
+              try { defineBtn.click(); } catch {}
+              anyTouched = true;
+              continue;
+            }
+            anyTouched = true;
+          }
+        }
+
+        return { ok: true, reason: anyTouched ? 'touched' : 'already_ok' };
+      }, tc, preferAssignToMyId).catch(() => null);
+
+      if (done && done.ok) {
+        if (done.reason === 'touched') {
+          await delay(600);
+          continue;
+        }
+        return true;
+      }
+    } catch {}
+    await delay(600 * attempt);
+  }
+  return false;
+}
+
+async function clickBasketDevamToOdeme(page) {
+  if (!page) return false;
+  try {
+    const btn = await page.evaluate(() => {
+      const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+      const els = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
+        .filter(el => {
+          try {
+            const st = window.getComputedStyle(el);
+            if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+            if (el.disabled) return false;
+            return !!(el.offsetParent !== null);
+          } catch {
+            return false;
+          }
+        });
+      const cand = els
+        .map(el => ({ el, t: norm(el.innerText || el.textContent || el.value || '') }))
+        .filter(x => x.t === 'devam')
+        .map(x => x.el);
+      const best = cand.find(b => (b.getAttribute('class') || '').toLowerCase().includes('red-btn')) || cand[0] || null;
+      if (!best) return null;
+      best.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = best.getBoundingClientRect();
+      return { x: r.left + (r.width / 2), y: r.top + (r.height / 2) };
+    });
+    if (!btn || !Number.isFinite(btn.x) || !Number.isFinite(btn.y)) return false;
+    const wait = page.waitForFunction(() => {
+      const u = String(location.href || '');
+      return /\/odeme(\b|\/|\?|#)/i.test(u);
+    }, { timeout: 30000 }).catch(() => null);
+    await page.mouse.move(btn.x, btn.y);
+    await page.mouse.down();
+    await page.mouse.up();
+    await Promise.race([wait, delay(2500)]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function dismissPaymentInfoModalIfPresent(page) {
+  if (!page) return false;
+  try {
+    const did = await page.evaluate(() => {
+      const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+      const conts = Array.from(document.querySelectorAll('.modal, .swal2-container, [role="dialog"], .cdk-overlay-container'));
+      const visible = conts.filter(c => {
+        try {
+          const st = window.getComputedStyle(c);
+          return st && st.display !== 'none' && st.visibility !== 'hidden' && (c.offsetParent !== null || st.position === 'fixed');
+        } catch { return false; }
+      });
+      if (!visible.length) return false;
+      const btns = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
+        .filter(b => {
+          const t = norm(b.innerText || b.textContent || b.value || '');
+          if (!t) return false;
+          if (b.disabled) return false;
+          return t === 'tamam' || t === 'ok' || t === 'kapat';
+        });
+      const b = btns[0] || null;
+      if (!b) return false;
+      try { b.click(); } catch {}
+      return true;
+    });
+    if (did) await delay(500);
+    return !!did;
+  } catch {
+    return false;
+  }
+}
+
+async function fillInvoiceTcAndContinue(page, identity) {
+  if (!page) return false;
+  const tc = identity != null ? String(identity).trim() : '';
+  if (!tc || tc.length !== 11) return false;
+
+  try {
+    const ok = await page.evaluate((tcValue) => {
+      const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+      const inputs = Array.from(document.querySelectorAll('quick-input input.form-control[placeholder="T.C. Kimlik No"], input.form-control[placeholder="T.C. Kimlik No"][maxlength="11"]'));
+      if (!inputs.length) return false;
+      const inp = inputs[0];
+      try {
+        inp.focus();
+        inp.value = '';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.value = tcValue;
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+      } catch {}
+
+      const btns = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
+        .filter(b => {
+          try {
+            const st = window.getComputedStyle(b);
+            if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+            if (b.disabled) return false;
+            return !!(b.offsetParent !== null);
+          } catch { return false; }
+        });
+      const cand = btns.find(b => (b.getAttribute('class') || '').toLowerCase().includes('black-btn') && norm(b.innerText || b.textContent || b.value || '').includes('devam'))
+        || btns.find(b => norm(b.innerText || b.textContent || b.value || '') === 'devam')
+        || null;
+      if (!cand) return false;
+      try { cand.click(); } catch {}
+      return true;
+    }, tc);
+    if (ok) {
+      await delay(1200);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+async function acceptAgreementsAndContinue(page) {
+  if (!page) return false;
+  try {
+    const did = await page.evaluate(() => {
+      const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+      const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'))
+        .filter(cb => {
+          if (cb.disabled) return false;
+          const id = cb.getAttribute('id') || '';
+          let labelTxt = '';
+          try {
+            if (id) labelTxt = document.querySelector(`label[for="${CSS.escape(id)}"]`)?.innerText || '';
+          } catch {}
+          const around = (cb.closest('label')?.innerText || cb.parentElement?.innerText || labelTxt || '');
+          const t = norm(around);
+          return /(kabul|onay|sözleşme|aydınlatma|kvkk|mesafeli|satış|bilet)/i.test(t);
+        });
+      let touched = false;
+      for (const cb of boxes) {
+        if (!cb.checked) {
+          try { cb.click(); } catch {}
+          touched = true;
+        }
+      }
+      const btns = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
+        .filter(b => {
+          try {
+            const st = window.getComputedStyle(b);
+            if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+            if (b.disabled) return false;
+            return !!(b.offsetParent !== null);
+          } catch { return false; }
+        });
+      const cont = btns.find(b => {
+        const cls = (b.getAttribute('class') || '').toLowerCase();
+        const t = norm(b.innerText || b.textContent || b.value || '');
+        if (cls.includes('black-btn') && t.includes('devam')) return true;
+        if (t === 'devam') return true;
+        return false;
+      }) || null;
+      if (cont) {
+        try { cont.click(); } catch {}
+        return { ok: true, touched };
+      }
+      return { ok: touched, touched };
+    });
+    if (did && did.ok) {
+      await delay(1200);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+async function fillNkolayPaymentIframe(page, card, options = null) {
+  if (!page) return false;
+  const opts = options && typeof options === 'object' ? options : {};
+  const clickPay = opts.clickPay === true;
+  const c = card && typeof card === 'object' ? card : {};
+  const name = c.cardHolder != null ? String(c.cardHolder).trim() : '';
+  const number = c.cardNumber != null ? String(c.cardNumber).replace(/\s+/g, '').trim() : '';
+  const mm = c.expiryMonth != null ? String(c.expiryMonth).trim() : '';
+  const yy = c.expiryYear != null ? String(c.expiryYear).trim() : '';
+  const cvv = c.cvv != null ? String(c.cvv).trim() : '';
+
+  if (!name || !number || !mm || !yy || !cvv) return false;
+
+  try {
+    await page.waitForSelector('iframe#payment_nkolay_frame', { timeout: 30000 }).catch(() => null);
+    const frameHandle = await page.$('iframe#payment_nkolay_frame').catch(() => null);
+    const frame = frameHandle ? await frameHandle.contentFrame().catch(() => null) : null;
+    if (!frame) return false;
+
+    await frame.waitForSelector('#name, #number, #ay, #yil, #cvv', { timeout: 30000 }).catch(() => null);
+
+    try { await frame.focus('#name'); } catch {}
+    try { await frame.evaluate(() => { try { document.querySelector('#name')?.select?.(); } catch {} }); } catch {}
+    try { await frame.type('#name', name, { delay: 20 }); } catch {}
+
+    try { await frame.focus('#number'); } catch {}
+    try { await frame.evaluate(() => { try { document.querySelector('#number')?.select?.(); } catch {} }); } catch {}
+    try { await frame.type('#number', number, { delay: 15 }); } catch {}
+
+    try { await frame.select('#ay', mm); } catch {}
+
+    const yearFull = yy.length === 2 ? `20${yy}` : yy;
+    try {
+      const hasYear = await frame.$eval('#yil', (s, y) => {
+        const opt = Array.from(s.options || []).some(o => String(o.value) === String(y));
+        return opt;
+      }, yearFull).catch(() => false);
+      if (hasYear) await frame.select('#yil', yearFull);
+    } catch {}
+
+    try { await frame.focus('#cvv'); } catch {}
+    try { await frame.evaluate(() => { try { document.querySelector('#cvv')?.select?.(); } catch {} }); } catch {}
+    try { await frame.type('#cvv', cvv, { delay: 15 }); } catch {}
+
+    let payClicked = false;
+    if (clickPay) {
+      try {
+        await frame.waitForSelector('#paybuttontext', { timeout: 8000 }).catch(() => null);
+        const btn = await frame.$('#paybuttontext').catch(() => null);
+        if (btn) {
+          try { await btn.click({ delay: 60 }); } catch { try { await frame.click('#paybuttontext'); } catch {} }
+          payClicked = true;
+        }
+      } catch {}
+    }
+
+    if (clickPay) {
+      return { ok: true, payClicked };
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function ensureUrlContains(page, expectedIncludes, options = null) {
   const opts = options && typeof options === 'object' ? options : {};
@@ -31,7 +348,22 @@ async function ensureUrlContains(page, expectedIncludes, options = null) {
     try { return page.url(); } catch { return ''; }
   };
 
-  const isOk = (u) => !!u && u.includes(expected);
+  const isOk = (u) => {
+    if (!u) return false;
+    const exp = String(expected || '');
+    if (!exp) return true;
+    // If expectation is a path like "/koltuk-secim", check against URL.pathname.
+    // This prevents false positives like "/giris?returnUrl=.../koltuk-secim".
+    if (exp.startsWith('/')) {
+      try {
+        const path = new URL(String(u)).pathname || '';
+        return String(path).includes(exp);
+      } catch {
+        return String(u).includes(exp);
+      }
+    }
+    return String(u).includes(exp);
+  };
 
   let lastUrl = getUrl();
   if (isOk(lastUrl)) return { ok: true, expected, url: lastUrl, attempts: 0 };
@@ -224,9 +556,12 @@ async function readBasketData(page) {
     const blockId = sel?.getAttribute('block-id') || '';
     const seatId = sel?.getAttribute('seat-id') || sel?.getAttribute('data-seat-id') || sel?.getAttribute('data-id') || '';
 
+    // On seat selection pages, Tribün/Blok/Sıra/Koltuk labels can appear in the seat tooltip/panel
+    // before the seat is actually added to the basket. Treat it as basket data only when we're on
+    // a basket-like URL or when strong basket DOM is present.
+    if (isSeatSelection && !isBasketUrl && !hasStrongBasketDom) return null;
+
     if (!tribune && !block && !row && !seat) {
-      // Seat selection page can contain "Sepete devam" etc. Avoid false positives.
-      if (isSeatSelection && !isBasketUrl) return null;
       if (!hasStrongBasketDom && !isBasketUrl) return null;
       return { tribune: '', block: '', row: '', seat: '', blockId, seatId, combined: '', inBasket: true, url };
     }
@@ -251,55 +586,163 @@ const readCatBlock = async (page) => page.evaluate(()=>{
 });
 
 const setCatBlockOnB = async (page, catBlock) => {
-  await page.waitForSelector('.custom-select-box',{visible:true});
-  await page.evaluate(()=>document.querySelector('.custom-select-box')?.click());
-  await page.waitForSelector('.dropdown-option:not(.disabled)', {visible:true});
-  await page.evaluate(catText=>{
-      const opts=[...document.querySelectorAll('.dropdown-option:not(.disabled)')];
-      const i=opts.findIndex(o=>(o.textContent||'').trim().toLowerCase().startsWith((catText||'').trim().toLowerCase()));
-      (i>=0?opts[i]:opts[0])?.click();
-  }, catBlock.categoryText||'');
+  const safeCatText = (catBlock && catBlock.categoryText) ? String(catBlock.categoryText) : '';
+  const safeBlockVal = (catBlock && catBlock.blockVal) ? String(catBlock.blockVal) : '';
+  const safeBlockText = (catBlock && catBlock.blockText) ? String(catBlock.blockText) : '';
 
-  await page.waitForFunction(()=>{ const s=document.querySelector('select#blocks'); return s && s.options.length>1; }, {timeout:8000});
-  await page.evaluate((val,txt)=>{
-      const s=document.querySelector('select#blocks'); if(!s) return;
-      const byVal=[...s.options].find(o=>String(o.value)===String(val));
-      const byTxt=[...s.options].find(o=>(o.textContent||'').trim().toLowerCase()===(txt||'').trim().toLowerCase());
-      const t = byVal||byTxt;
-      if (t){ s.value=t.value; s.dispatchEvent(new Event('change',{bubbles:true})); }
-  }, catBlock.blockVal, catBlock.blockText);
+  // Some events use the newer SVG UI without legacy category/block dropdowns.
+  // In those cases we should not fail the flow; caller can proceed with SVG block selection.
+  try {
+    const hasLegacy = await page.evaluate(() => {
+      const hasCustomSelect = !!document.querySelector('.custom-select-box, .custom-select-box .selected-option');
+      const hasBlocks = !!document.querySelector('select#blocks');
+      const hasSvgLayout = !!document.querySelector('svg.svgLayout, .svgLayout');
+      return { hasCustomSelect, hasBlocks, hasSvgLayout };
+    });
+    if (!hasLegacy?.hasCustomSelect || !hasLegacy?.hasBlocks) {
+      if (hasLegacy?.hasSvgLayout) return true;
+      // If neither legacy nor svg is detected, keep trying the legacy path below.
+    }
+  } catch {}
+
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      // (1) Ensure dropdown visible
+      const box = await page.waitForSelector('.custom-select-box', { visible: true, timeout: 6000 }).catch(() => null);
+      if (!box) {
+        // If UI is SVG-based, don't fail.
+        const isSvg = await page.evaluate(() => !!document.querySelector('svg.svgLayout, .svgLayout')).catch(() => false);
+        if (isSvg) return true;
+        throw new Error('setCatBlockOnB:legacy_controls_missing');
+      }
+      await page.evaluate(() => document.querySelector('.custom-select-box')?.click());
+      await page.waitForSelector('.dropdown-option:not(.disabled)', { visible: true, timeout: 15000 });
+      await page.evaluate((catText) => {
+        const norm = (s) => (s || '').toString().trim().toLowerCase();
+        const opts = [...document.querySelectorAll('.dropdown-option:not(.disabled)')];
+        const i = opts.findIndex(o => norm(o.textContent || '').startsWith(norm(catText || '')));
+        (i >= 0 ? opts[i] : opts[0])?.click();
+      }, safeCatText);
+
+      const blocksReady = await page.waitForFunction(() => {
+        const s = document.querySelector('select#blocks');
+        if (!s) return false;
+        const opts = Array.from(s.options || []);
+        // need at least 2 options to be meaningful
+        return opts.length >= 2;
+      }, { timeout: Math.max(12000, Number(cfg.TIMEOUTS.BLOCKS_WAIT_TIMEOUT || 0) + 9000) }).catch(() => null);
+      if (!blocksReady) {
+        const isSvg = await page.evaluate(() => !!document.querySelector('svg.svgLayout, .svgLayout')).catch(() => false);
+        if (isSvg) return true;
+        throw new Error('setCatBlockOnB:blocks_not_ready');
+      }
+
+      await page.evaluate((val, txt) => {
+        const s = document.querySelector('select#blocks');
+        if (!s) return;
+        const byVal = [...s.options].find(o => String(o.value) === String(val));
+        const byTxt = [...s.options].find(o => (o.textContent || '').trim().toLowerCase() === (txt || '').trim().toLowerCase());
+        const t = byVal || byTxt;
+        if (t) {
+          s.value = t.value;
+          s.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }, safeBlockVal, safeBlockText);
+      return true;
+    } catch (e) {
+      lastErr = e;
+      try {
+        // Re-trigger cat dropdown between attempts
+        await page.evaluate(() => {
+          const el = document.querySelector('.custom-select-box');
+          if (el) { try { el.click(); } catch {} }
+        });
+      } catch {}
+      await delay(700 * attempt);
+    }
+  }
+
+  // If we reached here, legacy path failed. If SVG is present, do not fail the whole run.
+  try {
+    const isSvg = await page.evaluate(() => !!document.querySelector('svg.svgLayout, .svgLayout')).catch(() => false);
+    if (isSvg) return true;
+  } catch {}
+  throw lastErr || new Error('setCatBlockOnB_failed');
 };
 
 const openSeatMapStrict = async (page) => {
-  const clicked = await page.evaluate(()=>{
-      const btn = document.getElementById('custom_seat_button');
-      if (!btn) return false;
+  const clickInfo = await page.evaluate(()=>{
+      const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+
+      const byId = document.getElementById('custom_seat_button');
+      const byText = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
+        .find(el => {
+          const t = norm(el.innerText || el.textContent || el.value || '');
+          if (!t) return false;
+          // Seen in DOM: "Seçimi değiştir". Also handle other possible CTAs.
+          return (
+            t === 'seçimi değiştir' ||
+            t.includes('kendim seçmek istiyorum') ||
+            (t.includes('koltuk') && (t.includes('seç') || t.includes('seçim') || t.includes('değiştir')))
+          );
+        });
+
+      const btn = byId || byText;
+      if (!btn) return { ok: false, reason: 'not_found' };
       const s=getComputedStyle(btn);
       const hidden = btn.closest('[hidden]')||s.display==='none'||s.visibility==='hidden'||btn.offsetParent===null||btn.disabled;
-      if (hidden) return false;
-      btn.scrollIntoView({block:'center'}); btn.click(); return true;
+      if (hidden) return { ok: false, reason: 'hidden' };
+      try { btn.scrollIntoView({block:'center'}); } catch {}
+      const r = btn.getBoundingClientRect();
+      if (!r || !r.width || !r.height) {
+        try { btn.click(); } catch {}
+        return { ok: true, method: 'dom_click_no_rect' };
+      }
+      const x = r.left + (r.width / 2);
+      const y = r.top + (r.height / 2);
+      try { btn.click(); } catch {}
+      return { ok: true, method: 'dom_click', x, y };
   });
-  if (!clicked) {
-      try { await page.waitForSelector('#custom_seat_button',{visible:true,timeout:4000}); await page.click('#custom_seat_button'); } catch {}
+
+  if (clickInfo && clickInfo.ok && Number.isFinite(clickInfo.x) && Number.isFinite(clickInfo.y)) {
+      try {
+          await page.mouse.move(clickInfo.x, clickInfo.y);
+          await page.mouse.click(clickInfo.x, clickInfo.y, { delay: 35 });
+      } catch {}
+  } else if (!clickInfo?.ok) {
+      try { await page.waitForSelector('#custom_seat_button',{visible:true,timeout:4000}); await page.click('#custom_seat_button', { delay: 35 }); } catch {}
   }
-  for (let i=0;i<40;i++){
-      const okMain = await page.evaluate((sel)=> document.querySelectorAll(sel).length > 0, SEAT_NODE_SELECTOR).catch(()=>false);
+  const seatMapContainerSelector = 'svg.seatmap-svg, #seatmap, [id*="seat" i][class*="map" i], iframe';
+  const isReadyInContext = async (ctx) => {
+      try {
+          const hasContainer = await ctx.evaluate((sel) => !!document.querySelector(sel), seatMapContainerSelector).catch(() => false);
+          const hasNodes = await ctx.evaluate((sel) => document.querySelectorAll(sel).length > 0, SEAT_NODE_SELECTOR).catch(() => false);
+          return !!(hasContainer && hasNodes);
+      } catch {
+          return false;
+      }
+  };
+
+  for (let i=0;i<55;i++){
+      const okMain = await isReadyInContext(page);
       if (okMain) return true;
 
-      // Bazı durumlarda seat map iframe içinde olabiliyor; frame'lerde de seat node arayalım.
+      // Bazı durumlarda seat map iframe içinde olabiliyor; relevant frame'lerde de seat node arayalım.
       try {
           const frames = page.frames ? page.frames() : [];
           if (frames && frames.length > 1) {
+              const main = typeof page.mainFrame === 'function' ? page.mainFrame() : null;
               for (const f of frames) {
-                  if (f === page.mainFrame?.()) continue;
-                  const okFrame = await f.evaluate((sel)=> document.querySelectorAll(sel).length > 0, SEAT_NODE_SELECTOR).catch(()=>false);
+                  if (main && f === main) continue;
+                  const okFrame = await isReadyInContext(f);
                   if (okFrame) return true;
               }
           }
       } catch {}
 
       // İlk tıklama bazen boşa düşüyor; birkaç turda bir tekrar dene.
-      if (i === 8 || i === 18 || i === 28) {
+      if (i === 10 || i === 22 || i === 34 || i === 46) {
           try { await page.click('#custom_seat_button'); } catch {}
       }
       await delay(300);
@@ -378,5 +821,11 @@ module.exports = {
   readCatBlock,
   setCatBlockOnB,
   openSeatMapStrict,
-  clickContinueInsidePage
+  clickContinueInsidePage,
+  ensureTcAssignedOnBasket,
+  clickBasketDevamToOdeme,
+  dismissPaymentInfoModalIfPresent,
+  fillInvoiceTcAndContinue,
+  acceptAgreementsAndContinue,
+  fillNkolayPaymentIframe
 };

@@ -11,6 +11,7 @@ const messages = {
     BUY_BUTTON_FAILED_B: 'SATIN AL tıklanamadı (B hesabı)',
     CATEGORY_NOT_FOUND: 'Uygun kategori bulunamadı',
     SEAT_SELECTION_FAILED_A: 'Sürede koltuk seçimi/sepet doğrulaması yapılamadı (A hesabı)',
+    NO_SELECTABLE_SEATS: 'Seçilen blokta boş/aktif koltuk bulunamadı',
     SEAT_PICK_FAILED_B: 'B hesabı hedef koltuğu zamanında alamadı',
     REMOVE_FROM_CART_FAILED: 'A hesabı koltuğu sepetten kaldıramadı',
     

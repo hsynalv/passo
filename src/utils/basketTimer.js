@@ -105,6 +105,15 @@ class BasketTimer {
     reset() {
         this.basketStartTime = null;
     }
+
+    syncFromRemainingSeconds(remainingSeconds) {
+        const rem = Number(remainingSeconds);
+        if (!Number.isFinite(rem)) return false;
+        const clamped = Math.max(0, Math.min(this.holdingTimeSeconds, Math.floor(rem)));
+        const elapsed = this.holdingTimeSeconds - clamped;
+        this.basketStartTime = Date.now() - (elapsed * 1000);
+        return true;
+    }
 }
 
 /**

@@ -1,0 +1,60 @@
+:root{--bg:#0b1220;--card:#101a2f;--muted:#8aa0c2;--text:#e8f0ff;--border:#1b2a4b;--accent:#5eead4;--accent2:#60a5fa;--danger:#fb7185;--shadow:0 18px 50px rgba(0,0,0,0.35)}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%;overflow:auto;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial; background:radial-gradient(1200px 500px at 15% -10%, rgba(96,165,250,0.22), transparent 60%), radial-gradient(900px 500px at 85% 0%, rgba(94,234,212,0.14), transparent 55%), linear-gradient(180deg,#050914,#0b1220); color:var(--text)}
+.app{max-width:1400px;margin:0 auto;padding:12px 16px 16px;min-height:100%}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid rgba(27,42,75,0.7)}
+.title{font-size:18px;font-weight:700}
+.subtitle{font-size:11px;color:var(--muted);margin-top:1px}
+.status{padding:4px 8px;border:1px solid var(--border);border-radius:999px;color:var(--muted);background:rgba(255,255,255,0.02);font-size:11px}
+.status.ok{border-color:rgba(94,234,212,0.3);color:var(--accent)}
+.grid{display:grid;grid-template-columns:500px 1fr; gap:12px; align-items:start}
+.card{background:linear-gradient(180deg, rgba(16,26,47,0.92), rgba(12,18,33,0.82));border:1px solid rgba(27,42,75,0.85);border-radius:12px;padding:12px;box-shadow:var(--shadow)}
+.card h2{margin:0 0 8px 0;font-size:13px;color:#dbeafe}
+.form .row{display:flex;flex-direction:column;gap:4px;margin-bottom:8px}
+.row2{display:grid;grid-template-columns:1fr 1fr; gap:8px}
+label{font-size:11px;color:var(--muted)}
+input,select{background:rgba(255,255,255,0.03);border:1px solid rgba(27,42,75,0.9);border-radius:10px;padding:8px 10px;color:var(--text);outline:none;font-size:12px;line-height:1;min-height:36px}
+select{appearance:auto}
+select option{color:#0b1220;background:#ffffff}
+select optgroup{color:#0b1220;background:#ffffff}
+input:focus,select:focus{border-color:rgba(96,165,250,0.55);box-shadow:0 0 0 2px rgba(96,165,250,0.12)}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+button{border:1px solid rgba(94,234,212,0.35);background:rgba(94,234,212,0.08);color:var(--accent);padding:8px 10px;border-radius:10px;cursor:pointer;font-weight:600;font-size:12px;min-height:36px}
+button:hover{background:rgba(94,234,212,0.14)}
+button:active{transform:translateY(1px)}
+#btnClear{border-color:rgba(96,165,250,0.35);color:var(--accent2);background:rgba(96,165,250,0.08)}
+#btnClear:hover{background:rgba(96,165,250,0.14)}
+.details{margin-top:8px;border:1px solid rgba(27,42,75,0.9);border-radius:10px;padding:10px;background:rgba(255,255,255,0.02)}
+.details summary{cursor:pointer;color:#dbeafe;font-size:11px}
+.subcard{margin-top:10px;border:1px solid rgba(27,42,75,0.9);border-radius:10px;padding:10px;background:rgba(255,255,255,0.02)}
+.subcard h3{margin:0 0 8px 0;font-size:12px;color:#dbeafe}
+.run{display:flex;justify-content:space-between;gap:8px;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)}
+code{color:#dbeafe}
+.muted{color:var(--muted)}
+.hint{margin-top:8px;font-size:11px;color:var(--muted)}
+.pill{display:inline-flex;align-items:center;gap:4px;padding:4px 8px;border:1px solid var(--border);border-radius:999px;background:rgba(255,255,255,0.02);font-size:11px}
+.accountList{display:flex;flex-direction:column;gap:8px;margin-bottom:8px}
+.accountRow{display:grid;grid-template-columns:44px 1fr auto;gap:8px;align-items:start;padding:10px;border:1px solid rgba(27,42,75,0.6);border-radius:10px;background:rgba(255,255,255,0.015)}
+.accountRowsWrap{display:flex;flex-direction:column;gap:6px}
+.accountRowInner{display:grid;grid-template-columns:1fr 1fr;gap:8px;width:100%}
+.accountRowInner .row{margin-bottom:0}
+.accountActions{display:flex;align-items:center;height:72px}
+.accountTag{display:flex;align-items:center;justify-content:center;height:32px;border:1px solid var(--border);border-radius:8px;background:rgba(96,165,250,0.08);color:#dbeafe;font-weight:700;font-size:11px}
+.accountRow .row{margin-bottom:0}
+.accountRow .row input{padding:6px 8px;min-height:32px;font-size:11px}
+.btnDanger{border-color:rgba(251,113,133,0.35);color:var(--danger);background:rgba(251,113,133,0.08);padding:6px 8px;font-size:11px}
+.btnDanger:hover{background:rgba(251,113,133,0.14)}
+.smallLabel{font-size:10px;color:var(--muted)}
+.logs{display:flex;flex-direction:column;min-height:0;height:auto}
+.logsHeader{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+.logsControls{display:flex;align-items:center;gap:8px}
+.logsControls input{padding:6px 8px;min-height:32px;font-size:11px}
+.chk{display:flex;align-items:center;gap:4px;color:var(--muted);font-size:11px}
+.logBox{height:180px;overflow:auto;background:rgba(0,0,0,0.28);border:1px solid rgba(27,42,75,0.9);border-radius:10px;padding:10px;white-space:pre-wrap;word-break:break-word;font-size:11px;line-height:1.4}
+.logBox.statusBox{height:120px;border-color:rgba(94,234,212,0.3);background:rgba(94,234,212,0.05);font-weight:500}
+.logBox::-webkit-scrollbar{width:8px}
+.logBox::-webkit-scrollbar-thumb{background:rgba(96,165,250,0.18);border-radius:999px;border:2px solid rgba(0,0,0,0)}
+.logBox::-webkit-scrollbar-thumb:hover{background:rgba(96,165,250,0.28)}
+@media (max-width: 980px){.grid{grid-template-columns:1fr}.logBox{height:200px}}
+@media (max-width: 980px){.accountRow{grid-template-columns:44px 1fr auto}.accountRowInner{grid-template-columns:1fr 1fr}}
+.expiryRow{display:grid;grid-template-columns:55px 55px;gap:6px}

@@ -1,5 +1,12 @@
 const { z } = require('zod');
 
+const accountSchema = z.object({
+  email: z.string().email('Geçerli bir email adresi giriniz'),
+  password: z.string().min(1, 'Şifre zorunludur'),
+  identity: z.string().nullable().optional(),
+  fanCardCode: z.string().nullable().optional()
+});
+
 const botRequestSchema = z.object({
   team: z.string().min(1, 'Team zorunludur'),
   ticketType: z.enum(['combined', 'regular'], {
@@ -24,8 +31,16 @@ const botRequestSchema = z.object({
   }),
   fanCardCode: z.string().nullable().optional(),
   identity: z.string().nullable().optional(),
-  email: z.string().email('Geçerli bir email adresi giriniz'),
-  password: z.string().min(1, 'Şifre zorunludur'),
+  // Legacy single-account fields (backward compatible)
+  email: z.string().email('Geçerli bir email adresi giriniz').optional(),
+  password: z.string().min(1, 'Şifre zorunludur').optional(),
+  email2: z.string().email('Geçerli bir email adresi giriniz (2. hesap)').optional(),
+  password2: z.string().min(1, 'Şifre zorunludur (2. hesap)').optional(),
+
+  // New multi-account fields
+  aAccounts: z.array(accountSchema).optional(),
+  bAccounts: z.array(accountSchema).optional(),
+
   cardHolder: z.string().min(1, 'Kart sahibi adı zorunludur').optional(),
   cardNumber: z.string().regex(/^[\d\s]{13,19}$/, 'Geçerli bir kart numarası giriniz (13-19 haneli)').optional(),
   expiryMonth: z.string().regex(/^(0[1-9]|1[0-2])$/, 'Geçerli bir ay giriniz (01-12)').optional(),
@@ -35,8 +50,6 @@ const botRequestSchema = z.object({
   proxyPort: z.string().nullable().optional(),
   proxyUsername: z.string().nullable().optional(),
   proxyPassword: z.string().nullable().optional(),
-  email2: z.string().email('Geçerli bir email adresi giriniz (2. hesap)'),
-  password2: z.string().min(1, 'Şifre zorunludur (2. hesap)'),
 }).superRefine((data, ctx) => {
   const mode = String(data.categorySelectionMode || 'scan');
   if (mode === 'legacy') {
@@ -47,6 +60,26 @@ const botRequestSchema = z.object({
         message: 'Kategori tipi zorunludur'
       });
     }
+  }
+
+  const aList = Array.isArray(data.aAccounts) ? data.aAccounts : [];
+  const bList = Array.isArray(data.bAccounts) ? data.bAccounts : [];
+  const hasLegacyA = !!(data.email && data.password);
+  const hasLegacyB = !!(data.email2 && data.password2);
+
+  if (!aList.length && !hasLegacyA) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['aAccounts'],
+      message: 'En az 1 A hesabı zorunludur (aAccounts veya email/password)'
+    });
+  }
+  if (!bList.length && !hasLegacyB) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['bAccounts'],
+      message: 'En az 1 B hesabı zorunludur (bAccounts veya email2/password2)'
+    });
   }
 });
 
