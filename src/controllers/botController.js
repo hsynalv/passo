@@ -4808,5 +4808,3 @@ async function startBot(req, res) {
         }
     }
 }
-
-module.exports = {startBot, startBotAsync, registerCAccount, requestFinalize, getRunStatus, ensureTurnstileTokenOnPage};
