@@ -971,15 +971,12 @@ async function reloginIfRedirected(page, email, password) {
 
     const preUrl = currentUrl;
     const navRes = await Promise.race([
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 })
-            .then(() => ({ type: 'navigation' }))
-            .catch((e) => ({ type: 'nav_error', message: e?.message })),
-        page.waitForFunction((pre) => location.href !== pre, { timeout: 30000 }, preUrl)
-            .then(() => ({ type: 'url_change' }))
-            .catch((e) => ({ type: 'url_wait_error', message: e?.message })),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).then(() => ({ type: 'nav_ok' })).catch((e) => ({ type: 'nav_error', message: e?.message || String(e) })),
         delay(30000).then(() => ({ type: 'timeout' }))
     ]);
 
+    // Re-check URL after navigation settles (even if timeout)
+    await delay(500);
     const afterUrl = (() => {
         try { return page.url(); } catch { return ''; }
     })();
@@ -995,7 +992,8 @@ async function reloginIfRedirected(page, email, password) {
         const errorSelectors = [
             '.alert-danger', '.error-message', '.field-validation-error',
             '[class*="error"]', '[class*="hata"]',
-            '.swal2-title', '.swal2-html-container'
+            '.swal2-title', '.swal2-html-container',
+            '.toast-message', '.notification-error'
         ];
         for (const sel of errorSelectors) {
             const el = document.querySelector(sel);
@@ -1005,7 +1003,7 @@ async function reloginIfRedirected(page, email, password) {
         }
         // Check for specific error texts
         const bodyText = document.body?.innerText || '';
-        const errorKeywords = ['hatalı', 'yanlış', 'geçersiz', 'bulunamadı', ' şifre', 'kilit', 'bloke'];
+        const errorKeywords = ['hatalı', 'yanlış', 'geçersiz', 'bulunamadı', 'şifre', 'kilit', 'bloke', 'hesap', 'ban'];
         for (const kw of errorKeywords) {
             if (bodyText.toLowerCase().includes(kw)) {
                 return { keyword: kw, text: bodyText.substring(0, 200) };
@@ -1021,7 +1019,7 @@ async function reloginIfRedirected(page, email, password) {
     // Check if we ended up on home page (login failed)
     const isHomePage = afterUrl === 'https://www.passo.com.tr/' || afterUrl === 'https://www.passo.com.tr' || afterUrl?.endsWith('passo.com.tr/');
     if (isHomePage) {
-        logger.error('reloginIfRedirected: login başarısız, ana sayfaya yönlendirildi', { email, afterUrl, loginError });
+        logger.error('reloginIfRedirected: login başarısız, ana sayfaya yönlendirildi', { email, afterUrl, loginError, navRes });
         // Don't proceed with returnUrl navigation if login failed
         return false;
     }
@@ -1036,6 +1034,18 @@ async function reloginIfRedirected(page, email, password) {
             rejectIfHome: false,
             backoffMs: 400
         }).catch(() => {});
+        
+        // Check URL again after returnUrl navigation
+        await delay(500);
+        const finalUrl = (() => {
+            try { return page.url(); } catch { return ''; }
+        })();
+        
+        const isStillHomePage = finalUrl === 'https://www.passo.com.tr/' || finalUrl === 'https://www.passo.com.tr' || finalUrl?.endsWith('passo.com.tr/');
+        if (isStillHomePage) {
+            logger.error('reloginIfRedirected: returnUrl navigation sonrası hala ana sayfadayız', { email, finalUrl, originalAfterUrl: afterUrl });
+            return false;
+        }
     }
 
     const afterReturnUrl = (() => {
