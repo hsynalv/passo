@@ -141,30 +141,58 @@ function fmt(entry) {
 }
 
 function appendLogLine(line, entry) {
-  // Filter for main log box
-  if (state.filter) {
-    const s = line.toLowerCase();
-    if (!s.includes(state.filter)) return;
+  const div = document.createElement('div');
+  const text = String(line || '');
+  div.textContent = text;
+  
+  // Check if this is a separator line
+  const isSeparator = text.includes('[SEPARATOR]') || 
+                      text.includes('==================') ||
+                      text.includes('OTURUMLAR KAPATILDI');
+  
+  if (isSeparator) {
+    div.className = 'log-separator';
   }
-  logBox.textContent += line + '\n';
+  
+  // Full log box
+  if (state.filter && !text.toLowerCase().includes(state.filter)) {
+    div.style.display = 'none';
+  }
+  logBox.appendChild(div);
   if (state.autoScroll) logBox.scrollTop = logBox.scrollHeight;
 
-  // Check if this is a status/informative message for the status box
-  const simpleMsg = isStatusMessage(entry, line);
-  if (simpleMsg) {
-    const ts = entry?.ts ? new Date(entry.ts).toLocaleTimeString('tr-TR') : new Date().toLocaleTimeString('tr-TR');
-    const formatted = `${ts} ${simpleMsg}`;
-    // Keep only last 50 status messages
-    const maxStatusLines = 50;
-    const currentLines = statusBox.textContent.split('\n').filter(l => l.trim());
-    currentLines.push(formatted);
-    if (currentLines.length > maxStatusLines) {
-      currentLines.shift();
+  // Status box (simplified)
+  if (isSeparator) {
+    const sDiv = document.createElement('div');
+    sDiv.className = 'log-separator';
+    sDiv.textContent = '────────────────────────────────────────';
+    statusBox.appendChild(sDiv);
+    if (state.autoScrollStatus) statusBox.scrollTop = statusBox.scrollHeight;
+  } else {
+    const statusText = isStatusMessage(entry, line);
+    if (statusText) {
+      const sDiv = document.createElement('div');
+      sDiv.textContent = statusText;
+      statusBox.appendChild(sDiv);
+      if (state.autoScrollStatus) statusBox.scrollTop = statusBox.scrollHeight;
     }
-    statusBox.textContent = currentLines.join('\n') + '\n';
-    if (state.autoScrollStatus) {
-      statusBox.scrollTop = statusBox.scrollHeight;
+  }
+}
+
+async function killSessions() {
+  try {
+    const resp = await fetch('/kill-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const json = await resp.json();
+    if (resp.ok) {
+      infoLine(`Aktif oturumlar kapatıldı: ${json.killedCount} oturum`);
+    } else {
+      infoLine('Oturum kapatma hatası', { error: json.error || 'unknown' });
     }
+  } catch (err) {
+    infoLine('Oturum kapatma isteği başarısız', { error: err?.message || String(err) });
   }
 }
 
@@ -394,6 +422,11 @@ try {
     } catch (e) {
       infoLine('Finalize request failed', { error: e?.message || String(e) });
     }
+  });
+
+  $('btnKillSessions').addEventListener('click', async () => {
+    if (!confirm('Tüm aktif oturumları kapatmak istediğinize emin misiniz?')) return;
+    await killSessions();
   });
 } catch {}
 

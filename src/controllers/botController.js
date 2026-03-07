@@ -264,7 +264,16 @@ const runStore = (() => {
         if (!rid) return false;
         return runs.delete(rid);
     };
-    return { get, upsert, remove, safeRunId };
+    const list = () => Array.from(runs.values());
+    const listRunning = () => list().filter(r => r.status === 'running');
+    const killAllRunning = () => {
+        const running = listRunning();
+        running.forEach(r => {
+            upsert(r.runId, { status: 'killed', killedAt: nowIso() });
+        });
+        return running.map(r => r.runId);
+    };
+    return { get, upsert, remove, safeRunId, list, listRunning, killAllRunning };
 })();
 
 async function startBotAsync(req, res) {
@@ -385,6 +394,32 @@ async function getRunStatus(req, res) {
     } catch {}
     return res.json({ success: true, run: safe });
 }
+
+async function killSessions(req, res) {
+    const running = runStore.listRunning();
+    const killedRunIds = runStore.killAllRunning();
+    
+    // Log separator for visual distinction in logs
+    logger.info('==================================================');
+    logger.info('KILL_SESSIONS: Aktif oturumlar kapatılıyor', { 
+        runningCount: running.length, 
+        killedRunIds,
+        timestamp: new Date().toISOString()
+    });
+    logger.info('==================================================');
+    
+    // Also emit a special log entry that UI can detect
+    logger.info('[SEPARATOR] ------------------- OTURUMLAR KAPATILDI -------------------');
+    
+    return res.json({ 
+        success: true, 
+        killedCount: killedRunIds.length, 
+        killedRunIds,
+        runningCount: running.length
+    });
+}
+
+module.exports = { startBot, startBotAsync, registerCAccount, requestFinalize, getRunStatus, killSessions };
 
 // Global semaphore to avoid hammering captcha provider with too many parallel solves.
 // This helps reduce queueing and long tail solve times in multi-account runs.
@@ -1073,7 +1108,11 @@ async function clickBuy(page, eventAddress = null) {
     // FALLBACK: If button not found/clickable, navigate directly to /koltuk-secim
     if (eventAddress && String(eventAddress).includes('/etkinlik/')) {
         try {
-            const seatSelectionUrl = String(eventAddress).replace(/\/$/, '') + '/koltuk-secim';
+            // Check if URL already ends with /koltuk-secim
+            let seatSelectionUrl = String(eventAddress).replace(/\/+$/, '');
+            if (!seatSelectionUrl.endsWith('/koltuk-secim')) {
+                seatSelectionUrl = seatSelectionUrl + '/koltuk-secim';
+            }
             logger.info('clickBuy_fallback_navigating', { 
                 reason: 'button_not_found', 
                 fallbackUrl: seatSelectionUrl 
@@ -1086,7 +1125,8 @@ async function clickBuy(page, eventAddress = null) {
                 backoffMs: 450
             });
             // Verify we actually reached seat selection
-            const currentUrl = await page.url().catch(() => '');
+            let currentUrl = '';
+            try { currentUrl = page.url(); } catch {}
             if (String(currentUrl).includes('/koltuk-secim')) {
                 logger.info('clickBuy_fallback_success', { url: currentUrl });
                 return true;

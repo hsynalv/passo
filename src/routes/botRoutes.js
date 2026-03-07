@@ -1,11 +1,13 @@
 const express = require('express');
 const router = express.Router();
-const { startBot, startBotAsync, registerCAccount, requestFinalize, getRunStatus } = require('../controllers/botController');
+const { startBot, startBotAsync, registerCAccount, requestFinalize, getRunStatus, killSessions } = require('../controllers/botController');
 const { botRateLimiter } = require('../middleware/rateLimiter');
 const logger = require('../utils/logger');
 
 router.post('/start-bot', botRateLimiter, startBot);
 router.post('/start-bot-async', botRateLimiter, startBotAsync);
+
+router.post('/kill-sessions', botRateLimiter, killSessions);
 
 router.get('/logs/stream', (req, res) => {
     res.status(200);
