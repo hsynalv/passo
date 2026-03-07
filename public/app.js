@@ -203,7 +203,10 @@ function isStatusMessage(entry, line) {
   // Helper to format seat details from meta
   const formatSeatDetails = (m) => {
     const parts = [];
-    if (m.blockText || m.blockName) parts.push(`Blok: ${m.blockText || m.blockName}`);
+    // Use combined if available (has full seat info: tribune block row seat)
+    if (m.combined) return ` (${m.combined})`;
+    if (m.tribune) parts.push(`Tribün: ${m.tribune}`);
+    if (m.block || m.blockText || m.blockName) parts.push(`Blok: ${m.block || m.blockText || m.blockName}`);
     if (m.categoryText || m.categoryName) parts.push(`Kat: ${m.categoryText || m.categoryName}`);
     if (m.row || m.rowNumber) parts.push(`Sıra: ${m.row || m.rowNumber}`);
     if (m.seat || m.seatNumber || m.seatNum) parts.push(`Koltuk: ${m.seat || m.seatNumber || m.seatNum}`);

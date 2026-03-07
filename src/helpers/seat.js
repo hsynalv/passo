@@ -1477,8 +1477,30 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
       for (let w=0; w<20; w++){
           await ensureOnSeatPage('verify_wait');
           const data = await readBasketData(page);
-          if (data && (data.row && data.seat)) return data;
-          if (data && data.inBasket && isBasketLikeUrl(data.url)) return data;
+          if (data && (data.row && data.seat)) {
+            logger.info(`seatPick:${context}:basket_success`, {
+              tribune: data.tribune,
+              block: data.block,
+              row: data.row,
+              seat: data.seat,
+              combined: data.combined,
+              seatId: data.seatId,
+              blockId: data.blockId
+            });
+            return data;
+          }
+          if (data && data.inBasket && isBasketLikeUrl(data.url)) {
+            logger.info(`seatPick:${context}:basket_success`, {
+              tribune: data.tribune,
+              block: data.block,
+              row: data.row,
+              seat: data.seat,
+              combined: data.combined,
+              seatId: data.seatId,
+              blockId: data.blockId
+            });
+            return data;
+          }
           await delay(200);
       }
       // olmadıysa dön ama RE-CLICK yok; sadece tekrar devam dener
