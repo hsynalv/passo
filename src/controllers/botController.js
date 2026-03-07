@@ -990,7 +990,42 @@ async function reloginIfRedirected(page, email, password) {
         afterUrl
     });
 
-    // Even if we appear to be stuck on /giris, sometimes the session is already valid.
+    // Check for login error messages on the page
+    const loginError = await page.evaluate(() => {
+        const errorSelectors = [
+            '.alert-danger', '.error-message', '.field-validation-error',
+            '[class*="error"]', '[class*="hata"]',
+            '.swal2-title', '.swal2-html-container'
+        ];
+        for (const sel of errorSelectors) {
+            const el = document.querySelector(sel);
+            if (el && el.textContent) {
+                return { selector: sel, text: el.textContent.trim() };
+            }
+        }
+        // Check for specific error texts
+        const bodyText = document.body?.innerText || '';
+        const errorKeywords = ['hatalı', 'yanlış', 'geçersiz', 'bulunamadı', ' şifre', 'kilit', 'bloke'];
+        for (const kw of errorKeywords) {
+            if (bodyText.toLowerCase().includes(kw)) {
+                return { keyword: kw, text: bodyText.substring(0, 200) };
+            }
+        }
+        return null;
+    }).catch(() => null);
+
+    if (loginError) {
+        logger.error('reloginIfRedirected: login hatası tespit edildi', { email, loginError });
+    }
+
+    // Check if we ended up on home page (login failed)
+    const isHomePage = afterUrl === 'https://www.passo.com.tr/' || afterUrl === 'https://www.passo.com.tr' || afterUrl?.endsWith('passo.com.tr/');
+    if (isHomePage) {
+        logger.error('reloginIfRedirected: login başarısız, ana sayfaya yönlendirildi', { email, afterUrl, loginError });
+        // Don't proceed with returnUrl navigation if login failed
+        return false;
+    }
+
     // Force navigation to returnUrl (if any) to re-enter the flow.
     if (returnUrl) {
         logger.info('reloginIfRedirected: returnUrl sayfasına dönülüyor', { email, returnUrl });
