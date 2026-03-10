@@ -3207,17 +3207,45 @@ async function startBot(req, res) {
                 await ensureTurnstileTokenOnPage(page, acc.email, `${label}.seatSelection`, { background: true });
                 setStep(`${label}.turnstile.ensure.done`, { snap: await snapshotPage(page, `${label}.afterTurnstileEnsure`) });
 
-                // IMPORTANT: In transfer strategy, B must NOT open seatmap before A releases the seat.
-                // Keep B parked on /koltuk-secim with turnstile ready; seatmap will be mounted post-release.
+                // IMPORTANT: B must be ready with seatmap mounted BEFORE A releases.
+                // Open seatmap now so B can immediately click when A releases.
                 const seatSelectionUrl = (() => { try { return page.url(); } catch { return null; } })();
                 audit('b_prepared', { idx: i, email: acc.email, seatSelectionUrl });
 
-                // Passo may mount seatmap automatically on /koltuk-secim; to prevent any pre-release seatmap load,
-                // park B on a neutral page and navigate back only after A releases.
+                // Open category/block and seatmap for B before release
+                setStep(`${label}.preRelease.categoryBlock.start`);
                 try {
-                    await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 10000 });
-                    audit('b_standby_parked', { idx: i, email: acc.email });
-                } catch {}
+                    await applyCategoryBlockSelection(page, categorySelectionMode, null, null);
+                    audit('b_pre_release_cat_block', { idx: i, email: acc.email, categorySelectionMode });
+                } catch (e) {
+                    audit('b_pre_release_cat_block_warn', { idx: i, email: acc.email, error: e?.message }, 'warn');
+                }
+
+                setStep(`${label}.preRelease.seatmap.start`);
+                let seatmapReady = false;
+                for (let attempt = 1; attempt <= 3; attempt++) {
+                    try {
+                        await openSeatMapStrict(page);
+                        await page.waitForFunction((sel) => {
+                            try { return document.querySelectorAll(sel).length > 0; } catch { return false; }
+                        }, { timeout: 15000 }, SEAT_NODE_SELECTOR);
+                        seatmapReady = true;
+                        audit('b_pre_release_seatmap_ready', { idx: i, email: acc.email, attempt });
+                        break;
+                    } catch (e) {
+                        audit('b_pre_release_seatmap_attempt', { idx: i, email: acc.email, attempt, error: e?.message }, 'warn');
+                        if (attempt < 3) await delay(500 + (attempt * 300));
+                    }
+                }
+
+                if (!seatmapReady) {
+                    audit('b_pre_release_seatmap_failed', { idx: i, email: acc.email }, 'warn');
+                }
+
+                // Keep B on seat selection but ready for immediate pick
+                setStep(`${label}.preRelease.ready`, { seatmapReady });
+                audit('b_standby_ready', { idx: i, email: acc.email, seatmapReady, url: (() => { try { return page.url(); } catch { return null; } })() });
+
                 return {
                     idx: i,
                     label,
@@ -3225,7 +3253,8 @@ async function startBot(req, res) {
                     password: acc.password,
                     browser,
                     page,
-                    seatSelectionUrl
+                    seatSelectionUrl,
+                    seatmapReady
                 };
                 });
                 setStep('MULTI.B.prepare.done', { bCount: bCtxList.length });
@@ -3608,39 +3637,37 @@ async function startBot(req, res) {
                     attempts: aRemoveAttempts
                 });
 
-                // Now that A released, navigate B back to seat selection.
+                // B is already on seat selection with seatmap ready - just apply correct category/block
+                setStep(`PAIR${i}.b_apply_catblock.start`, { seatmapReady: bCtx.seatmapReady });
+                audit('b_apply_catblock_start', { idx: i, bEmail: bCtx.email, seatId: aCtx.seatInfo.seatId, seatmapReady: bCtx.seatmapReady });
+
+                // Apply A's category/block to B for faster exact pick
                 try {
-                    if (bCtx.seatSelectionUrl) {
-                        await gotoWithRetry(bCtx.page, String(bCtx.seatSelectionUrl), {
-                            retries: 2,
-                            waitUntil: 'domcontentloaded',
-                            expectedUrlIncludes: '/koltuk-secim',
-                            rejectIfHome: false,
-                            backoffMs: 450
-                        });
+                    await applyCategoryBlockSelection(bCtx.page, categorySelectionMode, aCtx.catBlock, aCtx.seatInfo);
+                    audit('b_catblock_applied', { idx: i, bEmail: bCtx.email, seatId: aCtx.seatInfo.seatId });
+                } catch (e) {
+                    audit('b_catblock_apply_warn', { idx: i, bEmail: bCtx.email, error: e?.message }, 'warn');
+                }
+
+                // Re-open seatmap to refresh with new block
+                if (!bCtx.seatmapReady) {
+                    try {
+                        await openSeatMapStrict(bCtx.page);
+                        await bCtx.page.waitForFunction((sel) => {
+                            try { return document.querySelectorAll(sel).length > 0; } catch { return false; }
+                        }, { timeout: 10000 }, SEAT_NODE_SELECTOR);
+                        audit('b_seatmap_reopened', { idx: i, bEmail: bCtx.email });
+                    } catch (e) {
+                        audit('b_seatmap_reopen_failed', { idx: i, bEmail: bCtx.email, error: e?.message }, 'warn');
                     }
-                } catch {}
+                }
 
-                // start B exact pick AFTER release so the whole timeout window is spent post-release
-                const exactMaxMs = Math.max(12000, Math.min(cfg.TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 60000));
+                setStep(`PAIR${i}.b_apply_catblock.done`);
 
-                // Post-release refresh of category/block/seatmap can sometimes block for a long time.
-                // Do not delay the exact-pick window; run refresh best-effort in background.
-                try {
-                    (async () => {
-                        try {
-                            await Promise.race([
-                                (async () => {
-                                    try { await applyCategoryBlockSelection(bCtx.page, categorySelectionMode, aCtx.catBlock, aCtx.seatInfo); } catch {}
-                                    try { await openSeatMapStrict(bCtx.page); } catch {}
-                                })(),
-                                delay(5000)
-                            ]);
-                        } catch {}
-                    })();
-                } catch {}
+                // start B exact pick immediately with short timeout for fast response
+                const exactMaxMs = Math.max(8000, Math.min(cfg.TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 30000));
 
-                audit('b_exact_pick_start', { idx: i, bEmail: bCtx.email, seatId: aCtx.seatInfo.seatId, maxMs: exactMaxMs });
+                audit('b_exact_pick_start', { idx: i, bEmail: bCtx.email, seatId: aCtx.seatInfo.seatId, maxMs: exactMaxMs, seatmapReady: bCtx.seatmapReady });
                 const exactPromise = pickExactSeatWithVerify_ReleaseAware(bCtx.page, aCtx.seatInfo, exactMaxMs);
 
                 let seatBInfo = null;
