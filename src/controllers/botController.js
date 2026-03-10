@@ -2,6 +2,8 @@ const {connect} = require('puppeteer-real-browser');
 const axios = require('axios');
 const ac = require('@antiadmin/anticaptchaofficial');
 const { randomUUID } = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { botRequestSchema } = require('../validators/botRequest');
 
 const cfg = require('../config');
@@ -14,6 +16,8 @@ const { captureSeatIdFromNetwork, readBasketData, readCatBlock, setCatBlockOnB, 
 const { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware } = require('../helpers/seat');
 
 ac.setAPIKey(cfg.ANTICAPTCHA_KEY || '');
+
+const isLoginUrl = (u) => /\/giris(\?|$)/i.test(String(u || ''));
 
 async function selectSvgBlockById(page, blockId) {
     const safeId = String(blockId || '').trim();
@@ -900,6 +904,17 @@ async function launchAndLogin(options) {
         logger.info('launchAndLogin: login sonrası snapshot', { email, snap: postLogin });
     } catch {}
 
+    const afterLoginUrl = (() => {
+        try { return page.url(); } catch { return ''; }
+    })();
+    if (isLoginUrl(afterLoginUrl)) {
+        logger.warn('launchAndLogin: login tamamlanamadı, hala login sayfasında', {
+            email,
+            afterLoginUrl
+        });
+        throw new Error('LOGIN_NOT_COMPLETED');
+    }
+
     return {browser, page};
 }
 
@@ -1001,12 +1016,22 @@ async function reloginIfRedirected(page, email, password) {
                 return { selector: sel, text: el.textContent.trim() };
             }
         }
-        // Check for specific error texts
+        // Check for explicit login-failed phrases only (avoid false positives from static "Şifre" labels)
         const bodyText = document.body?.innerText || '';
-        const errorKeywords = ['hatalı', 'yanlış', 'geçersiz', 'bulunamadı', 'şifre', 'kilit', 'bloke', 'hesap', 'ban'];
-        for (const kw of errorKeywords) {
-            if (bodyText.toLowerCase().includes(kw)) {
-                return { keyword: kw, text: bodyText.substring(0, 200) };
+        const lower = bodyText.toLowerCase();
+        const errorPhrases = [
+            'hatalı e-posta',
+            'hatalı email',
+            'hatalı şifre',
+            'şifreniz hatalı',
+            'e-posta veya şifre hatalı',
+            'geçersiz kullanıcı',
+            'hesabınız kilitlendi',
+            'çok fazla başarısız giriş'
+        ];
+        for (const phrase of errorPhrases) {
+            if (lower.includes(phrase)) {
+                return { phrase, text: bodyText.substring(0, 240) };
             }
         }
         return null;
@@ -2681,6 +2706,18 @@ async function startBot(req, res) {
         } catch {}
         try { return randomUUID(); } catch { return `${Date.now()}_${Math.random().toString(16).slice(2)}`; }
     })();
+    const runProfileStamp = `${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+    const runProfileKey = String(runId || '').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const buildRunUserDataDir = (baseDir, label) => {
+        const base = String(baseDir || '').trim();
+        if (!base) return base;
+        const suffix = `run-${runProfileKey}-${runProfileStamp}-${String(label || 'X')}`;
+        const hasTrailingSep = /[\\\/]$/.test(base);
+        return `${base}${hasTrailingSep ? '' : '/'}${suffix}`;
+    };
+    const userDataDirA = buildRunUserDataDir(cfg.USER_DATA_DIR_A, 'A');
+    const userDataDirB = buildRunUserDataDir(cfg.USER_DATA_DIR_B, 'B');
+    const userDataDirC = buildRunUserDataDir(cfg.USER_DATA_DIR_B, 'C');
     const audit = (event, meta = {}, level = 'info') => {
         const payload = {
             runId,
@@ -2694,6 +2731,40 @@ async function startBot(req, res) {
             return logger.infoSafe('audit', payload);
         } catch {
             try { logger.info('audit', payload); } catch {}
+        }
+    };
+    const debugArtifactsEnabled = String(process.env.DEBUG_ARTIFACTS_ENABLED || 'true').toLowerCase() !== 'false';
+    const runArtifactsDir = path.join(process.cwd(), 'logs', 'runs', runProfileKey);
+    const writeDebugArtifact = async (tag, page, meta = {}) => {
+        if (!debugArtifactsEnabled || !page) return null;
+        const safeTag = String(tag || 'artifact').replace(/[^a-zA-Z0-9._-]/g, '_');
+        const stamp = `${Date.now()}`;
+        const base = `${stamp}_${safeTag}`;
+        const out = {
+            meta: path.join(runArtifactsDir, `${base}.json`),
+            screenshot: path.join(runArtifactsDir, `${base}.png`),
+            html: path.join(runArtifactsDir, `${base}.html`)
+        };
+        try {
+            fs.mkdirSync(runArtifactsDir, { recursive: true });
+            const payload = {
+                runId,
+                tag: safeTag,
+                ts: new Date().toISOString(),
+                url: (() => { try { return page.url(); } catch { return null; } })(),
+                title: await page.title().catch(() => null),
+                ...meta
+            };
+            try { fs.writeFileSync(out.meta, JSON.stringify(payload, null, 2), 'utf8'); } catch {}
+            try { await page.screenshot({ path: out.screenshot, fullPage: true }).catch(() => null); } catch {}
+            try {
+                const html = await page.content().catch(() => null);
+                if (html) fs.writeFileSync(out.html, html, 'utf8');
+            } catch {}
+            return out;
+        } catch (e) {
+            logger.warn('debug_artifact_write_failed', { runId, tag: safeTag, error: e?.message || String(e) });
+            return null;
         }
     };
 
@@ -2748,7 +2819,7 @@ async function startBot(req, res) {
         ({ browser: browserC, page: pageC } = await launchAndLogin({
             email: cAcc.email,
             password: cAcc.password,
-            userDataDir: `${cfg.USER_DATA_DIR_B}_C`,
+            userDataDir: userDataDirC,
             proxyHost,
             proxyPort,
             proxyUsername,
@@ -3131,7 +3202,7 @@ async function startBot(req, res) {
                 }
                 setStep(`${label}.launchAndLogin.start`, { email: acc.email });
                 audit('account_launch_start', { role: 'B', idx: i, email: acc.email });
-                const userDataDir = `${cfg.USER_DATA_DIR_B}_${i}`;
+                const userDataDir = buildRunUserDataDir(cfg.USER_DATA_DIR_B, `B${i}`);
                 const { browser, page } = await launchAndLogin({
                     email: acc.email,
                     password: acc.password,
@@ -3268,7 +3339,7 @@ async function startBot(req, res) {
                 audit('multi_a_hold_start', { aCount: aList.length, concurrency: multiAConcurrency, multiStaggerMs });
                 const aCtxList = await poolMap(aList, multiAConcurrency, async (acc, i) => {
                 const label = `A${i}`;
-                const userDataDir = `${cfg.USER_DATA_DIR_A}_${i}`;
+                const userDataDir = buildRunUserDataDir(cfg.USER_DATA_DIR_A, `A${i}`);
 
                 if (multiStaggerMs > 0) {
                     try { await delay(i * multiStaggerMs); } catch {}
@@ -3724,7 +3795,7 @@ async function startBot(req, res) {
         setStep('A.launchAndLogin.start', { email: emailA });
         audit('account_launch_start', { role: 'A', idx: 0, email: emailA });
         ({browser: browserA, page: pageA} = await launchAndLogin({
-            email: emailA, password: passwordA, userDataDir: cfg.USER_DATA_DIR_A, proxyHost, proxyPort, proxyUsername, proxyPassword
+            email: emailA, password: passwordA, userDataDir: userDataDirA, proxyHost, proxyPort, proxyUsername, proxyPassword
         }));
         setStep('A.launchAndLogin.done', { email: emailA, snap: await snapshotPage(pageA, 'A.afterLogin') });
         audit('account_launch_done', { role: 'A', idx: 0, email: emailA, url: (() => { try { return pageA.url(); } catch { return null; } })() });
@@ -3736,7 +3807,7 @@ async function startBot(req, res) {
         ({browser: browserB, page: pageB} = await launchAndLogin({
             email: emailB,
             password: passwordB,
-            userDataDir: cfg.USER_DATA_DIR_B,
+            userDataDir: userDataDirB,
             proxyHost,
             proxyPort,
             proxyUsername,
@@ -3793,6 +3864,7 @@ async function startBot(req, res) {
         ]);
         await pageA.waitForSelector('.custom-select-box, .ticket-type-title, #custom_seat_button', { timeout: 10000 }).catch(() => {});
         setStep('A.waitNavAfterBuy.done', { result: aNavResult, snap: await snapshotPage(pageA, 'A.afterBuyNav') });
+        await writeDebugArtifact('A_after_buy_nav', pageA, { result: aNavResult, preUrl: aPreUrl });
 
         setStep('A.postBuy.ensureUrl.start');
         const aUrlCheck = await ensureUrlContains(pageA, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
@@ -3802,6 +3874,7 @@ async function startBot(req, res) {
         setStep('A.postBuy.reloginCheck.start');
         const aRelog = await reloginIfRedirected(pageA, emailA, passwordA);
         setStep('A.postBuy.reloginCheck.done', { relogged: aRelog, snap: await snapshotPage(pageA, 'A.afterReloginCheck') });
+        await writeDebugArtifact('A_after_relogin_check', pageA, { relogged: aRelog });
 
         const psA2 = await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity });
         if (psA2) {
@@ -3811,6 +3884,7 @@ async function startBot(req, res) {
         setStep('A.seatSelection.turnstile.ensure.start');
         await ensureTurnstileTokenOnPage(pageA, emailA, 'A.seatSelection');
         setStep('A.seatSelection.turnstile.ensure.done', { snap: await snapshotPage(pageA, 'A.afterTurnstileEnsure') });
+        await writeDebugArtifact('A_before_category_selection', pageA, {});
 
         // Hard guard: compute canonical seat selection URL and force navigation back to /koltuk-secim if we drifted.
         const canonicalSeatUrlA = (() => {
@@ -3827,34 +3901,33 @@ async function startBot(req, res) {
             }
         })();
 
-        try {
-            const okNow = await ensureUrlContains(pageA, '/koltuk-secim', { retries: 0, waitMs: 10 });
-            if (!okNow?.ok && canonicalSeatUrlA) {
-                logger.warn('A.force_goto_canonical_seat_url', {
-                    currentUrl: (() => { try { return pageA.url(); } catch { return null; } })(),
-                    canonicalSeatUrlA
+        const okNow = await ensureUrlContains(pageA, '/koltuk-secim', { retries: 0, waitMs: 10 });
+        if (!okNow?.ok && canonicalSeatUrlA) {
+            logger.warn('A.force_goto_canonical_seat_url', {
+                currentUrl: (() => { try { return pageA.url(); } catch { return null; } })(),
+                canonicalSeatUrlA
+            });
+            try {
+                await gotoWithRetry(pageA, canonicalSeatUrlA, {
+                    retries: 3,
+                    waitUntil: 'domcontentloaded',
+                    expectedUrlIncludes: '/koltuk-secim',
+                    rejectIfHome: true,
+                    backoffMs: 450
                 });
-                try {
-                    await gotoWithRetry(pageA, canonicalSeatUrlA, {
-                        retries: 3,
-                        waitUntil: 'domcontentloaded',
-                        expectedUrlIncludes: '/koltuk-secim',
-                        rejectIfHome: true,
-                        backoffMs: 450
-                    });
-                } catch {}
+            } catch {}
 
-                const okAfter = await ensureUrlContains(pageA, '/koltuk-secim', {
-                    retries: 1,
-                    waitMs: 9000,
-                    backoffMs: 450,
-                    recoveryUrl: canonicalSeatUrlA
-                }).catch(() => null);
-                if (!okAfter?.ok) {
-                    throw new Error('Seat selection sayfasına gidilemedi (/koltuk-secim)');
-                }
+            const okAfter = await ensureUrlContains(pageA, '/koltuk-secim', {
+                retries: 1,
+                waitMs: 9000,
+                backoffMs: 450,
+                recoveryUrl: canonicalSeatUrlA
+            }).catch(() => null);
+            if (!okAfter?.ok) {
+                await writeDebugArtifact('A_canonical_seat_url_failed', pageA, { okNow, okAfter, canonicalSeatUrlA });
+                throw new Error('Seat selection sayfasına gidilemedi (/koltuk-secim)');
             }
-        } catch {}
+        }
 
         // If we are still on login page, recover by navigating to decoded returnUrl.
         try {
@@ -4805,6 +4878,8 @@ async function startBot(req, res) {
         
         const snapA = await snapshotPage(pageA, 'A.onError');
         const snapB = await snapshotPage(pageB, 'B.onError');
+        await writeDebugArtifact('A_on_error', pageA, { lastStep, error: String(err?.message || err) });
+        await writeDebugArtifact('B_on_error', pageB, { lastStep, error: String(err?.message || err) });
         logger.errorSafe('Bot hatası', err, {
             team,
             ticketType,
