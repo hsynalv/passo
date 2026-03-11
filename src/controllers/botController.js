@@ -1,13 +1,14 @@
-const {connect} = require('puppeteer-real-browser');
+const { connect: realBrowserConnect } = require('puppeteer-real-browser');
+const rebrowserPuppeteer = require('rebrowser-puppeteer-core');
 const axios = require('axios');
 const ac = require('@antiadmin/anticaptchaofficial');
 const { randomUUID } = require('crypto');
 const fs = require('fs');
-const path = require('path');
 const { botRequestSchema } = require('../validators/botRequest');
 
 const cfg = require('../config');
 const delay = require('../utils/delay');
+const { evaluateSafe, waitForFunctionSafe } = require('../utils/browserEval');
 const logger = require('../utils/logger');
 const { formatError, formatSuccess } = require('../utils/messages');
 const { BasketTimer, checkBasketTimeoutFromPage } = require('../utils/basketTimer');
@@ -16,8 +17,6 @@ const { captureSeatIdFromNetwork, readBasketData, readCatBlock, setCatBlockOnB, 
 const { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware } = require('../helpers/seat');
 
 ac.setAPIKey(cfg.ANTICAPTCHA_KEY || '');
-
-const isLoginUrl = (u) => /\/giris(\?|$)/i.test(String(u || ''));
 
 async function selectSvgBlockById(page, blockId) {
     const safeId = String(blockId || '').trim();
@@ -450,6 +449,12 @@ const createSemaphore = (max) => {
 
 const turnstileSolveSem = createSemaphore(cfg?.TIMEOUTS?.TURNSTILE_SOLVE_CONCURRENCY || 2);
 
+async function evalOnPage(page, scriptBody, args) {
+    const payload = JSON.stringify(Array.isArray(args) ? args : []).replace(/</g, '\\u003c');
+    const script = `(function(){var __args=${payload};${scriptBody}})()`;
+    return evaluateSafe(page, script);
+}
+
 async function ensureTurnstileTokenOnPage(page, email, label, options) {
     if (!page) return { attempted: false };
 
@@ -467,22 +472,26 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
     };
     const cache = getCache();
 
-    const maxAttempts = 2;
+    const maxAttempts = Math.max(1, Number(cfg?.TIMEOUTS?.TURNSTILE_MAX_ATTEMPTS) || 2);
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-            const state = await page.evaluate(() => {
-                const bodyText = (document.body?.innerText || '').toLowerCase();
-                const hasVerifyHuman = bodyText.includes('verify you are human');
-                const hasWidget = !!document.querySelector('.cf-turnstile');
-                const input = document.querySelector('input[name="cf-turnstile-response"]');
-                const hasTokenField = !!input;
-                const tokenLen = input?.value ? input.value.length : 0;
-                return { hasVerifyHuman, hasWidget, hasTokenField, tokenLen };
-            });
-
-            logger.info('turnstile:state', { email, label, attempt, state, background });
+            const state = await evalOnPage(page, `
+                var body = document.body;
+                var bodyText = body && body.innerText ? String(body.innerText).toLowerCase() : '';
+                var hasVerifyHuman = bodyText.indexOf('verify you are human') >= 0;
+                var hasWidget = !!document.querySelector('.cf-turnstile');
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                var hasTokenField = !!input;
+                var tokenLen = (input && input.value) ? String(input.value).length : 0;
+                return { hasVerifyHuman: hasVerifyHuman, hasWidget: hasWidget, hasTokenField: hasTokenField, tokenLen: tokenLen };
+            `);
 
             const shouldSolve = (state.hasVerifyHuman || state.hasWidget || state.hasTokenField) && state.tokenLen <= 0;
+            if (shouldSolve) {
+                logger.info('turnstile:state', { email, label, attempt, state, background });
+            } else {
+                logger.debug('turnstile:state', { email, label, attempt, state, background });
+            }
             if (!shouldSolve) return { attempted: false, state };
 
             if (!cfg.PASSO_SITE_KEY || !cfg.ANTICAPTCHA_KEY) {
@@ -533,10 +542,11 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
                     tokenLength: tok ? String(tok).length : 0
                 });
 
-                await page.evaluate((token) => {
-                    const f = document.querySelector('form') || document.body;
+                await evalOnPage(page, `
+                    var token = (__args && __args.length) ? __args[0] : '';
+                    var f = document.querySelector('form') || document.body;
                     if (!f) return;
-                    let i = document.querySelector('input[name="cf-turnstile-response"]');
+                    var i = document.querySelector('input[name="cf-turnstile-response"]');
                     if (!i) {
                         i = document.createElement('input');
                         i.type = 'hidden';
@@ -546,12 +556,13 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
                     i.value = token;
                     i.dispatchEvent(new Event('input', { bubbles: true }));
                     i.dispatchEvent(new Event('change', { bubbles: true }));
-                }, tok);
+                `, [tok]);
 
-                const after = await page.evaluate(() => {
-                    const input = document.querySelector('input[name="cf-turnstile-response"]');
-                    return { hasTokenField: !!input, tokenLen: input?.value ? input.value.length : 0 };
-                });
+                const after = await evalOnPage(page, `
+                    var input = document.querySelector('input[name="cf-turnstile-response"]');
+                    var tokenLen = (input && input.value) ? String(input.value).length : 0;
+                    return { hasTokenField: !!input, tokenLen: tokenLen };
+                `);
                 logger.info('turnstile:inject_check', { email, label, attempt, after });
                 return { attempted: true, state, after };
             })();
@@ -594,7 +605,23 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
 }
 
 function buildProxyArgs(proxyHost, proxyPort) {
-    const args = ['--window-size=1920,1080'];
+    const windowSize = process.env.BROWSER_WINDOW_SIZE || '1280,720';
+    const args = [
+        `--window-size=${windowSize}`,
+        '--disable-extensions',
+        '--disable-sync',
+        '--disable-translate',
+        '--mute-audio',
+        '--no-first-run',
+        '--disable-default-apps',
+        '--disable-background-networking',
+        '--disable-background-downloads',
+        '--disable-hang-monitor',
+        '--disable-prompt-on-repost',
+        '--metrics-recording-only',
+        '--safebrowsing-disable-auto-update',
+        '--disable-client-side-phishing-detection'
+    ];
     let proxyApplied = false;
     if (proxyHost && proxyPort) {
         let host = String(proxyHost).trim();
@@ -605,6 +632,74 @@ function buildProxyArgs(proxyHost, proxyPort) {
         proxyApplied = true;
     }
     return {args, proxyApplied};
+}
+
+function resolveBrowserExecutablePath(configuredPath) {
+    const raw = String(configuredPath || '').trim().replace(/^['"]|['"]$/g, '');
+    const localAppData = process.env.LOCALAPPDATA || 'C:\\Users\\Default\\AppData\\Local';
+    const programFiles = process.env.PROGRAMFILES || 'C:\\Program Files';
+    const programFilesX86 = process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
+
+    const candidates = [
+        raw,
+        `${programFiles}\\Google\\Chrome\\Application\\chrome.exe`,
+        `${programFilesX86}\\Google\\Chrome\\Application\\chrome.exe`,
+        `${localAppData}\\Google\\Chrome\\Application\\chrome.exe`,
+        `${programFiles}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe`,
+        `${programFilesX86}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe`,
+        `${localAppData}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe`,
+        `${programFiles}\\Microsoft\\Edge\\Application\\msedge.exe`,
+        `${programFilesX86}\\Microsoft\\Edge\\Application\\msedge.exe`,
+        `${localAppData}\\Microsoft\\Edge\\Application\\msedge.exe`
+    ].filter(Boolean);
+
+    for (const candidate of candidates) {
+        try {
+            if (fs.existsSync(candidate)) return candidate;
+        } catch {}
+    }
+    return null;
+}
+
+async function connectStableBrowser({ chromePath, userDataDir, args }) {
+    try {
+        return await realBrowserConnect({
+            headless: false,
+            turnstile: false,
+            args,
+            customConfig: {
+                chromePath,
+                userDataDir
+            },
+            connectOption: {
+                defaultViewport: null
+            }
+        });
+    } catch (e) {
+        const msg = e?.message || String(e);
+        const canFallback = /Invalid host defined options/i.test(msg) || !!process.pkg;
+        if (!canFallback) throw e;
+
+        logger.warn('launchAndLogin: real-browser connect failed, using puppeteer-core fallback', { error: msg });
+
+        if (!chromePath) {
+            throw new Error(
+                'Chrome/Brave/Edge bulunamadi. CHROME_PATH ayarlayin veya tarayici kurulumunu kontrol edin.'
+            );
+        }
+
+        const launchOpts = {
+            headless: false,
+            executablePath: chromePath,
+            userDataDir,
+            args,
+            defaultViewport: null
+        };
+        const browser = await rebrowserPuppeteer.launch(launchOpts);
+        let [page] = await browser.pages();
+        if (!page) page = await browser.newPage();
+        return { browser, page };
+    }
 }
 
 async function launchAndLogin(options) {
@@ -618,19 +713,23 @@ async function launchAndLogin(options) {
     const proxyPassword = opts.proxyPassword;
 
     const {args, proxyApplied} = buildProxyArgs(proxyHost, proxyPort);
+    const chromePath = resolveBrowserExecutablePath(cfg.CHROME_PATH);
+
+    if (userDataDir) {
+        try {
+            fs.mkdirSync(userDataDir, { recursive: true });
+        } catch (e) {
+            logger.warn('launchAndLogin: userDataDir oluşturulamadı', { userDataDir, error: e?.message });
+        }
+    }
+
     logger.debug('launchAndLogin: browser connect başlıyor', {
         email,
         userDataDir,
-        proxyApplied
+        proxyApplied,
+        chromePath: chromePath || 'not-found'
     });
-    const ret = await connect({
-        executablePath: cfg.CHROME_PATH,
-        userDataDir,
-        headless: false,
-        turnstile: false,
-        args,
-        defaultViewport: null
-    });
+    const ret = await connectStableBrowser({ chromePath, userDataDir, args });
     const browser = ret.browser;
     const page = ret.page || await ensurePage(browser);
     try {
@@ -704,20 +803,31 @@ async function launchAndLogin(options) {
     } catch {}
 
     try {
-        const snap0 = await page.evaluate(() => {
-            const bodyText = (document.body?.innerText || '').toLowerCase();
-            const hasVerifyHuman = bodyText.includes('verify you are human');
-            const hasTurnstileWidget = !!document.querySelector('.cf-turnstile');
-            const hasTurnstileTokenField = !!document.querySelector('input[name="cf-turnstile-response"]');
-            const title = document.title;
-            const inputCount = document.querySelectorAll('input').length;
-            const formCount = document.querySelectorAll('form').length;
-            const scriptCount = document.querySelectorAll('script').length;
-            const linkCount = document.querySelectorAll('link[rel="stylesheet"], link[as="style"], style').length;
-            const bodyHtmlLen = (document.body?.innerHTML || '').length;
-            const docHtmlLen = (document.documentElement?.outerHTML || '').length;
-            return { title, hasVerifyHuman, hasTurnstileWidget, hasTurnstileTokenField, inputCount, formCount, scriptCount, linkCount, bodyHtmlLen, docHtmlLen };
-        });
+        const snap0 = await evalOnPage(page, `
+            var bodyText = (document.body && document.body.innerText) ? String(document.body.innerText).toLowerCase() : '';
+            var hasVerifyHuman = bodyText.indexOf('verify you are human') >= 0;
+            var hasTurnstileWidget = !!document.querySelector('.cf-turnstile');
+            var hasTurnstileTokenField = !!document.querySelector('input[name="cf-turnstile-response"]');
+            var title = document.title || '';
+            var inputCount = document.querySelectorAll('input').length;
+            var formCount = document.querySelectorAll('form').length;
+            var scriptCount = document.querySelectorAll('script').length;
+            var linkCount = document.querySelectorAll('link[rel="stylesheet"], link[as="style"], style').length;
+            var bodyHtmlLen = (document.body && document.body.innerHTML) ? document.body.innerHTML.length : 0;
+            var docHtmlLen = (document.documentElement && document.documentElement.outerHTML) ? document.documentElement.outerHTML.length : 0;
+            return {
+                title: title,
+                hasVerifyHuman: hasVerifyHuman,
+                hasTurnstileWidget: hasTurnstileWidget,
+                hasTurnstileTokenField: hasTurnstileTokenField,
+                inputCount: inputCount,
+                formCount: formCount,
+                scriptCount: scriptCount,
+                linkCount: linkCount,
+                bodyHtmlLen: bodyHtmlLen,
+                docHtmlLen: docHtmlLen
+            };
+        `);
         logger.info('launchAndLogin: login sayfası yüklendi', { email, snap: snap0 });
 
         // If page is basically empty (no inputs/forms) try a stronger reload
@@ -725,20 +835,31 @@ async function launchAndLogin(options) {
             logger.warn('launchAndLogin: login sayfası boş görünüyor, reload(networkidle2) deneniyor', { email, snap: snap0 });
             try { await page.reload({ waitUntil: 'networkidle2', timeout: 60000 }); } catch {}
             await delay(800);
-            const snap1 = await page.evaluate(() => {
-                const bodyText = (document.body?.innerText || '').toLowerCase();
-                const hasVerifyHuman = bodyText.includes('verify you are human');
-                const hasTurnstileWidget = !!document.querySelector('.cf-turnstile');
-                const hasTurnstileTokenField = !!document.querySelector('input[name="cf-turnstile-response"]');
-                const title = document.title;
-                const inputCount = document.querySelectorAll('input').length;
-                const formCount = document.querySelectorAll('form').length;
-                const scriptCount = document.querySelectorAll('script').length;
-                const linkCount = document.querySelectorAll('link[rel="stylesheet"], link[as="style"], style').length;
-                const bodyHtmlLen = (document.body?.innerHTML || '').length;
-                const docHtmlLen = (document.documentElement?.outerHTML || '').length;
-                return { title, hasVerifyHuman, hasTurnstileWidget, hasTurnstileTokenField, inputCount, formCount, scriptCount, linkCount, bodyHtmlLen, docHtmlLen };
-            });
+            const snap1 = await evalOnPage(page, `
+                var bodyText = (document.body && document.body.innerText) ? String(document.body.innerText).toLowerCase() : '';
+                var hasVerifyHuman = bodyText.indexOf('verify you are human') >= 0;
+                var hasTurnstileWidget = !!document.querySelector('.cf-turnstile');
+                var hasTurnstileTokenField = !!document.querySelector('input[name="cf-turnstile-response"]');
+                var title = document.title || '';
+                var inputCount = document.querySelectorAll('input').length;
+                var formCount = document.querySelectorAll('form').length;
+                var scriptCount = document.querySelectorAll('script').length;
+                var linkCount = document.querySelectorAll('link[rel="stylesheet"], link[as="style"], style').length;
+                var bodyHtmlLen = (document.body && document.body.innerHTML) ? document.body.innerHTML.length : 0;
+                var docHtmlLen = (document.documentElement && document.documentElement.outerHTML) ? document.documentElement.outerHTML.length : 0;
+                return {
+                    title: title,
+                    hasVerifyHuman: hasVerifyHuman,
+                    hasTurnstileWidget: hasTurnstileWidget,
+                    hasTurnstileTokenField: hasTurnstileTokenField,
+                    inputCount: inputCount,
+                    formCount: formCount,
+                    scriptCount: scriptCount,
+                    linkCount: linkCount,
+                    bodyHtmlLen: bodyHtmlLen,
+                    docHtmlLen: docHtmlLen
+                };
+            `);
             logger.info('launchAndLogin: login reload sonrası snapshot', { email, snap: snap1 });
         }
     } catch {}
@@ -752,14 +873,15 @@ async function launchAndLogin(options) {
     try { page.removeListener('response', onResp); } catch {}
 
     try {
-        const preLoginSnap = await page.evaluate(() => {
-            const bodyText = (document.body?.innerText || '').toLowerCase();
-            const hasVerifyHuman = bodyText.includes('verify you are human');
-            const hasTurnstileTokenField = !!document.querySelector('input[name="cf-turnstile-response"]');
-            const tokenLen = document.querySelector('input[name="cf-turnstile-response"]')?.value?.length || 0;
-            const title = document.title;
-            return { title, hasVerifyHuman, hasTurnstileTokenField, tokenLen };
-        });
+        const preLoginSnap = await evalOnPage(page, `
+            var bodyText = (document.body && document.body.innerText) ? String(document.body.innerText).toLowerCase() : '';
+            var hasVerifyHuman = bodyText.indexOf('verify you are human') >= 0;
+            var input = document.querySelector('input[name="cf-turnstile-response"]');
+            var hasTurnstileTokenField = !!input;
+            var tokenLen = (input && input.value) ? String(input.value).length : 0;
+            var title = document.title || '';
+            return { title: title, hasVerifyHuman: hasVerifyHuman, hasTurnstileTokenField: hasTurnstileTokenField, tokenLen: tokenLen };
+        `);
         logger.debug('launchAndLogin: login submit öncesi snapshot', { email, snap: preLoginSnap });
     } catch {}
 
@@ -830,24 +952,31 @@ async function launchAndLogin(options) {
             return { browser, page };
         }
         try {
-            const diag = await page.evaluate(() => {
-                const inputs = Array.from(document.querySelectorAll('input'))
-                    .slice(0, 40)
-                    .map(i => ({
-                        type: i.getAttribute('type') || '',
-                        name: i.getAttribute('name') || '',
-                        id: i.getAttribute('id') || '',
-                        autocomplete: i.getAttribute('autocomplete') || ''
-                    }));
-                const forms = Array.from(document.querySelectorAll('form'))
-                    .slice(0, 10)
-                    .map(f => ({
+            const diag = await evalOnPage(page, `
+                var allInputs = document.querySelectorAll('input');
+                var allForms = document.querySelectorAll('form');
+                var inputs = [];
+                var forms = [];
+                var i;
+                for (i = 0; i < allInputs.length && i < 40; i += 1) {
+                    var inp = allInputs[i];
+                    inputs.push({
+                        type: inp.getAttribute('type') || '',
+                        name: inp.getAttribute('name') || '',
+                        id: inp.getAttribute('id') || '',
+                        autocomplete: inp.getAttribute('autocomplete') || ''
+                    });
+                }
+                for (i = 0; i < allForms.length && i < 10; i += 1) {
+                    var f = allForms[i];
+                    forms.push({
                         id: f.getAttribute('id') || '',
                         name: f.getAttribute('name') || '',
                         action: f.getAttribute('action') || ''
-                    }));
-                return { inputCount: document.querySelectorAll('input').length, inputs, formCount: document.querySelectorAll('form').length, forms };
-            });
+                    });
+                }
+                return { inputCount: allInputs.length, inputs: inputs, formCount: allForms.length, forms: forms };
+            `);
             const frameInfo = (() => {
                 try {
                     return page.frames().map(fr => ({
@@ -875,45 +1004,50 @@ async function launchAndLogin(options) {
         await passEl.type(String(password || ''), { delay: 10 }).catch(() => {});
     });
 
-    await page.evaluate(() => {
-        const norm = (s) => (s || '').toString().trim().toLowerCase();
-        const btns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a'));
-        const b = btns.find(x => {
-            const t = norm(x.innerText || x.textContent || x.value || '');
-            return t === 'giriş' || t === 'girış' || t.includes('giriş') || t.includes('login');
-        });
-        try { b?.click(); } catch {}
-    });
+    await evalOnPage(page, `
+        var norm = function (s) { return String(s || '').trim().toLowerCase(); };
+        var btns = document.querySelectorAll('button, input[type="submit"], input[type="button"], a');
+        var target = null;
+        var i;
+        for (i = 0; i < btns.length; i += 1) {
+            var x = btns[i];
+            var t = norm(x.innerText || x.textContent || x.value || '');
+            if (t === 'giriş' || t === 'girış' || t.indexOf('giriş') >= 0 || t.indexOf('login') >= 0) {
+                target = x;
+                break;
+            }
+        }
+        try { if (target) target.click(); } catch {}
+    `);
     logger.debug('launchAndLogin: GİRİŞ butonu click gönderildi', { email });
     await delay(cfg.DELAYS.AFTER_LOGIN);
 
     try {
-        const postLogin = await page.evaluate(() => {
-            const bodyText = (document.body?.innerText || '').toLowerCase();
-            const hasVerifyHuman = bodyText.includes('verify you are human');
-            const hasTurnstileWidget = !!document.querySelector('.cf-turnstile');
-            const hasTurnstileTokenField = !!document.querySelector('input[name="cf-turnstile-response"]');
-            const title = document.title;
-            const url = location.href;
-            const possibleErrors = Array.from(document.querySelectorAll('.error, .alert, .toast, .swal2-html-container, .validation, .invalid-feedback'))
-                .slice(0, 5)
-                .map(el => (el.innerText || el.textContent || '').trim())
-                .filter(Boolean);
-            return { title, url, hasVerifyHuman, hasTurnstileWidget, hasTurnstileTokenField, possibleErrors };
-        });
+        const postLogin = await evalOnPage(page, `
+            var bodyText = (document.body && document.body.innerText) ? String(document.body.innerText).toLowerCase() : '';
+            var hasVerifyHuman = bodyText.indexOf('verify you are human') >= 0;
+            var hasTurnstileWidget = !!document.querySelector('.cf-turnstile');
+            var hasTurnstileTokenField = !!document.querySelector('input[name="cf-turnstile-response"]');
+            var title = document.title || '';
+            var url = location.href || '';
+            var nodes = document.querySelectorAll('.error, .alert, .toast, .swal2-html-container, .validation, .invalid-feedback');
+            var possibleErrors = [];
+            var i;
+            for (i = 0; i < nodes.length && i < 5; i += 1) {
+                var txt = String(nodes[i].innerText || nodes[i].textContent || '').trim();
+                if (txt) possibleErrors.push(txt);
+            }
+            return {
+                title: title,
+                url: url,
+                hasVerifyHuman: hasVerifyHuman,
+                hasTurnstileWidget: hasTurnstileWidget,
+                hasTurnstileTokenField: hasTurnstileTokenField,
+                possibleErrors: possibleErrors
+            };
+        `);
         logger.info('launchAndLogin: login sonrası snapshot', { email, snap: postLogin });
     } catch {}
-
-    const afterLoginUrl = (() => {
-        try { return page.url(); } catch { return ''; }
-    })();
-    if (isLoginUrl(afterLoginUrl)) {
-        logger.warn('launchAndLogin: login tamamlanamadı, hala login sayfasında', {
-            email,
-            afterLoginUrl
-        });
-        throw new Error('LOGIN_NOT_COMPLETED');
-    }
 
     return {browser, page};
 }
@@ -957,7 +1091,7 @@ async function reloginIfRedirected(page, email, password) {
     }
 
     try {
-        await page.evaluate(() => {
+        await evaluateSafe(page, () => {
             const u = document.querySelector('input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"]');
             const p = document.querySelector('input[autocomplete="current-password"], input[type="password"]');
             if (u) u.value = '';
@@ -977,7 +1111,7 @@ async function reloginIfRedirected(page, email, password) {
         } catch {}
     }
 
-    await page.evaluate(() => {
+    await evaluateSafe(page, () => {
         const b = [...document.querySelectorAll('button.black-btn, button, [role="button"]')].find(x => (x.innerText || '').trim().toUpperCase() === 'GİRİŞ');
         b?.click();
     }).catch(() => {});
@@ -1003,7 +1137,7 @@ async function reloginIfRedirected(page, email, password) {
     });
 
     // Check for login error messages on the page
-    const loginError = await page.evaluate(() => {
+    const loginError = await evaluateSafe(page, () => {
         const errorSelectors = [
             '.alert-danger', '.error-message', '.field-validation-error',
             '[class*="error"]', '[class*="hata"]',
@@ -1016,22 +1150,12 @@ async function reloginIfRedirected(page, email, password) {
                 return { selector: sel, text: el.textContent.trim() };
             }
         }
-        // Check for explicit login-failed phrases only (avoid false positives from static "Şifre" labels)
+        // Check for specific error texts
         const bodyText = document.body?.innerText || '';
-        const lower = bodyText.toLowerCase();
-        const errorPhrases = [
-            'hatalı e-posta',
-            'hatalı email',
-            'hatalı şifre',
-            'şifreniz hatalı',
-            'e-posta veya şifre hatalı',
-            'geçersiz kullanıcı',
-            'hesabınız kilitlendi',
-            'çok fazla başarısız giriş'
-        ];
-        for (const phrase of errorPhrases) {
-            if (lower.includes(phrase)) {
-                return { phrase, text: bodyText.substring(0, 240) };
+        const errorKeywords = ['hatalı', 'yanlış', 'geçersiz', 'bulunamadı', 'şifre', 'kilit', 'bloke', 'hesap', 'ban'];
+        for (const kw of errorKeywords) {
+            if (bodyText.toLowerCase().includes(kw)) {
+                return { keyword: kw, text: bodyText.substring(0, 200) };
             }
         }
         return null;
@@ -2733,40 +2857,6 @@ async function startBot(req, res) {
             try { logger.info('audit', payload); } catch {}
         }
     };
-    const debugArtifactsEnabled = String(process.env.DEBUG_ARTIFACTS_ENABLED || 'true').toLowerCase() !== 'false';
-    const runArtifactsDir = path.join(process.cwd(), 'logs', 'runs', runProfileKey);
-    const writeDebugArtifact = async (tag, page, meta = {}) => {
-        if (!debugArtifactsEnabled || !page) return null;
-        const safeTag = String(tag || 'artifact').replace(/[^a-zA-Z0-9._-]/g, '_');
-        const stamp = `${Date.now()}`;
-        const base = `${stamp}_${safeTag}`;
-        const out = {
-            meta: path.join(runArtifactsDir, `${base}.json`),
-            screenshot: path.join(runArtifactsDir, `${base}.png`),
-            html: path.join(runArtifactsDir, `${base}.html`)
-        };
-        try {
-            fs.mkdirSync(runArtifactsDir, { recursive: true });
-            const payload = {
-                runId,
-                tag: safeTag,
-                ts: new Date().toISOString(),
-                url: (() => { try { return page.url(); } catch { return null; } })(),
-                title: await page.title().catch(() => null),
-                ...meta
-            };
-            try { fs.writeFileSync(out.meta, JSON.stringify(payload, null, 2), 'utf8'); } catch {}
-            try { await page.screenshot({ path: out.screenshot, fullPage: true }).catch(() => null); } catch {}
-            try {
-                const html = await page.content().catch(() => null);
-                if (html) fs.writeFileSync(out.html, html, 'utf8');
-            } catch {}
-            return out;
-        } catch (e) {
-            logger.warn('debug_artifact_write_failed', { runId, tag: safeTag, error: e?.message || String(e) });
-            return null;
-        }
-    };
 
     let currentHolder = null; // 'A' | 'B'
     let currentSeatInfo = null;
@@ -3101,7 +3191,7 @@ async function startBot(req, res) {
     const snapshotPage = async (page, label) => {
         if (!page) return null;
         try {
-            return await page.evaluate((lbl, seatSel) => {
+            return await evaluateSafe(page, (lbl, seatSel) => {
                 const bodyText = (document.body?.innerText || '').toLowerCase();
                 const title = document.title;
                 const url = location.href;
@@ -3460,8 +3550,11 @@ async function startBot(req, res) {
                 let seatInfo = null;
                 const seatPickStart = Date.now();
                 const maxCycle = Math.max(12, Number(cfg?.TIMEOUTS?.SEAT_SELECTION_CYCLES || 0) || 12);
+                const waitUntilFound = cfg?.TIMEOUTS?.SEAT_WAIT_UNTIL_FOUND === true;
+                const waitMaxMinutes = Math.max(1, Number(cfg?.TIMEOUTS?.SEAT_WAIT_MAX_MINUTES || 90) || 90);
+                const waitDeadlineAt = Date.now() + (waitMaxMinutes * 60 * 1000);
                 let cycleStartedAt = Date.now();
-                for (let cycle = 1; cycle <= maxCycle; cycle++) {
+                for (let cycle = 1; (waitUntilFound ? (Date.now() < waitDeadlineAt) : (cycle <= maxCycle)); cycle++) {
                     try {
                         const remaining = Math.max(15000, Number(cfg.TIMEOUTS.SEAT_SELECTION_MAX) - (Date.now() - cycleStartedAt));
                         seatInfo = await seatHelper.pickRandomSeatWithVerify(page, remaining, {
@@ -3857,14 +3950,13 @@ async function startBot(req, res) {
             pageA.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 })
                 .then(() => ({ type: 'navigation' }))
                 .catch((e) => ({ type: 'nav_error', message: e?.message })),
-            pageA.waitForFunction((pre) => location.href !== pre, { timeout: 10000 }, aPreUrl)
+            waitForFunctionSafe(pageA, (pre) => location.href !== pre, { timeout: 10000 }, aPreUrl)
                 .then(() => ({ type: 'url_change' }))
                 .catch((e) => ({ type: 'url_wait_error', message: e?.message })),
             delay(10000).then(() => ({ type: 'timeout' }))
         ]);
         await pageA.waitForSelector('.custom-select-box, .ticket-type-title, #custom_seat_button', { timeout: 10000 }).catch(() => {});
         setStep('A.waitNavAfterBuy.done', { result: aNavResult, snap: await snapshotPage(pageA, 'A.afterBuyNav') });
-        await writeDebugArtifact('A_after_buy_nav', pageA, { result: aNavResult, preUrl: aPreUrl });
 
         setStep('A.postBuy.ensureUrl.start');
         const aUrlCheck = await ensureUrlContains(pageA, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
@@ -3874,7 +3966,6 @@ async function startBot(req, res) {
         setStep('A.postBuy.reloginCheck.start');
         const aRelog = await reloginIfRedirected(pageA, emailA, passwordA);
         setStep('A.postBuy.reloginCheck.done', { relogged: aRelog, snap: await snapshotPage(pageA, 'A.afterReloginCheck') });
-        await writeDebugArtifact('A_after_relogin_check', pageA, { relogged: aRelog });
 
         const psA2 = await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity });
         if (psA2) {
@@ -3884,7 +3975,6 @@ async function startBot(req, res) {
         setStep('A.seatSelection.turnstile.ensure.start');
         await ensureTurnstileTokenOnPage(pageA, emailA, 'A.seatSelection');
         setStep('A.seatSelection.turnstile.ensure.done', { snap: await snapshotPage(pageA, 'A.afterTurnstileEnsure') });
-        await writeDebugArtifact('A_before_category_selection', pageA, {});
 
         // Hard guard: compute canonical seat selection URL and force navigation back to /koltuk-secim if we drifted.
         const canonicalSeatUrlA = (() => {
@@ -3901,33 +3991,34 @@ async function startBot(req, res) {
             }
         })();
 
-        const okNow = await ensureUrlContains(pageA, '/koltuk-secim', { retries: 0, waitMs: 10 });
-        if (!okNow?.ok && canonicalSeatUrlA) {
-            logger.warn('A.force_goto_canonical_seat_url', {
-                currentUrl: (() => { try { return pageA.url(); } catch { return null; } })(),
-                canonicalSeatUrlA
-            });
-            try {
-                await gotoWithRetry(pageA, canonicalSeatUrlA, {
-                    retries: 3,
-                    waitUntil: 'domcontentloaded',
-                    expectedUrlIncludes: '/koltuk-secim',
-                    rejectIfHome: true,
-                    backoffMs: 450
+        try {
+            const okNow = await ensureUrlContains(pageA, '/koltuk-secim', { retries: 0, waitMs: 10 });
+            if (!okNow?.ok && canonicalSeatUrlA) {
+                logger.warn('A.force_goto_canonical_seat_url', {
+                    currentUrl: (() => { try { return pageA.url(); } catch { return null; } })(),
+                    canonicalSeatUrlA
                 });
-            } catch {}
+                try {
+                    await gotoWithRetry(pageA, canonicalSeatUrlA, {
+                        retries: 3,
+                        waitUntil: 'domcontentloaded',
+                        expectedUrlIncludes: '/koltuk-secim',
+                        rejectIfHome: true,
+                        backoffMs: 450
+                    });
+                } catch {}
 
-            const okAfter = await ensureUrlContains(pageA, '/koltuk-secim', {
-                retries: 1,
-                waitMs: 9000,
-                backoffMs: 450,
-                recoveryUrl: canonicalSeatUrlA
-            }).catch(() => null);
-            if (!okAfter?.ok) {
-                await writeDebugArtifact('A_canonical_seat_url_failed', pageA, { okNow, okAfter, canonicalSeatUrlA });
-                throw new Error('Seat selection sayfasına gidilemedi (/koltuk-secim)');
+                const okAfter = await ensureUrlContains(pageA, '/koltuk-secim', {
+                    retries: 1,
+                    waitMs: 9000,
+                    backoffMs: 450,
+                    recoveryUrl: canonicalSeatUrlA
+                }).catch(() => null);
+                if (!okAfter?.ok) {
+                    throw new Error('Seat selection sayfasına gidilemedi (/koltuk-secim)');
+                }
             }
-        }
+        } catch {}
 
         // If we are still on login page, recover by navigating to decoded returnUrl.
         try {
@@ -4031,8 +4122,11 @@ async function startBot(req, res) {
 
         let seatInfoA = null;
         const maxCycle = Math.max(12, Number(cfg?.TIMEOUTS?.SEAT_SELECTION_CYCLES || 0) || 12);
+        const waitUntilFound = cfg?.TIMEOUTS?.SEAT_WAIT_UNTIL_FOUND === true;
+        const waitMaxMinutes = Math.max(1, Number(cfg?.TIMEOUTS?.SEAT_WAIT_MAX_MINUTES || 90) || 90);
+        const waitDeadlineAt = Date.now() + (waitMaxMinutes * 60 * 1000);
         let cycleStartedAt = Date.now();
-        for (let cycle = 1; cycle <= maxCycle; cycle++) {
+        for (let cycle = 1; (waitUntilFound ? (Date.now() < waitDeadlineAt) : (cycle <= maxCycle)); cycle++) {
             try {
                 const remaining = Math.max(15000, Number(cfg.TIMEOUTS.SEAT_SELECTION_MAX) - (Date.now() - cycleStartedAt));
                 seatInfoA = await seatHelper.pickRandomSeatWithVerify(
@@ -4154,7 +4248,7 @@ async function startBot(req, res) {
             pageB.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 })
                 .then(() => ({ type: 'navigation' }))
                 .catch((e) => ({ type: 'nav_error', message: e?.message })),
-            pageB.waitForFunction((pre) => location.href !== pre, { timeout: 10000 }, bPreUrl)
+            waitForFunctionSafe(pageB, (pre) => location.href !== pre, { timeout: 10000 }, bPreUrl)
                 .then(() => ({ type: 'url_change' }))
                 .catch((e) => ({ type: 'url_wait_error', message: e?.message })),
             delay(10000).then(() => ({ type: 'timeout' }))
@@ -4878,8 +4972,6 @@ async function startBot(req, res) {
         
         const snapA = await snapshotPage(pageA, 'A.onError');
         const snapB = await snapshotPage(pageB, 'B.onError');
-        await writeDebugArtifact('A_on_error', pageA, { lastStep, error: String(err?.message || err) });
-        await writeDebugArtifact('B_on_error', pageB, { lastStep, error: String(err?.message || err) });
         logger.errorSafe('Bot hatası', err, {
             team,
             ticketType,

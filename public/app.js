@@ -131,6 +131,10 @@ const state = {
   autoScroll: true,
   autoScrollStatus: true,
 };
+const statusState = {
+  lastText: '',
+  lastAt: 0,
+};
 
 function fmt(entry) {
   const ts = entry.ts || '';
@@ -171,6 +175,11 @@ function appendLogLine(line, entry) {
   } else {
     const statusText = isStatusMessage(entry, line);
     if (statusText) {
+      const now = Date.now();
+      const isDuplicate = statusState.lastText === statusText && (now - statusState.lastAt) < 2500;
+      if (isDuplicate) return;
+      statusState.lastText = statusText;
+      statusState.lastAt = now;
       const sDiv = document.createElement('div');
       sDiv.textContent = statusText;
       statusBox.appendChild(sDiv);
@@ -187,6 +196,7 @@ async function killSessions() {
     });
     const json = await resp.json();
     if (resp.ok) {
+      clearLogs();
       infoLine(`Aktif oturumlar kapatıldı: ${json.killedCount} oturum`);
     } else {
       infoLine('Oturum kapatma hatası', { error: json.error || 'unknown' });
@@ -214,42 +224,90 @@ function isStatusMessage(entry, line) {
     return parts.length > 0 ? ` (${parts.join(', ')})` : '';
   };
   
-  const statusPatterns = [
-    { keywords: ['step:', 'launchAndLogin', 'done', 'login', 'giriş'], message: (e) => {
-      const account = e.message?.includes('step:A.') ? 'A' : (e.message?.includes('step:B.') ? 'B' : (e.message?.includes('step:C.') ? 'C' : null));
-      const email = e.meta?.email || '';
-      return account ? `✓ ${account} Hesabı giriş yapıldı${email ? ': ' + email : ''}` : null;
-    }},
-    { keywords: ['basket', 'eklendi', 'sepete', 'added', 'seçti ve sepete'], message: (e) => {
-      const details = formatSeatDetails(e.meta?.seatInfo || e.meta);
-      return `🛒 Sepete koltuk eklendi${details}`;
-    }},
-    { keywords: ['finalize', 'registered', 'ödeme', 'payment'], message: (e) => `💳 Ödeme işlemi başlatıldı` },
-    { keywords: ['run started'], message: (e) => `🚀 Bot çalışmaya başladı` },
-    { keywords: ['run stopped', 'completed', 'tamamlandı'], message: (e) => `✅ Bot tamamlandı` },
-    { keywords: ['error', 'hata', 'failed', 'başarısız'], message: (e) => {
-      const m = e.message || '';
-      if (m.includes('login') || m.includes('giriş')) return '❌ Giriş hatası';
-      if (m.includes('basket') || m.includes('sepet')) return '❌ Sepet hatası';
-      if (m.includes('seat') || m.includes('koltuk')) return '❌ Koltuk seçim hatası';
-      return '⚠️ Hata oluştu';
-    }},
-    { keywords: ['seat', 'koltuk', 'selected', 'pick', 'yakaladı'], message: (e) => {
-      const details = formatSeatDetails(e.meta || {});
-      return `🪑 Koltuk seçildi${details}`;
-    }},
-    { keywords: ['category', 'kategori', 'blok', 'block'], message: (e) => `📍 Kategori/blok değişti` },
-    { keywords: ['transfer', 'taşıma', 'holder'], message: (e) => `↔️ Koltuk transfer ediliyor` },
-    { keywords: ['remove', 'çıkarıldı', 'boşaltıldı'], message: (e) => `🗑️ Sepet boşaltıldı` },
-  ];
-  
-  const matched = statusPatterns.find(p => p.keywords.some(kw => msg.includes(kw.toLowerCase())));
-  return matched ? matched.message(entry) : null;
+  // Keep mappings strict to avoid false positives in status panel.
+  if (msg.includes('run started')) return '🚀 Bot çalışmaya başladı';
+  if (msg.includes('run stopped') || msg.includes('bot başarıyla tamamlandı') || msg.includes('completed')) return '✅ Bot tamamlandı';
+
+  if (msg.includes('step:a.launchandlogin.done') || msg.includes('step:b.launchandlogin.done') || msg.includes('step:c.launchandlogin.done')) {
+    const account = msg.includes('step:a.') ? 'A' : (msg.includes('step:b.') ? 'B' : (msg.includes('step:c.') ? 'C' : null));
+    const email = meta?.email || '';
+    return account ? `✓ ${account} Hesabı giriş yapıldı${email ? ': ' + email : ''}` : null;
+  }
+
+  if (msg.includes('launchandlogin: login tamamlanamadı')) return '❌ Giriş tamamlanamadı, login sayfasında kaldı';
+  if (msg.includes('launchandlogin: login formu bulunamadı')) return '❌ Giriş formu bulunamadı (site/challenge yüklenmedi)';
+  if (msg.includes('reloginifredirected: login redirect tespit edildi')) return '🔁 Oturum düştü, yeniden giriş deneniyor';
+  if (msg.includes('reloginifredirected: login submit sonrası')) return '🔐 Yeniden giriş denemesi yapıldı';
+  if (msg.includes('step:a.gotoevent.start') || msg.includes('step:b.gotoevent.start')) return '🎯 Etkinlik sayfasına gidiliyor';
+  if (msg.includes('step:a.clickbuy.start') || msg.includes('step:b.clickbuy.start')) return '🛍️ SATIN AL butonu aranıyor/tıklanıyor';
+  if (msg.includes('step:a.postbuy.ensureurl.start')) return '🧭 Koltuk seçimi sayfasına geçiş doğrulanıyor';
+
+  if (msg.includes('categoryblock.select.done') || msg.includes('categoryblock.reselect.done') || msg.includes('categoryblock:svg_block_ok')) {
+    const blockId = meta?.blockId || meta?.svgBlockId || null;
+    return blockId ? `📍 Blok seçildi: ${blockId}` : '📍 Kategori/blok değişti';
+  }
+
+  if (msg.includes('categoryblock:svg_clicked')) {
+    const id = meta?.clicked?.id || meta?.clickPoint?.id || null;
+    return id ? `🗺️ SVG blok tıklandı: ${id}` : '🗺️ SVG blok tıklandı';
+  }
+
+  // Only show "seat selected" on strong/confirmed seat signals.
+  const seatConfirmed =
+    msg.includes('seatpick:a:selected') ||
+    msg.includes('seatpick:b:selected') ||
+    msg.includes('seatpick:a:basket_success') ||
+    msg.includes('seatpick:b:basket_success') ||
+    msg.includes('seatpick:a:basket_from_network') ||
+    msg.includes('seatpick:b:basket_from_network') ||
+    msg.includes('seat_selected_a') ||
+    msg.includes('seat_grabbed_b');
+  if (seatConfirmed) {
+    const details = formatSeatDetails(meta?.seatInfo || meta);
+    return `🪑 Koltuk seçildi${details}`;
+  }
+
+  if (msg.includes('sepete') || msg.includes('basket_success') || msg.includes('basket_from_network')) {
+    const details = formatSeatDetails(meta?.seatInfo || meta);
+    return `🛒 Sepete koltuk eklendi${details}`;
+  }
+
+  if (msg.includes('seat.noselectable.retry_block')) {
+    const cycle = meta?.cycle != null ? ` (deneme ${meta.cycle})` : '';
+    return `⏳ Bu blokta boş koltuk yok, yeni blok deneniyor${cycle}`;
+  }
+  if (msg.includes('seatpick:a:snipe_wait_start') || msg.includes('seatpick:b:snipe_wait_start')) {
+    return '👀 Boşa düşecek koltuk için anlık tarama yapılıyor';
+  }
+  if (msg.includes('seatpick:a:snipe_wait_hit') || msg.includes('seatpick:b:snipe_wait_hit')) {
+    return '⚡ Boşa düşen koltuk sinyali alındı, yakalama deneniyor';
+  }
+  if (msg.includes('seatpick:a:no_selectable_seats_back') || msg.includes('seatpick:b:no_selectable_seats_back')) {
+    return '🚫 Bu blokta seçilebilir koltuk görünmüyor';
+  }
+  if (msg.includes('seatpick:a:diag') || msg.includes('seatpick:b:diag')) {
+    return null; // too noisy for customer status panel
+  }
+
+  if (msg.includes('finalize') || msg.includes('payment') || msg.includes('ödeme')) return '💳 Ödeme işlemi başlatıldı';
+  if (msg.includes('transfer') || msg.includes('holder_updated')) return '↔️ Koltuk transfer ediliyor';
+  if (msg.includes('remove_from_cart') || msg.includes('çıkarıldı') || msg.includes('boşaltıldı')) return '🗑️ Sepet boşaltıldı';
+
+  if (msg.includes('error') || msg.includes('hata') || msg.includes('failed') || msg.includes('başarısız')) {
+    if (msg.includes('login') || msg.includes('giriş')) return '❌ Giriş hatası';
+    if (msg.includes('basket') || msg.includes('sepet')) return '❌ Sepet hatası';
+    if (msg.includes('seat') || msg.includes('koltuk')) return '❌ Koltuk seçim hatası';
+    return '⚠️ Hata oluştu';
+  }
+
+  return null;
 }
 
 function clearLogs() {
   logBox.textContent = '';
   statusBox.textContent = '';
+  statusState.lastText = '';
+  statusState.lastAt = 0;
 }
 
 function infoLine(msg, meta) {

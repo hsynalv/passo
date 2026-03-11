@@ -4,9 +4,11 @@
   "description": "Two-browser Passo seat transfer bot — professionally modularized.",
   "type": "commonjs",
   "main": "src/index.js",
+  "bin": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "build:win": "pkg . --targets node18-win-x64 --output passobot.exe"
   },
   "dependencies": {
     "@antiadmin/anticaptchaofficial": "^1.0.52",
@@ -17,5 +19,22 @@
     "puppeteer-real-browser": "^1.4.2",
     "winston": "^3.19.0",
     "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  },
+  "pkg": {
+    "scripts": [
+      "src/**/*.js",
+      "node_modules/axios/**/*.js",
+      "node_modules/rebrowser-puppeteer-core/**/*.js"
+    ],
+    "assets": [
+      "public/**/*",
+      "node_modules/axios/dist/node/*.cjs",
+      "node_modules/rebrowser-puppeteer-core/**/*.json",
+      ".env",
+      ".env.example"
+    ]
   }
 }

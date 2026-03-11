@@ -1,5 +1,6 @@
 const delay = require('../utils/delay');
 const cfg = require('../config');
+const { evaluateSafe, waitForFunctionSafe } = require('../utils/browserEval');
 
 const SEAT_NODE_SELECTOR = 'circle.seat-circle, .seat-circle, [seat-id], [data-seat-id], [data-id][class*="seat"], [class*="seat-circle"], svg circle[class*="seat"], svg.seatmap-svg g[id^="seat"], svg.seatmap-svg g[id^="seat"] rect, svg.seatmap-svg g[id^="seat"] circle, svg.seatmap-svg g[id^="seat"] path, svg.seatmap-svg g[id^="seat"] polygon, svg.seatmap-svg g[id^="seat"] line, svg.seatmap-svg rect[class^="block"]';
 
@@ -27,7 +28,7 @@ async function ensureTcAssignedOnBasket(page, identity, options = null) {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const done = await page.evaluate((tcValue, preferMyId) => {
+      const done = await evaluateSafe(page, (tcValue, preferMyId) => {
         const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim();
         const lower = (s) => norm(s).toLowerCase();
 
@@ -100,7 +101,7 @@ async function ensureTcAssignedOnBasket(page, identity, options = null) {
 async function clickBasketDevamToOdeme(page) {
   if (!page) return false;
   try {
-    const btn = await page.evaluate(() => {
+    const btn = await evaluateSafe(page, () => {
       const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
       const els = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
         .filter(el => {
@@ -124,7 +125,7 @@ async function clickBasketDevamToOdeme(page) {
       return { x: r.left + (r.width / 2), y: r.top + (r.height / 2) };
     });
     if (!btn || !Number.isFinite(btn.x) || !Number.isFinite(btn.y)) return false;
-    const wait = page.waitForFunction(() => {
+    const wait = waitForFunctionSafe(page, () => {
       const u = String(location.href || '');
       return /\/odeme(\b|\/|\?|#)/i.test(u);
     }, { timeout: 30000 }).catch(() => null);
@@ -141,7 +142,7 @@ async function clickBasketDevamToOdeme(page) {
 async function dismissPaymentInfoModalIfPresent(page) {
   if (!page) return false;
   try {
-    const did = await page.evaluate(() => {
+    const did = await evaluateSafe(page, () => {
       const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
       const conts = Array.from(document.querySelectorAll('.modal, .swal2-container, [role="dialog"], .cdk-overlay-container'));
       const visible = conts.filter(c => {
@@ -176,7 +177,7 @@ async function fillInvoiceTcAndContinue(page, identity) {
   if (!tc || tc.length !== 11) return false;
 
   try {
-    const ok = await page.evaluate((tcValue) => {
+    const ok = await evaluateSafe(page, (tcValue) => {
       const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
       const inputs = Array.from(document.querySelectorAll('quick-input input.form-control[placeholder="T.C. Kimlik No"], input.form-control[placeholder="T.C. Kimlik No"][maxlength="11"]'));
       if (!inputs.length) return false;
@@ -217,7 +218,7 @@ async function fillInvoiceTcAndContinue(page, identity) {
 async function acceptAgreementsAndContinue(page) {
   if (!page) return false;
   try {
-    const did = await page.evaluate(() => {
+    const did = await evaluateSafe(page, () => {
       const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
       const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'))
         .filter(cb => {
@@ -378,7 +379,7 @@ async function ensureUrlContains(page, expectedIncludes, options = null) {
     }
 
     try {
-      await page.waitForFunction((inc) => location.href.includes(inc), { timeout: waitMs }, expected);
+      await waitForFunctionSafe(page, (inc) => location.href.includes(inc), { timeout: waitMs }, expected);
     } catch {}
 
     lastUrl = getUrl();

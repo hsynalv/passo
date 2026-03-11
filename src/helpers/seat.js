@@ -576,6 +576,62 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
     }
   };
 
+  // During sold-out sniping we need to react immediately when a seat is released.
+  // This picks a fresh visible seat candidate (no lockedSeat reuse) and clicks it.
+  const trySnipeFreshSeatNow = async () => {
+    try {
+      const info = await page.evaluate(() => {
+        const normFill = (r) => {
+          const attr = (r.getAttribute('fill') || '').toLowerCase();
+          if (attr) return attr;
+          const st = (r.getAttribute('style') || '').toLowerCase();
+          const m = st.match(/fill\s*:\s*([^;]+)/i);
+          return (m && m[1] ? m[1].trim() : '');
+        };
+        const rects = Array.from(document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect'));
+        const candidates = rects.filter(r => {
+          const pe = (r.getAttribute('pointer-events') || '').toLowerCase();
+          if (pe === 'none') return false;
+          const fill = normFill(r);
+          if (fill === '#89a0a3') return false;
+          const cls = (r.getAttribute('class') || '').toLowerCase();
+          if (/(occupied|disabled|unavailable|dolu|sold|reserved)/i.test(cls)) return false;
+          const g = r.closest('g');
+          if (g && (g.classList.contains('seatActive') || g.classList.contains('selected'))) return false;
+          if (r.classList.contains('selected')) return false;
+          return true;
+        });
+        if (!candidates.length) return null;
+        const r0 = candidates[0];
+        try { r0.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+        const bb = r0.getBoundingClientRect();
+        const cx = bb.left + (bb.width / 2);
+        const cy = bb.top + (bb.height / 2);
+        if (!Number.isFinite(cx) || !Number.isFinite(cy)) return null;
+        if (cx <= 8 || cy <= 8 || cx >= (window.innerWidth - 8) || cy >= (window.innerHeight - 8)) return null;
+        const gid = r0.closest('g')?.getAttribute('id') || '';
+        const seatId = (gid.match(/seat(\d+)/i) || [])[1] || null;
+        return { x: cx, y: cy, seatId };
+      }).catch(() => null);
+
+      if (!info) return false;
+      lockedSeat = null; // force fresh selection path after snipe click
+
+      let clicked = false;
+      if (info.seatId) clicked = await clickSeatById(page, info.seatId);
+      if (!clicked) clicked = await robustSeatClick(page, info.x, info.y);
+      if (!clicked) return false;
+
+      const selected = await page.waitForFunction((sel) => !!document.querySelector(sel), { timeout: 1200 }, SELECTED_SEAT_SELECTOR)
+        .then(() => true)
+        .catch(() => false);
+      logger.info(`seatPick:${context}:snipe_fresh_click`, { seatId: info.seatId, x: info.x, y: info.y, selected });
+      return selected;
+    } catch {
+      return false;
+    }
+  };
+
   const isLockedSeatSelected = async () => {
     if (!lockedSeat) return false;
     try {
@@ -679,6 +735,25 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
         noSelectableStreak++;
       } else {
         noSelectableStreak = 0;
+      }
+
+      // If at least one seat is now selectable, don't keep stale/off-screen locks.
+      if (selectableState && selectableState.seatmapPresent && Number(selectableState.selectableCount || 0) > 0 && lockedSeat) {
+        const stale = await page.evaluate((seat) => {
+          if (!seat) return true;
+          const x = Number(seat.x);
+          const y = Number(seat.y);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return true;
+          const vw = window.innerWidth || 0;
+          const vh = window.innerHeight || 0;
+          if (x <= 8 || y <= 8 || x >= (vw - 8) || y >= (vh - 8)) return true;
+          return false;
+        }, lockedSeat).catch(() => true);
+        if (stale) {
+          logger.info(`seatPick:${context}:lock_cleared_stale_when_selectable`, { lockedSeat, selectableCount: selectableState.selectableCount });
+          lockedSeat = null;
+          lockedMiss = 0;
+        }
       }
 
       if (noSelectableStreak >= 3) {
@@ -800,7 +875,13 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                   if (st && Number(st.selectable || 0) > 0) {
                     logger.info(`seatPick:${context}:snipe_wait_hit`, st);
                     noSelectableStreak = 0;
-                    // continue outer loop; we should now be able to pick a seat.
+                    // Seat just became available; attempt immediate click before it disappears again.
+                    try {
+                      const sniped = await trySnipeFreshSeatNow();
+                      if (sniped) {
+                        // Keep going in outer loop for continue/basket verification.
+                      }
+                    } catch {}
                     break;
                   }
                 } catch {}

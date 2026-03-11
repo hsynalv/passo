@@ -1,22 +1,62 @@
 const express = require('express');
 const path = require('path');
+const readline = require('readline');
 const cfg = require('./config');
-const botRoutes = require('./routes/botRoutes');
 const logger = require('./utils/logger');
 
-const app = express();
-app.use(express.json());
-
-// Web UI
-app.use(express.static(path.join(process.cwd(), 'public')));
-app.get('/health', (req, res) => res.json({ ok: true }));
-
-app.use('/', botRoutes);
-
-app.listen(cfg.PORT, () => {
-    logger.info(`Bot sunucusu http://localhost:${cfg.PORT} üzerinde çalışıyor`);
-});
+function waitForEnterInExe() {
+    if (!process.pkg) return;
+    console.log('\nUygulama kapatilmadi. Cikmak icin Enter tusuna basin...');
+    try {
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        rl.question('', () => rl.close());
+    } catch {}
+}
 
 process.on('unhandledRejection', (reason, promise) => {
-    logger.errorSafe('Unhandled Rejection', reason, { promise });
+    try {
+        logger.errorSafe('Unhandled Rejection', reason, { promise });
+    } catch {}
+    console.error('\n[UnhandledRejection]', reason);
+    waitForEnterInExe();
 });
+
+process.on('uncaughtException', (err) => {
+    try {
+        logger.errorSafe('Uncaught Exception', err);
+    } catch {}
+    console.error('\n[UncaughtException]', err);
+    waitForEnterInExe();
+});
+
+function start() {
+    const botRoutes = require('./routes/botRoutes');
+    const app = express();
+    app.use(express.json());
+
+    // Web UI: in .exe mode process.cwd() can be arbitrary; resolve robustly.
+    const publicCandidates = [
+        path.join(process.cwd(), 'public'),
+        path.join(__dirname, '..', 'public')
+    ];
+    const fs = require('fs');
+    const publicDir = publicCandidates.find((dir) => {
+        try {
+            return fs.existsSync(dir);
+        } catch {
+            return false;
+        }
+    });
+    if (publicDir) app.use(express.static(publicDir));
+
+    app.get('/health', (req, res) => res.json({ ok: true }));
+
+    app.use('/', botRoutes);
+
+    app.listen(cfg.PORT, () => {
+        logger.info(`Bot sunucusu http://localhost:${cfg.PORT} üzerinde çalışıyor`);
+        console.log(`Bot sunucusu http://localhost:${cfg.PORT} uzerinde calisiyor`);
+    });
+}
+
+start();
