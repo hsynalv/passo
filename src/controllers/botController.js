@@ -966,8 +966,25 @@ async function launchAndLogin(options) {
 
     await delay(800);
     await page.waitForSelector('.cf-turnstile, input[name="cf-turnstile-response"]', { timeout: 15000 }).catch(() => {});
+
+    const target = loginCtx.frame || page;
+    const userEl = loginCtx.userEl;
+    const passEl = loginCtx.passEl;
+    if (!userEl || !passEl) throw new Error('Login inputları bulunamadı');
+
+    await userEl.click({ clickCount: 3 }).catch(() => {});
+    await target.type(userSel, String(email || ''), { delay: 15 }).catch(async () => {
+        await userEl.type(String(email || ''), { delay: 15 }).catch(() => {});
+    });
+    await passEl.click({ clickCount: 3 }).catch(() => {});
+    await target.type(passSel, String(password || ''), { delay: 15 }).catch(async () => {
+        await passEl.type(String(password || ''), { delay: 15 }).catch(() => {});
+    });
+    await delay(500);
+
     await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.warmup', { background: true });
     await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.beforeSubmit');
+    await delay(300);
 
     try {
         const preLoginSnap = await evalOnPage(page, `
@@ -982,34 +999,19 @@ async function launchAndLogin(options) {
         logger.debug('launchAndLogin: login submit öncesi snapshot', { email, snap: preLoginSnap });
     } catch {}
 
-    const target = loginCtx.frame || page;
-    const userEl = loginCtx.userEl;
-    const passEl = loginCtx.passEl;
-    if (!userEl || !passEl) throw new Error('Login inputları bulunamadı');
-    await userEl.click({ clickCount: 3 }).catch(() => {});
-    await target.type(userSel, String(email || ''), { delay: 10 }).catch(async () => {
-        await userEl.type(String(email || ''), { delay: 10 }).catch(() => {});
-    });
-    await passEl.click({ clickCount: 3 }).catch(() => {});
-    await target.type(passSel, String(password || ''), { delay: 10 }).catch(async () => {
-        await passEl.type(String(password || ''), { delay: 10 }).catch(() => {});
-    });
-
-    await evalOnPage(page, `
-        var norm = function (s) { return String(s || '').trim().toLowerCase(); };
-        var btns = document.querySelectorAll('button, input[type="submit"], input[type="button"], a');
-        var target = null;
-        var i;
-        for (i = 0; i < btns.length; i += 1) {
-            var x = btns[i];
-            var t = norm(x.innerText || x.textContent || x.value || '');
-            if (t === 'giriş' || t === 'girış' || t.indexOf('giriş') >= 0 || t.indexOf('login') >= 0) {
-                target = x;
-                break;
+    try {
+        await evaluateSafe(page, () => {
+            const form = document.querySelector('form');
+            if (form) {
+                const submitBtn = [...form.querySelectorAll('button, input[type="submit"]')].find(x => (x.innerText || x.value || '').trim().toUpperCase().includes('GİRİŞ'));
+                if (submitBtn) { submitBtn.click(); return; }
+                try { form.requestSubmit(); return; } catch {}
+                try { form.submit(); return; } catch {}
             }
-        }
-        try { if (target) target.click(); } catch {}
-    `);
+            const any = [...document.querySelectorAll('button, input[type="submit"], [role="button"]')].find(x => (x.innerText || x.value || '').trim().toLowerCase().includes('giriş'));
+            any?.click();
+        });
+    } catch {}
     logger.debug('launchAndLogin: GİRİŞ butonu click gönderildi', { email });
     await delay(cfg.DELAYS.AFTER_LOGIN);
 
@@ -1071,48 +1073,58 @@ async function reloginIfRedirected(page, email, password) {
         returnUrl
     });
 
-    // Warmup turnstile solve in background first, then ensure before submit (reuses in-flight if present)
-    await ensureTurnstileTokenOnPage(page, email, 'reloginIfRedirected.warmup', { background: true });
-    // If we are on a human verification page, try to solve turnstile before attempting login.
-    await ensureTurnstileTokenOnPage(page, email, 'reloginIfRedirected.beforeSubmit');
-
     try {
         await page.waitForSelector('input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"]', { timeout: 10000 });
-    } catch {
-    }
+    } catch {}
 
     try {
         await evaluateSafe(page, () => {
             const u = document.querySelector('input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"]');
             const p = document.querySelector('input[autocomplete="current-password"], input[type="password"]');
-            if (u) u.value = '';
-            if (p) p.value = '';
+            if (u) { u.value = ''; u.dispatchEvent(new Event('input', { bubbles: true })); u.dispatchEvent(new Event('change', { bubbles: true })); }
+            if (p) { p.value = ''; p.dispatchEvent(new Event('input', { bubbles: true })); p.dispatchEvent(new Event('change', { bubbles: true })); }
         });
-    } catch {
-    }
+    } catch {}
 
     try {
-        await page.type('input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"]', String(email || ''), { delay: 10 });
-        await page.type('input[autocomplete="current-password"], input[type="password"]', String(password || ''), { delay: 10 });
+        await page.type('input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"]', String(email || ''), { delay: 15 });
+        await page.type('input[autocomplete="current-password"], input[type="password"]', String(password || ''), { delay: 15 });
     } catch {
-        // fall back to original selectors
         try {
-            await page.type('input[autocomplete="username"]', String(email || ''), { delay: 10 });
-            await page.type('input[autocomplete="current-password"]', String(password || ''), { delay: 10 });
+            await page.type('input[autocomplete="username"]', String(email || ''), { delay: 15 });
+            await page.type('input[autocomplete="current-password"]', String(password || ''), { delay: 15 });
         } catch {}
     }
 
-    await evaluateSafe(page, () => {
-        const b = [...document.querySelectorAll('button.black-btn, button, [role="button"]')].find(x => (x.innerText || '').trim().toUpperCase() === 'GİRİŞ');
-        b?.click();
-    }).catch(() => {});
+    await delay(500);
+    await ensureTurnstileTokenOnPage(page, email, 'reloginIfRedirected.warmup', { background: true });
+    await ensureTurnstileTokenOnPage(page, email, 'reloginIfRedirected.beforeSubmit');
+    await delay(300);
+
+    try {
+        const submitted = await evaluateSafe(page, () => {
+            const form = document.querySelector('form');
+            if (form) {
+                const submitBtn = [...form.querySelectorAll('button, input[type="submit"]')].find(x => (x.innerText || x.value || '').trim().toUpperCase().includes('GİRİŞ'));
+                if (submitBtn) {
+                    try { submitBtn.click(); return 'click'; } catch {}
+                }
+                try { form.requestSubmit(); return 'requestSubmit'; } catch {}
+                try { form.submit(); return 'submit'; } catch {}
+            }
+            const any = [...document.querySelectorAll('button.black-btn, button, [role="button"]')].find(x => (x.innerText || '').trim().toUpperCase() === 'GİRİŞ');
+            if (any) { any.click(); return 'fallback_click'; }
+            return null;
+        });
+        logger.debug('reloginIfRedirected: form submit', { method: submitted });
+    } catch {}
 
     try { await delay(350); } catch {}
 
     const preUrl = currentUrl;
     const navRes = await Promise.race([
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).then(() => ({ type: 'nav_ok' })).catch((e) => ({ type: 'nav_error', message: e?.message || String(e) })),
-        delay(30000).then(() => ({ type: 'timeout' }))
+        page.waitForNavigation({ waitUntil: 'load', timeout: 45000 }).then(() => ({ type: 'nav_ok' })).catch((e) => ({ type: 'nav_error', message: e?.message || String(e) })),
+        delay(45000).then(() => ({ type: 'timeout' }))
     ]);
 
     // Re-check URL after navigation settles (even if timeout)
