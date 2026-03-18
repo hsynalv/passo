@@ -13,7 +13,7 @@ const logger = require('../utils/logger');
 const { formatError, formatSuccess } = require('../utils/messages');
 const { BasketTimer, checkBasketTimeoutFromPage } = require('../utils/basketTimer');
 const {confirmSwalYes, clickRemoveFromCartAndConfirm} = require('../helpers/swal');
-const { captureSeatIdFromNetwork, readBasketData, readCatBlock, setCatBlockOnB, openSeatMapStrict, clickContinueInsidePage, gotoWithRetry, ensureUrlContains, SEAT_NODE_SELECTOR, ensureTcAssignedOnBasket, clickBasketDevamToOdeme, dismissPaymentInfoModalIfPresent, fillInvoiceTcAndContinue, acceptAgreementsAndContinue, fillNkolayPaymentIframe } = require('../helpers/page');
+const { captureSeatIdFromNetwork, readBasketData, readCatBlock, setCatBlockOnB, openSeatMapStrict, clickContinueInsidePage, gotoWithRetry, ensureUrlContains, isHomeUrl, SEAT_NODE_SELECTOR, ensureTcAssignedOnBasket, clickBasketDevamToOdeme, dismissPaymentInfoModalIfPresent, fillInvoiceTcAndContinue, acceptAgreementsAndContinue, fillNkolayPaymentIframe } = require('../helpers/page');
 const { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware } = require('../helpers/seat');
 
 ac.setAPIKey(cfg.ANTICAPTCHA_KEY || '');
@@ -225,17 +225,12 @@ async function selectSvgBlockById(page, blockId) {
 }
 
 async function applyCategoryBlockSelection(page, selectionMode, catBlock, seatInfo) {
-    const mode = String(selectionMode || 'legacy').toLowerCase();
-    if (mode === 'svg') {
-        // IMPORTANT:
-        // - `catBlock.svgBlockId` is a DOM id like "block40396" (works with document.getElementById).
-        // - `seatInfo.blockId` is a backend numeric id (e.g. "61336") and is NOT a DOM id.
-        // Prefer DOM svgBlockId; fall back to last-known svgBlockId stored on seatInfo.
-        const svgBlockId =
-            (catBlock && catBlock.svgBlockId ? String(catBlock.svgBlockId) : '') ||
-            (seatInfo && seatInfo.svgBlockId ? String(seatInfo.svgBlockId) : '') ||
-            '';
-        if (!svgBlockId) return true;
+    // svgBlockId = SVG akışından (svg veya scan+svg) gelen blok id'si
+    const svgBlockId =
+        (catBlock && catBlock.svgBlockId ? String(catBlock.svgBlockId) : '') ||
+        (seatInfo && seatInfo.svgBlockId ? String(seatInfo.svgBlockId) : '') ||
+        '';
+    if (svgBlockId) {
         return await selectSvgBlockById(page, svgBlockId);
     }
     await setCatBlockOnB(page, catBlock);
@@ -592,6 +587,9 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
 
             try { if (cache) cache.inFlight = null; } catch {}
 
+            if (/detached|Target closed|Protocol error/i.test(msg)) {
+                throw new Error('Sayfa oturumu sonlandı (uzun süreli Turnstile çözümü sırasında sayfa değişti). Lütfen tekrar deneyin.');
+            }
             const transient = /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up/i.test(msg);
             if (!transient || attempt >= maxAttempts) {
                 return { attempted: false, error: msg, attempt };
@@ -1965,10 +1963,16 @@ async function handlePrioritySaleModal(page, opts = null) {
 async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCategory, selectionMode = 'legacy') {
     try {
         const u = (() => { try { return page.url(); } catch { return ''; } })();
-        if (/\/giris(\?|$)/i.test(String(u || ''))) {
+        const url = String(u || '');
+        if (/\/giris(\?|$)/i.test(url)) {
             throw new Error('Kategori/blok seçimi login sayfasında başlatılamaz');
         }
-    } catch {}
+        if (!/\/koltuk-secim/i.test(url)) {
+            throw new Error('Kategori/blok seçimi koltuk-secim sayfasında yapılmalı (şu an: ' + (url || 'bilinmiyor') + ')');
+        }
+    } catch (e) {
+        if (e?.message?.includes('Kategori/blok seçimi')) throw e;
+    }
 
     const cat = String(categoryType || '').trim();
     const alt = String(alternativeCategory || '').trim();
@@ -1978,8 +1982,21 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
 
     const mode = String(selectionMode || 'legacy').toLowerCase();
 
+    // Scan mode: try SVG first if present, else use dropdown
+    let useSvgFlow = (mode === 'svg');
+    let proceedToDropdown = false;
+    if (mode === 'scan') {
+        const hasSvg = await page.waitForSelector('svg.svgLayout, svg .svgLayout, svg[class*="svgLayout"], .svgLayout', { timeout: 5000 }).then(() => true).catch(() => false);
+        useSvgFlow = hasSvg;
+        if (hasSvg) {
+            logger.info('categoryBlock:scan_svg_detected', {});
+        } else {
+            logger.info('categoryBlock:scan_dropdown_detected', {});
+        }
+    }
+
     // New UI: SVG stadium layout block selection
-    if (mode === 'svg') {
+    if (useSvgFlow) {
         const readSeatmapStateAcrossFrames = async () => {
             try {
                 const frames = page.frames();
@@ -2146,13 +2163,18 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
         // SVG layout can be AB-tested / gated; if not present, fallback to legacy dropdown flow.
         const svgRootOk = await page.waitForSelector('svg.svgLayout, svg .svgLayout, svg[class*="svgLayout"], .svgLayout', { timeout: 15000 }).then(() => true).catch(() => false);
         if (!svgRootOk) {
-            logger.warn('categoryBlock:svg_layout_missing_fallback_legacy', {
-                url: (() => { try { return page.url(); } catch { return null; } })(),
-                title: await page.title().catch(() => null)
-            });
-            // In svg mode do NOT fallback to legacy: on home/login pages .custom-select-box doesn't exist.
-            throw new Error('SVG_LAYOUT_MISSING');
-        } else {
+            if (mode === 'scan') {
+                logger.info('categoryBlock:scan_svg_fallback_dropdown', { reason: 'SVG_LAYOUT_MISSING' });
+                proceedToDropdown = true;
+            } else {
+                logger.warn('categoryBlock:svg_layout_missing_fallback_legacy', {
+                    url: (() => { try { return page.url(); } catch { return null; } })(),
+                    title: await page.title().catch(() => null)
+                });
+                throw new Error('SVG_LAYOUT_MISSING');
+            }
+        }
+        if (!proceedToDropdown) {
             const tried = new Set();
             const maxTries = 40;
             for (let attempt = 1; attempt <= maxTries; attempt++) {
@@ -2199,9 +2221,19 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                     return items;
                 });
 
-                const remaining = (candidates || []).filter(c => c?.id && !tried.has(c.id));
+                let remaining = (candidates || []).filter(c => c?.id && !tried.has(c.id));
                 if (!remaining.length) break;
-                const pick = remaining[Math.floor(Math.random() * remaining.length)];
+                // SVG modda categoryType/alternativeCategory = blok ID ("block17363" veya "17363")
+                let pick = null;
+                const tryBlockId = (hint) => {
+                    if (!hint) return null;
+                    const h = String(hint).trim();
+                    const normalized = /^\d+$/.test(h) ? `block${h}` : (h.startsWith('block') ? h : `block${h}`);
+                    return remaining.find(c => c?.id === normalized);
+                };
+                pick = tryBlockId(cat) || tryBlockId(alt);
+                if (pick) logger.info('categoryBlock:svg_block_from_category', { categoryType: cat || null, alternativeCategory: alt || null, blockId: pick.id });
+                if (!pick) pick = remaining[Math.floor(Math.random() * remaining.length)];
 
                 const readClickPoint = async () => {
                     return await page.evaluate((targetId) => {
@@ -2474,12 +2506,24 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                 }
             }
 
-            throw new Error('SVG bloklarında uygun koltuk bulunamadı');
+            if (mode === 'scan') {
+                logger.info('categoryBlock:scan_svg_fallback_dropdown', { reason: 'no_seats_in_blocks' });
+                proceedToDropdown = true;
+            } else {
+                throw new Error('SVG bloklarında uygun koltuk bulunamadı');
+            }
         }
-    }
+        }
 
-    // Sayfa hazır olana kadar bekle (kategori dropdown'ının görünür olması için)
+    // Dropdown path: legacy mode, or scan when SVG not found / failed
+    if (!useSvgFlow || proceedToDropdown) {
+        await (async () => {
     for (let i = 0; i < cfg.TIMEOUTS.CATEGORY_SELECTION_RETRIES; i++) {
+        const cur = (() => { try { return page.url(); } catch { return ''; } })();
+        if (/\/giris(\?|$)/i.test(cur)) throw new Error('Kategori seçimi login sayfasında yapılamaz');
+        if (isHomeUrl(cur)) {
+            throw new Error('Koltuk seçim sayfasına ulaşılamadı (ana sayfaya yönlendirildi - giriş yapılmamış veya oturum sonlandı)');
+        }
         const ok = await page.evaluate(() => {
             const selectBox = document.querySelector('.custom-select-box');
             return selectBox && selectBox.offsetParent !== null; // Görünür olup olmadığını kontrol et
@@ -2488,7 +2532,19 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
         await delay(cfg.DELAYS.CATEGORY_SELECTION);
     }
 
-    await page.waitForSelector('.custom-select-box', { visible: true, timeout: 15000 });
+    const beforeWait = (() => { try { return page.url(); } catch { return ''; } })();
+    if (!/\/koltuk-secim/i.test(beforeWait)) {
+        if (/\/giris(\?|$)/i.test(beforeWait)) throw new Error('Kategori seçimi login sayfasında yapılamaz');
+        throw new Error('Koltuk seçim sayfasına ulaşılamadı (giriş yapılmamış veya oturum sonlandı). Şu an: ' + (beforeWait || 'bilinmiyor'));
+    }
+    try {
+        await page.waitForSelector('.custom-select-box', { visible: true, timeout: 15000 });
+    } catch (e) {
+        const after = (() => { try { return page.url(); } catch { return ''; } })();
+        if (/\/giris(\?|$)/i.test(after)) throw new Error('Kategori seçimi login sayfasında yapılamaz');
+        if (isHomeUrl(after)) throw new Error('Koltuk seçim sayfasına ulaşılamadı (ana sayfaya yönlendirildi - giriş yapılmamış veya oturum sonlandı)');
+        throw e;
+    }
 
     // open dropdown + choose category
     const optSel = '.dropdown-option:not(.disabled), .dropdown-option, [role="option"], .dropdown-menu [role="menuitem"], .dropdown-menu .dropdown-item';
@@ -2754,6 +2810,8 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
             s.dispatchEvent(new Event('change', {bubbles: true}));
         }
     });
+        })();
+    }
 }
 
 async function startBot(req, res) {
@@ -3055,7 +3113,7 @@ async function startBot(req, res) {
                     }, { timeout: 20000 }, SEAT_NODE_SELECTOR);
                     return true;
                 } catch {}
-                if (String(categorySelectionMode || '').toLowerCase() === 'svg' && svgBid) {
+                if (svgBid) {
                     try { await selectSvgBlockById(pageC, String(svgBid)); } catch {}
                 }
                 try { await delay(350 + (attempt * 300)); } catch {}
@@ -4970,8 +5028,14 @@ async function startBot(req, res) {
             }
         } catch {}
         
-        const snapA = await snapshotPage(pageA, 'A.onError');
-        const snapB = await snapshotPage(pageB, 'B.onError');
+        let snapA, snapB;
+        try { snapA = await snapshotPage(pageA, 'A.onError'); } catch (e) {
+            snapA = { label: 'A.onError', error: /detached|Target closed/i.test(String(e?.message)) ? 'Sayfa oturumu sonlandı' : (e?.message || String(e)) };
+        }
+        try { snapB = await snapshotPage(pageB, 'B.onError'); } catch (e) {
+            snapB = { label: 'B.onError', error: /detached|Target closed/i.test(String(e?.message)) ? 'Sayfa oturumu sonlandı' : (e?.message || String(e)) };
+        }
+        const errMsg = /detached|Target closed/i.test(String(err?.message)) ? 'Sayfa oturumu sonlandı (uzun süreli işlem sırasında sayfa değişti). Lütfen tekrar deneyin.' : String(err?.message || err);
         logger.errorSafe('Bot hatası', err, {
             team,
             ticketType,
@@ -4984,10 +5048,10 @@ async function startBot(req, res) {
             snapB
         });
         try {
-            runStore.upsert(runId, { status: 'error', error: String(err?.message || err), result: null });
+            runStore.upsert(runId, { status: 'error', error: errMsg, result: null });
         } catch {}
         return res.status(500).json({
-            error: String(err.message || err),
+            error: errMsg,
             basketStatus: basketStatus,
             lastStep,
             urlA: (() => { try { return pageA?.url?.(); } catch { return null; } })(),

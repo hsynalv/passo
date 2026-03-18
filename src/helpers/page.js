@@ -816,6 +816,7 @@ module.exports = {
   ensurePage,
   ensureUrlContains,
   gotoWithRetry,
+  isHomeUrl,
   SEAT_NODE_SELECTOR,
   captureSeatIdFromNetwork,
   readBasketData,

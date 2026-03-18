@@ -1174,7 +1174,11 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                 await page.waitForFunction(() => {
                   return !!document.querySelector('.cf-turnstile') || !!document.querySelector('input[name="cf-turnstile-response"]');
                 }, { timeout: 8000 }).catch(() => {});
-                try { await ensureTurnstileFn(page, email, `seatPick:${context}:seatmapRecoverNav`, { background: false }); } catch {}
+                try {
+                  await ensureTurnstileFn(page, email, `seatPick:${context}:seatmapRecoverNav`, { background: false });
+                } catch (e) {
+                  if (e && /detached|Target closed|Sayfa oturumu sonlandı/i.test(String(e.message))) throw e;
+                }
               }
               await openSeatMapStrict(page);
             } catch {}

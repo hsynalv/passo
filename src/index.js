@@ -56,7 +56,13 @@ function start() {
     app.listen(cfg.PORT, () => {
         logger.info(`Bot sunucusu http://localhost:${cfg.PORT} üzerinde çalışıyor`);
         console.log(`Bot sunucusu http://localhost:${cfg.PORT} uzerinde calisiyor`);
+        console.log('Durdurmak icin Ctrl+C basin.');
     });
+}
+
+// Terminal prompt gelmesin: stdin açık tutulsun (foreground'da çalışsın)
+if (process.stdin.isTTY) {
+    process.stdin.resume();
 }
 
 start();
