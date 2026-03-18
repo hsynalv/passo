@@ -620,6 +620,12 @@ function buildProxyArgs(proxyHost, proxyPort) {
         '--safebrowsing-disable-auto-update',
         '--disable-client-side-phishing-detection'
     ];
+    if (process.platform !== 'win32') {
+        args.push('--no-sandbox', '--disable-setuid-sandbox');
+        args.push('--disable-dev-shm-usage');
+        args.push('--disable-gpu', '--disable-software-rasterizer');
+        args.push('--disable-features=VizDisplayCompositor');
+    }
     let proxyApplied = false;
     if (proxyHost && proxyPort) {
         let host = String(proxyHost).trim();
@@ -634,11 +640,12 @@ function buildProxyArgs(proxyHost, proxyPort) {
 
 function resolveBrowserExecutablePath(configuredPath) {
     const raw = String(configuredPath || '').trim().replace(/^['"]|['"]$/g, '');
+    const isWin = process.platform === 'win32';
     const localAppData = process.env.LOCALAPPDATA || 'C:\\Users\\Default\\AppData\\Local';
     const programFiles = process.env.PROGRAMFILES || 'C:\\Program Files';
     const programFilesX86 = process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
 
-    const candidates = [
+    const candidates = isWin ? [
         raw,
         `${programFiles}\\Google\\Chrome\\Application\\chrome.exe`,
         `${programFilesX86}\\Google\\Chrome\\Application\\chrome.exe`,
@@ -649,9 +656,17 @@ function resolveBrowserExecutablePath(configuredPath) {
         `${programFiles}\\Microsoft\\Edge\\Application\\msedge.exe`,
         `${programFilesX86}\\Microsoft\\Edge\\Application\\msedge.exe`,
         `${localAppData}\\Microsoft\\Edge\\Application\\msedge.exe`
-    ].filter(Boolean);
+    ] : [
+        raw,
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/snap/bin/chromium',
+        '/usr/bin/chromium-browser-unstable'
+    ];
 
-    for (const candidate of candidates) {
+    for (const candidate of candidates.filter(Boolean)) {
         try {
             if (fs.existsSync(candidate)) return candidate;
         } catch {}
@@ -862,13 +877,97 @@ async function launchAndLogin(options) {
         }
     } catch {}
 
-    // Start Turnstile solving ASAP (background), so form fill + other waits overlap with captcha time.
-    await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.warmup', { background: true });
-
-    // Turnstile/Verify Human: ensure token before submit (will reuse in-flight warmup if present)
-    await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.beforeSubmit');
-
     try { page.removeListener('response', onResp); } catch {}
+
+    const userSel = 'input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"], input[id*="user"], input[id*="email"]';
+    const passSel = 'input[autocomplete="current-password"], input[type="password"], input[name*="pass"], input[id*="pass"]';
+
+    const findLoginContext = async () => {
+        const directUser = await page.$(userSel).catch(() => null);
+        const directPass = await page.$(passSel).catch(() => null);
+        if (directUser && directPass) return { frame: null, userEl: directUser, passEl: directPass };
+        const frames = (() => { try { return page.frames(); } catch { return []; } })();
+        for (const fr of frames) {
+            if (!fr || fr === page.mainFrame()) continue;
+            const u = await fr.$(userSel).catch(() => null);
+            const p = await fr.$(passSel).catch(() => null);
+            if (u && p) return { frame: fr, userEl: u, passEl: p };
+        }
+        return null;
+    };
+
+    const tryRevealLoginForm = async () => {
+        const hasForm = await findLoginContext();
+        if (hasForm) return true;
+        try {
+            await page.evaluate(() => {
+                const norm = (s) => (s || '').toString().trim().toLowerCase();
+                const btns = document.querySelectorAll('a, button, [role="button"], [role="link"]');
+                for (const x of btns) {
+                    const t = norm(x.innerText || x.textContent || '');
+                    if (t.includes('giriş') || t.includes('giris') || t === 'giriş yap' || t === 'üye girişi') {
+                        try { x.click(); return; } catch {}
+                    }
+                }
+            });
+            await delay(1500);
+        } catch {}
+        return !!await findLoginContext();
+    };
+
+    const tryEnsureLoginForm = async (timeoutMs = 12000) => {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            let ctx = await findLoginContext();
+            if (ctx) return ctx;
+            if (Date.now() - start > 3000) await tryRevealLoginForm();
+            await delay(500);
+        }
+        return null;
+    };
+
+    const ensureLoginFormWithReload = async () => {
+        for (let attempt = 1; attempt <= 5; attempt++) {
+            const ctx = await tryEnsureLoginForm(12000);
+            if (ctx) return ctx;
+            try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }); } catch {}
+            try { await delay(600 * attempt); } catch {}
+            const u = (() => { try { return page.url(); } catch { return ''; } })();
+            if (!/\/tr\/giris(\?|$)/i.test(String(u || ''))) {
+                try {
+                    await gotoWithRetry(page, cfg.PASSO_LOGIN, { retries: 1, waitUntil: 'domcontentloaded', expectedUrlIncludes: '/giris', backoffMs: 350 });
+                } catch {}
+            }
+        }
+        return null;
+    };
+
+    let loginCtx = await ensureLoginFormWithReload();
+    if (!loginCtx) {
+        const u = (() => { try { return page.url(); } catch { return ''; } })();
+        if (!/\/giris(\?|$)/i.test(u)) {
+            logger.warn('launchAndLogin: login formu bulunamadı, zaten girişli/redirect kabul ediliyor', { email, url: u });
+            return { browser, page };
+        }
+        try {
+            const diag = await evalOnPage(page, `
+                var allInputs = document.querySelectorAll('input');
+                var inputs = [];
+                for (var i = 0; i < Math.min(allInputs.length, 40); i++) {
+                    var inp = allInputs[i];
+                    inputs.push({ type: inp.getAttribute('type') || '', name: inp.getAttribute('name') || '', id: inp.getAttribute('id') || '' });
+                }
+                return { inputCount: allInputs.length, inputs };
+            `);
+            logger.warn('launchAndLogin: login formu bulunamadı (diagnostic)', { email, url: u, diag });
+        } catch {}
+        throw new Error('Login formu bulunamadı');
+    }
+
+    await delay(800);
+    await page.waitForSelector('.cf-turnstile, input[name="cf-turnstile-response"]', { timeout: 15000 }).catch(() => {});
+    await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.warmup', { background: true });
+    await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.beforeSubmit');
 
     try {
         const preLoginSnap = await evalOnPage(page, `
@@ -882,112 +981,6 @@ async function launchAndLogin(options) {
         `);
         logger.debug('launchAndLogin: login submit öncesi snapshot', { email, snap: preLoginSnap });
     } catch {}
-
-    const userSel = 'input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"], input[id*="user"], input[id*="email"]';
-    const passSel = 'input[autocomplete="current-password"], input[type="password"], input[name*="pass"], input[id*="pass"]';
-
-    const findLoginContext = async () => {
-        const directUser = await page.$(userSel).catch(() => null);
-        const directPass = await page.$(passSel).catch(() => null);
-        if (directUser && directPass) return { frame: null, userEl: directUser, passEl: directPass };
-
-        const frames = (() => {
-            try { return page.frames(); } catch { return []; }
-        })();
-        for (const fr of frames) {
-            if (!fr || fr === page.mainFrame()) continue;
-            const u = await fr.$(userSel).catch(() => null);
-            const p = await fr.$(passSel).catch(() => null);
-            if (u && p) return { frame: fr, userEl: u, passEl: p };
-        }
-        return null;
-    };
-
-    const tryEnsureLoginForm = async (timeoutMs = 8000) => {
-        const start = Date.now();
-        while (Date.now() - start < timeoutMs) {
-            const ctx = await findLoginContext();
-            if (ctx) return ctx;
-            await delay(500);
-        }
-        return null;
-    };
-
-    const ensureLoginFormWithReload = async () => {
-        for (let attempt = 1; attempt <= 5; attempt++) {
-            const ctx = await tryEnsureLoginForm(8000);
-            if (ctx) return ctx;
-
-            try {
-                await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
-            } catch {}
-
-            const backoff = 600 * attempt;
-            try { await delay(backoff); } catch {}
-
-            const u = (() => { try { return page.url(); } catch { return ''; } })();
-            if (!/\/tr\/giris(\?|$)/i.test(String(u || ''))) {
-                try {
-                    await gotoWithRetry(page, cfg.PASSO_LOGIN, {
-                        retries: 1,
-                        waitUntil: 'domcontentloaded',
-                        expectedUrlIncludes: '/giris',
-                        backoffMs: 350
-                    });
-                } catch {}
-            }
-        }
-        return null;
-    };
-
-    let loginCtx = await ensureLoginFormWithReload();
-    
-    if (!loginCtx) {
-        const u = (() => { try { return page.url(); } catch { return ''; } })();
-        // Login formu yoksa ve /giris'te değilsek, büyük ihtimalle zaten girişli/redirect olmuştur.
-        if (!/\/giris(\?|$)/i.test(u)) {
-            logger.warn('launchAndLogin: login formu bulunamadı, zaten girişli/redirect kabul ediliyor', { email, url: u });
-            return { browser, page };
-        }
-        try {
-            const diag = await evalOnPage(page, `
-                var allInputs = document.querySelectorAll('input');
-                var allForms = document.querySelectorAll('form');
-                var inputs = [];
-                var forms = [];
-                var i;
-                for (i = 0; i < allInputs.length && i < 40; i += 1) {
-                    var inp = allInputs[i];
-                    inputs.push({
-                        type: inp.getAttribute('type') || '',
-                        name: inp.getAttribute('name') || '',
-                        id: inp.getAttribute('id') || '',
-                        autocomplete: inp.getAttribute('autocomplete') || ''
-                    });
-                }
-                for (i = 0; i < allForms.length && i < 10; i += 1) {
-                    var f = allForms[i];
-                    forms.push({
-                        id: f.getAttribute('id') || '',
-                        name: f.getAttribute('name') || '',
-                        action: f.getAttribute('action') || ''
-                    });
-                }
-                return { inputCount: allInputs.length, inputs: inputs, formCount: allForms.length, forms: forms };
-            `);
-            const frameInfo = (() => {
-                try {
-                    return page.frames().map(fr => ({
-                        url: (() => { try { return fr.url(); } catch { return null; } })()
-                    }));
-                } catch {
-                    return [];
-                }
-            })();
-            logger.warn('launchAndLogin: login formu bulunamadı (diagnostic)', { email, url: u, diag, frames: frameInfo });
-        } catch {}
-        throw new Error('Login formu bulunamadı');
-    }
 
     const target = loginCtx.frame || page;
     const userEl = loginCtx.userEl;
@@ -1148,12 +1141,12 @@ async function reloginIfRedirected(page, email, password) {
                 return { selector: sel, text: el.textContent.trim() };
             }
         }
-        // Check for specific error texts
-        const bodyText = document.body?.innerText || '';
-        const errorKeywords = ['hatalı', 'yanlış', 'geçersiz', 'bulunamadı', 'şifre', 'kilit', 'bloke', 'hesap', 'ban'];
-        for (const kw of errorKeywords) {
-            if (bodyText.toLowerCase().includes(kw)) {
-                return { keyword: kw, text: bodyText.substring(0, 200) };
+        // Check for specific error texts (şifre tek başına form etiketi olabilir, sadece hata bağlamında kontrol et)
+        const bodyText = (document.body?.innerText || '').toLowerCase();
+        const errorPhrases = ['hatalı', 'yanlış', 'geçersiz', 'bulunamadı', 'kilit', 'bloke', 'ban', 'şifre hatalı', 'yanlış şifre', 'geçersiz şifre', 'e-posta hatalı', 'hesap bulunamadı'];
+        for (const phrase of errorPhrases) {
+            if (bodyText.includes(phrase)) {
+                return { keyword: phrase, text: (document.body?.innerText || '').substring(0, 200) };
             }
         }
         return null;
