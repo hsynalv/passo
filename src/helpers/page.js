@@ -1,5 +1,5 @@
 const delay = require('../utils/delay');
-const cfg = require('../config');
+const { getCfg } = require('../runCfg');
 const { evaluateSafe, waitForFunctionSafe } = require('../utils/browserEval');
 
 const SEAT_NODE_SELECTOR = 'circle.seat-circle, .seat-circle, [seat-id], [data-seat-id], [data-id][class*="seat"], [class*="seat-circle"], svg circle[class*="seat"], svg.seatmap-svg g[id^="seat"], svg.seatmap-svg g[id^="seat"] rect, svg.seatmap-svg g[id^="seat"] circle, svg.seatmap-svg g[id^="seat"] path, svg.seatmap-svg g[id^="seat"] polygon, svg.seatmap-svg g[id^="seat"] line, svg.seatmap-svg rect[class^="block"]';
@@ -453,7 +453,7 @@ async function ensurePage(browser){
 }
 
 const captureSeatIdFromNetwork = (page, timeoutMs=null)=> new Promise(resolve=>{
-  timeoutMs = timeoutMs || cfg.TIMEOUTS.NETWORK_CAPTURE_TIMEOUT;
+  timeoutMs = timeoutMs || getCfg().TIMEOUTS.NETWORK_CAPTURE_TIMEOUT;
   let settled=false; const done=v=>{ if(!settled){ settled=true; try{page.removeListener('response',onResp);}catch{}; clearTimeout(t); resolve(v||null);} };
   const t=setTimeout(()=>done(null),timeoutMs);
   const onResp=async(resp)=>{ try{
@@ -571,7 +571,36 @@ async function readBasketData(page) {
 }
 
 const readCatBlock = async (page) => page.evaluate(()=>{
-  const cat = document.querySelector('.custom-select-box .selected-option')?.textContent?.trim() || '';
+  let cat = document.querySelector('.custom-select-box .selected-option')?.textContent?.trim() || '';
+  if (!cat) {
+    try {
+      const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+      const isVisible = (el) => {
+        try {
+          const r = el.getBoundingClientRect();
+          if (!r || r.width < 2 || r.height < 2) return false;
+          const st = window.getComputedStyle(el);
+          if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || '1') === 0)) return false;
+          return true;
+        } catch { return false; }
+      };
+      const selects = Array.from(document.querySelectorAll('select')).filter(isVisible);
+      const hasTicketish = (s) => {
+        try {
+          const opts = Array.from(s.options || []).map(o => norm(o.textContent || o.innerText || ''));
+          return opts.some(t => t.includes('kategori')) && opts.some(t => /₺|try|tl/i.test(t));
+        } catch { return false; }
+      };
+      const pick = selects.find(hasTicketish) || selects.find(s => {
+        const id = norm(s.id);
+        const name = norm(s.getAttribute('name') || '');
+        return id.includes('kategori') || name.includes('kategori') || id.includes('category') || name.includes('category');
+      }) || null;
+      if (pick) {
+        cat = pick.selectedOptions?.[0]?.textContent?.trim() || '';
+      }
+    } catch {}
+  }
   const s = document.querySelector('select#blocks');
   const blockText = s?.selectedOptions?.[0]?.textContent?.trim() || '';
   let blockVal  = s?.value || '';
@@ -632,7 +661,7 @@ const setCatBlockOnB = async (page, catBlock) => {
         const opts = Array.from(s.options || []);
         // need at least 2 options to be meaningful
         return opts.length >= 2;
-      }, { timeout: Math.max(12000, Number(cfg.TIMEOUTS.BLOCKS_WAIT_TIMEOUT || 0) + 9000) }).catch(() => null);
+      }, { timeout: Math.max(12000, Number(getCfg().TIMEOUTS.BLOCKS_WAIT_TIMEOUT || 0) + 9000) }).catch(() => null);
       if (!blocksReady) {
         const isSvg = await page.evaluate(() => !!document.querySelector('svg.svgLayout, .svgLayout')).catch(() => false);
         if (isSvg) return true;

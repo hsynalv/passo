@@ -1,4 +1,4 @@
-const cfg = require('../config');
+const { getCfg } = require('../runCfg');
 const logger = require('./logger');
 
 /**
@@ -7,7 +7,7 @@ const logger = require('./logger');
 class BasketTimer {
     constructor() {
         this.basketStartTime = null;
-        this.holdingTimeSeconds = cfg.BASKET.HOLDING_TIME_SECONDS;
+        this.holdingTimeSeconds = getCfg().BASKET.HOLDING_TIME_SECONDS;
     }
 
     /**
@@ -54,7 +54,7 @@ class BasketTimer {
     isNearExpiry() {
         const remaining = this.getRemainingSeconds();
         if (remaining === null) return false;
-        return remaining <= cfg.BASKET.WARNING_BEFORE_TIMEOUT && remaining > 0;
+        return remaining <= getCfg().BASKET.WARNING_BEFORE_TIMEOUT && remaining > 0;
     }
 
     /**
@@ -63,7 +63,7 @@ class BasketTimer {
     shouldRemoveBeforeTimeout() {
         const remaining = this.getRemainingSeconds();
         if (remaining === null) return false;
-        return remaining <= cfg.BASKET.REMOVE_BEFORE_TIMEOUT && remaining > 0;
+        return remaining <= getCfg().BASKET.REMOVE_BEFORE_TIMEOUT && remaining > 0;
     }
 
     /**

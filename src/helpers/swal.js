@@ -1,8 +1,8 @@
 const delay = require('../utils/delay');
-const cfg = require('../config');
+const { getCfg } = require('../runCfg');
 
 async function confirmSwalYes(page, timeoutMs = null) {
-  timeoutMs = timeoutMs || cfg.TIMEOUTS.SWAL_CONFIRM_TIMEOUT;
+  timeoutMs = timeoutMs || getCfg().TIMEOUTS.SWAL_CONFIRM_TIMEOUT;
   const end = Date.now() + timeoutMs;
   while (Date.now() < end) {
     const contexts = [page, ...(typeof page.frames === 'function' ? page.frames() : [])];
@@ -174,7 +174,7 @@ async function confirmSwalYes(page, timeoutMs = null) {
 }
 
 async function clickRemoveFromCartAndConfirm(page, timeoutMs = null) {
-  timeoutMs = timeoutMs || cfg.TIMEOUTS.REMOVE_FROM_CART_TIMEOUT;
+  timeoutMs = timeoutMs || getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT;
   const labels = ['Sil','Kaldır','Sepetten çıkar','Sepetten Çıkar','Çıkar','Remove','Delete'];
   let clicked = false;
   const contexts = [page, ...(typeof page.frames === 'function' ? page.frames() : [])];

@@ -12,6 +12,60 @@ const autoScrollStatusEl = $('autoScrollStatus');
 let currentRunId = null;
 let es = null;
 
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function renderPairDashboard(dash) {
+  const metaEl = $('pairDashboardMeta');
+  const bodyEl = $('pairDashboardBody');
+  if (!metaEl || !bodyEl) return;
+  if (!dash || !Array.isArray(dash.pairs) || dash.pairs.length === 0) {
+    metaEl.textContent = '';
+    bodyEl.innerHTML = '<div class="pairDashEmpty">Run başlatıldığında eşleşmeler burada canlı güncellenir.</div>';
+    return;
+  }
+  const pairs = dash.pairs;
+  const matched = pairs.filter((p) => !p.unmatched).length;
+  const extra = pairs.length - matched;
+  const mode = dash.mode === 'multi' ? 'Çoklu' : 'Tek çift';
+  const cT = Math.max(1, Number(dash.cTargetPairIndex) || 1);
+  const t = dash.updatedAt ? new Date(dash.updatedAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+  metaEl.textContent = `${mode} · ${pairs.length} satır (${matched} eşleşen${extra ? `, ${extra} ekstra A` : ''}) · C/finalize hedefi: #${cT}${t ? ` · ${t}` : ''}`;
+
+  bodyEl.innerHTML = pairs
+    .map((p) => {
+      const who =
+        p.holder === 'A' ? 'A hesabında' : p.holder === 'B' ? 'B hesabında' : '—';
+      const badge = p.isCTarget ? '<span class="pairDashC">C hedefi</span>' : '';
+      const um = p.unmatched ? '<span class="pairDashWarn">B yok</span>' : '';
+      const active = p.isCTarget ? ' active' : '';
+      const trib = p.tribune != null && String(p.tribune).trim() ? String(p.tribune).trim() : null;
+      const srow = p.seatRow != null && String(p.seatRow).trim() ? String(p.seatRow).trim() : null;
+      const snum = p.seatNumber != null && String(p.seatNumber).trim() ? String(p.seatNumber).trim() : null;
+      const detailLines =
+        trib || srow || snum
+          ? `<div class="pairCardRow"><span>Tribün</span> ${escapeHtml(trib || '—')}</div>
+      <div class="pairCardRow"><span>Sıra</span> ${escapeHtml(srow || '—')}</div>
+      <div class="pairCardRow"><span>Koltuk no</span> ${escapeHtml(snum || '—')}</div>`
+          : '';
+      return `<div class="pairCard${active}">
+      <div class="pairCardHead"><strong>#${escapeHtml(p.pairIndex)}</strong> ${badge} ${um}</div>
+      <div class="pairCardRow"><span>A</span> <code>${escapeHtml(p.aEmail || '—')}</code></div>
+      <div class="pairCardRow"><span>B</span> <code>${escapeHtml(p.bEmail || '—')}</code></div>
+      ${detailLines}
+      <div class="pairCardRow"><span>Özet</span> ${escapeHtml(p.seatLabel || '—')} <span class="muted">(id: ${escapeHtml(p.seatId || '—')})</span></div>
+      <div class="pairCardRow"><span>Tutucu</span> <strong>${escapeHtml(who)}</strong></div>
+      <div class="pairCardPhase">${escapeHtml(p.phase || '')}</div>
+    </div>`;
+    })
+    .join('');
+}
+
 const aListEl = $('aAccounts');
 const bListEl = $('bAccounts');
 
@@ -131,6 +185,213 @@ const state = {
   autoScroll: true,
   autoScrollStatus: true,
 };
+
+/** Sunucudan gelen .env tabanlı varsayılanlar; modal açıldığında doldurulur. */
+let panelDefaultsFromServer = null;
+let panelKeyOrder = [];
+const PANEL_STORAGE_KEY = 'passobot_panel_settings_v1';
+
+const PANEL_CHECKBOX_KEYS = new Set([
+  'BASKET_LOOP_ENABLED',
+  'EXPERIMENTAL_A_READD_ON_THRESHOLD',
+]);
+
+/** Bilet alımı — timeout / gecikme / çoklu hesap / sepet döngüsü / koltuk tarama. */
+const PANEL_FIELD_META = {
+  MULTI_A_CONCURRENCY: { label: 'Paralel A oturumu', hint: 'Aynı anda kaç A tarayıcısı.', section: 'multi' },
+  MULTI_B_CONCURRENCY: { label: 'Paralel B oturumu', hint: 'Aynı anda kaç B tarayıcısı.', section: 'multi' },
+  MULTI_STAGGER_MS: { label: 'Başlatma aralığı (ms)', hint: 'Oturumlar arası gecikme.', section: 'multi' },
+
+  BASKET_LOOP_ENABLED: { label: 'Sepet döngüsü (basket loop)', hint: 'Transfer döngüsü aktif.', section: 'basket', type: 'checkbox' },
+  BASKET_LOOP_MAX_HOPS: { label: 'Sepet döngüsü max adım', hint: 'Maksimum hop sayısı.', section: 'basket' },
+  PASSIVE_SESSION_CHECK_MS: { label: 'Pasif hesap oturum kontrolü (ms)', hint: 'Karşı taraf sepetteyken bekleyen (koltuk sayfası) hesap bu aralıkla kontrol edilir; min 10 sn.', section: 'basket' },
+  EXPERIMENTAL_A_READD_ON_THRESHOLD: { label: 'A yeniden ekleme (eşik modu)', hint: 'Deneysel: süre eşiğinde tekrar ekleme.', section: 'basket', type: 'checkbox' },
+  EXPERIMENTAL_A_READD_THRESHOLD_SECONDS: { label: 'A readd eşik (sn)', hint: 'Ne kadar süre kala tetiklensin.', section: 'basket' },
+  EXPERIMENTAL_A_READD_COOLDOWN_SECONDS: { label: 'A readd bekleme (sn)', hint: 'Tekrar arası minimum süre.', section: 'basket' },
+
+  TURNSTILE_DETECTION_TIMEOUT: { label: 'Turnstile algılama timeout (ms)', hint: 'Widget bekleme.', section: 'timeouts' },
+  CLICK_BUY_RETRIES: { label: 'Satın al tıklama denemesi', hint: 'SATIN AL için tekrar.', section: 'timeouts' },
+  CLICK_BUY_DELAY: { label: 'Satın al tıklama gecikmesi (ms)', hint: 'Denemeler arası.', section: 'timeouts' },
+  SEAT_SELECTION_MAX_MS: { label: 'Koltuk seçimi max süre (ms)', hint: 'Blok başına üst süre.', section: 'timeouts' },
+  SEAT_PICK_EXACT_MAX_MS: { label: 'Tam koltuk yakalama max (ms)', hint: 'B’de hedef koltuk.', section: 'timeouts' },
+  NETWORK_CAPTURE_TIMEOUT: { label: 'Ağ yakalama timeout (ms)', hint: 'API yanıtı bekleme.', section: 'timeouts' },
+  SWAL_CONFIRM_TIMEOUT: { label: 'SweetAlert onay timeout (ms)', hint: 'Modal onayı.', section: 'timeouts' },
+  REMOVE_FROM_CART_TIMEOUT: { label: 'Sepetten çıkar timeout (ms)', hint: 'Çıkarma onayı.', section: 'timeouts' },
+  CATEGORY_SELECTION_RETRIES: { label: 'Kategori seçim denemesi', hint: 'Tekrar sayısı.', section: 'timeouts' },
+  BLOCKS_WAIT_TIMEOUT: { label: 'Blok listesi bekleme (ms)', hint: 'select#blocks hazır olana kadar.', section: 'timeouts' },
+  ORDER_LOG_TIMEOUT: { label: 'Order log HTTP timeout (ms)', hint: 'Harici log isteği.', section: 'timeouts' },
+
+  TURNSTILE_CHECK_DELAY: { label: 'Turnstile kontrol gecikmesi (ms)', hint: 'Kısa bekleme.', section: 'delays' },
+  AFTER_LOGIN_DELAY: { label: 'Giriş sonrası gecikme (ms)', hint: 'Sayfa otursun diye.', section: 'delays' },
+  AFTER_CONTINUE_DELAY: { label: 'Devam sonrası gecikme (ms)', hint: 'Koltuk haritasına geçiş.', section: 'delays' },
+  SEAT_SELECTION_DELAY: { label: 'Koltuk seçim gecikmesi (ms)', hint: 'Döngüler arası.', section: 'delays' },
+  CATEGORY_SELECTION_DELAY: { label: 'Kategori seçim gecikmesi (ms)', hint: 'Kategori adımları arası.', section: 'delays' },
+  CLEANUP_DELAY: { label: 'Temizlik gecikmesi (ms)', hint: 'Tarayıcı kapatmadan önce.', section: 'delays' },
+
+  SEAT_SELECTION_CYCLES: { label: 'Koltuk seçim döngü sayısı', hint: 'Blok başına üst tur.', section: 'seat' },
+  SEAT_SNIPE_MAX_MS: { label: 'Snipe max süre (ms)', hint: 'Boş koltuk bekleme üst sınırı.', section: 'seat' },
+  SEAT_SNIPE_POLL_MS: { label: 'Snipe tarama aralığı (ms)', hint: 'Poll sıklığı.', section: 'seat' },
+  CATEGORY_ROAM_EVERY_CYCLES: { label: 'Kategori gezinti (her N döngü)', hint: '0 = kapalı.', section: 'seat' },
+};
+
+const PANEL_SECTION_TITLES = {
+  multi: 'Çoklu hesap',
+  basket: 'Sepet döngüsü ve deneysel A',
+  timeouts: 'Zaman aşımları (ms)',
+  delays: 'Gecikmeler (ms)',
+  seat: 'Koltuk ve kategori tarama',
+  other: 'Diğer',
+};
+
+function loadStoredPanelSettings() {
+  try {
+    const raw = localStorage.getItem(PANEL_STORAGE_KEY);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    return o && typeof o === 'object' ? o : null;
+  } catch {
+    return null;
+  }
+}
+
+function panelSettingsForSubmit() {
+  const s = loadStoredPanelSettings();
+  return s && Object.keys(s).length ? s : undefined;
+}
+
+async function ensurePanelDefaultsFetched() {
+  if (panelDefaultsFromServer && panelKeyOrder.length) return;
+  const r = await fetch('/api/panel-settings', { cache: 'no-store' });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || 'Ayarlar yüklenemedi');
+  panelDefaultsFromServer = j.defaults || {};
+  panelKeyOrder = Array.isArray(j.keys) && j.keys.length ? j.keys : Object.keys(panelDefaultsFromServer);
+}
+
+function checkboxValueForKey(key, checked) {
+  if (key === 'KEEP_BROWSERS_OPEN') return checked ? 'true' : 'false';
+  return checked ? '1' : '0';
+}
+
+function isCheckboxChecked(key, rawVal) {
+  const v = String(rawVal || '').trim().toLowerCase();
+  if (key === 'KEEP_BROWSERS_OPEN') return v === 'true' || v === '1';
+  return v === '1' || v === 'true';
+}
+
+function buildSettingsForm() {
+  const body = $('settingsModalBody');
+  body.textContent = '';
+  const defaults = panelDefaultsFromServer || {};
+  const stored = loadStoredPanelSettings();
+
+  const bySection = {};
+  for (const key of panelKeyOrder) {
+    const meta = PANEL_FIELD_META[key] || { label: key, hint: '', section: 'other' };
+    const section = meta.section || 'other';
+    if (!bySection[section]) bySection[section] = [];
+    bySection[section].push({ key, meta });
+  }
+
+  const sectionOrder = ['timeouts', 'delays', 'basket', 'multi', 'seat', 'other'];
+
+  for (const section of sectionOrder) {
+    const items = bySection[section];
+    if (!items || !items.length) continue;
+
+    const secEl = document.createElement('div');
+    secEl.className = 'settingsSection';
+    const h = document.createElement('h3');
+    h.textContent = PANEL_SECTION_TITLES[section] || section;
+    secEl.appendChild(h);
+
+    const grid = document.createElement('div');
+    grid.className = 'settingsGrid';
+
+    for (const { key, meta } of items) {
+      const valRaw = stored && Object.prototype.hasOwnProperty.call(stored, key) ? stored[key] : defaults[key];
+      const val = valRaw != null ? String(valRaw) : '';
+      const useCheckbox =
+        PANEL_CHECKBOX_KEYS.has(key) || meta.type === 'checkbox';
+
+      const wrap = document.createElement('div');
+      wrap.className = 'settingsField' + (useCheckbox ? '' : ' fullWidth');
+
+      const lab = document.createElement('label');
+      lab.textContent = meta.label || key;
+      wrap.appendChild(lab);
+
+      if (meta.hint) {
+        const hi = document.createElement('p');
+        hi.className = 'hint';
+        hi.textContent = meta.hint;
+        wrap.appendChild(hi);
+      }
+
+      if (useCheckbox) {
+        const row = document.createElement('label');
+        row.className = 'chk chkRow';
+        const inp = document.createElement('input');
+        inp.type = 'checkbox';
+        inp.dataset.panelKey = key;
+        inp.checked = isCheckboxChecked(key, val);
+        row.appendChild(inp);
+        row.appendChild(document.createTextNode(' Aktif'));
+        wrap.appendChild(row);
+      } else {
+        const inp = document.createElement('input');
+        inp.type = key === 'ANTICAPTCHA_KEY' ? 'password' : 'text';
+        inp.dataset.panelKey = key;
+        inp.value = val;
+        if (/MS|DELAY|RETRIES|CONCURRENCY|SECONDS|HOPS|CYCLES|TIMEOUT|POLLS|WIDTH|PORT/i.test(key) && key !== 'CHROME_PATH' && key !== 'ORDER_LOG_URL' && key !== 'PASSO_LOGIN' && key !== 'TICKETING_API_BASE') {
+          inp.type = 'text';
+          inp.inputMode = 'numeric';
+        }
+        wrap.appendChild(inp);
+      }
+
+      grid.appendChild(wrap);
+    }
+
+    secEl.appendChild(grid);
+    body.appendChild(secEl);
+  }
+}
+
+function collectSettingsFromForm() {
+  const body = $('settingsModalBody');
+  const out = {};
+  const inputs = body.querySelectorAll('[data-panel-key]');
+  inputs.forEach((el) => {
+    const key = el.dataset.panelKey;
+    if (!key) return;
+    if (el.type === 'checkbox') {
+      out[key] = checkboxValueForKey(key, el.checked);
+    } else {
+      out[key] = String(el.value != null ? el.value : '').trim();
+    }
+  });
+  return out;
+}
+
+function openSettingsModal() {
+  const root = $('settingsModal');
+  root.hidden = false;
+}
+
+function closeSettingsModal() {
+  $('settingsModal').hidden = true;
+}
+
+async function openSettingsModalFresh() {
+  try {
+    await ensurePanelDefaultsFetched();
+    buildSettingsForm();
+    openSettingsModal();
+  } catch (e) {
+    infoLine('Bilet alım ayarları yüklenemedi', { error: e?.message || String(e) });
+  }
+}
 const statusState = {
   lastText: '',
   lastAt: 0,
@@ -220,7 +481,6 @@ function isStatusMessage(entry, line) {
     if (m.categoryText || m.categoryName) parts.push(`Kat: ${m.categoryText || m.categoryName}`);
     if (m.row || m.rowNumber) parts.push(`Sıra: ${m.row || m.rowNumber}`);
     if (m.seat || m.seatNumber || m.seatNum) parts.push(`Koltuk: ${m.seat || m.seatNumber || m.seatNum}`);
-    if (m.seatId) parts.push(`ID: ${m.seatId}`);
     return parts.length > 0 ? ` (${parts.join(', ')})` : '';
   };
   
@@ -359,10 +619,10 @@ async function pollRunStatus(runId) {
     try {
       const r = await fetch(`/run/${encodeURIComponent(runId)}/status`, { cache: 'no-store' });
       const j = await r.json();
-      if (j && j.status) {
-        runStatusEl.textContent = j.status;
-        if (j.status !== 'running') return;
-      }
+      const st = j?.run?.status;
+      if (j?.run?.pairDashboard) renderPairDashboard(j.run.pairDashboard);
+      if (st) runStatusEl.textContent = st;
+      if (st && st !== 'running') return;
     } catch {}
     await new Promise((res) => setTimeout(res, 1000));
   }
@@ -376,6 +636,12 @@ $('botForm').addEventListener('submit', async (e) => {
 
   // Normalize
   body.prioritySale = body.prioritySale === 'on';
+
+  if (body.cTransferPairIndex != null && String(body.cTransferPairIndex).trim() !== '') {
+    const n = parseInt(String(body.cTransferPairIndex).trim(), 10);
+    if (Number.isFinite(n) && n >= 1) body.cTransferPairIndex = n;
+    else delete body.cTransferPairIndex;
+  }
 
   const aAccounts = readAccounts('A');
   const bAccounts = readAccounts('B');
@@ -393,8 +659,12 @@ $('botForm').addEventListener('submit', async (e) => {
     if (typeof body[k] === 'string' && body[k].trim() === '') delete body[k];
   }
 
+  const ps = panelSettingsForSubmit();
+  if (ps) body.panelSettings = ps;
+
   runIdEl.textContent = '-';
   runStatusEl.textContent = '-';
+  renderPairDashboard(null);
 
   try {
     const resp = await fetch('/start-bot-async', {
@@ -504,6 +774,34 @@ autoScrollStatusEl.addEventListener('change', (e) => {
 });
 
 startSse();
+
+ensurePanelDefaultsFetched().catch(() => {});
+
+try {
+  $('btnOpenSettings').addEventListener('click', () => openSettingsModalFresh());
+  $('btnCloseSettings').addEventListener('click', () => closeSettingsModal());
+  $('settingsModalBackdrop').addEventListener('click', () => closeSettingsModal());
+  $('btnCancelSettings').addEventListener('click', () => closeSettingsModal());
+  $('btnSavePanelSettings').addEventListener('click', () => {
+    try {
+      const collected = collectSettingsFromForm();
+      localStorage.setItem(PANEL_STORAGE_KEY, JSON.stringify(collected));
+      infoLine('Bilet alım ayarları bu tarayıcıda kaydedildi; bir sonraki başlatmada kullanılacak.');
+      closeSettingsModal();
+    } catch (e) {
+      infoLine('Ayarlar kaydedilemedi', { error: e?.message || String(e) });
+    }
+  });
+  $('btnResetPanelDefaults').addEventListener('click', () => {
+    try {
+      localStorage.removeItem(PANEL_STORAGE_KEY);
+      buildSettingsForm();
+      infoLine('Kayıtlı panel ayarları silindi; sunucu (.env) varsayılanları gösteriliyor.');
+    } catch (e) {
+      infoLine('Sıfırlama başarısız', { error: e?.message || String(e) });
+    }
+  });
+} catch {}
 
 // Init with 1 row each
 try {

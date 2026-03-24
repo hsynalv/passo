@@ -13,7 +13,10 @@
         <div class="title">Passobot Panel</div>
         <div class="subtitle">Bot başlat / durumu izle / canlı log</div>
       </div>
-      <div class="status" id="connStatus">Disconnected</div>
+      <div class="headerRight">
+        <button type="button" id="btnOpenSettings" class="btnGhost">Bilet alım ayarları</button>
+        <div class="status" id="connStatus">Disconnected</div>
+      </div>
     </header>
 
     <main class="grid">
@@ -91,6 +94,14 @@
           </div>
 
           <div id="bAccounts" class="accountList"></div>
+
+          <div class="row2">
+            <div class="row">
+              <label>C için A↔B eşleşmesi (çoklu hesap)</label>
+              <input name="cTransferPairIndex" type="number" min="1" max="30" value="1" />
+              <div class="pill muted" style="margin-top:4px">1 = A1↔B1, 2 = A2↔B2… Finalize/C bu çiftin güncel tutucusundan alır. Tek çiftte genelde 1.</div>
+            </div>
+          </div>
 
           <details class="details">
             <summary>Proxy Ayarları (opsiyonel)</summary>
@@ -223,8 +234,38 @@
           </div>
         </div>
         <pre id="logBox" class="logBox"></pre>
+
+        <div class="pairDashboard" id="pairDashboard">
+          <div class="logsHeader" style="margin-top:12px;border-top:1px dashed var(--border);padding-top:8px">
+            <h2>Eşleşmeler & bilet tutucu</h2>
+            <div id="pairDashboardMeta" class="pairDashMeta muted"></div>
+          </div>
+          <div id="pairDashboardBody" class="pairDashBody">
+            <div class="pairDashEmpty">Run başlatıldığında eşleşmeler burada canlı güncellenir.</div>
+          </div>
+        </div>
       </section>
     </main>
+  </div>
+
+  <div id="settingsModal" class="modalRoot" hidden>
+    <div class="modalBackdrop" id="settingsModalBackdrop"></div>
+    <div class="modalDialog" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
+      <div class="modalHead">
+        <h2 id="settingsModalTitle">Bilet alım ayarları</h2>
+        <button type="button" class="modalClose" id="btnCloseSettings" aria-label="Kapat">×</button>
+      </div>
+      <p class="modalIntro">
+        Sadece <strong>bilet alımı</strong> (timeout, gecikme, çoklu hesap, sepet döngüsü, koltuk tarama) ayarları. Varsayılanlar sunucudaki <code>.env</code> değerleridir; kayıtlar bu tarayıcıda saklanır, bot başlarken sunucuya gider — <strong>.env dosyasını değiştirmez</strong>.
+      </p>
+      <div class="modalBody" id="settingsModalBody"></div>
+      <div class="modalFoot">
+        <button type="button" id="btnResetPanelDefaults" class="btnMuted">Sunucu varsayılanına dön</button>
+        <span class="modalFootSpacer"></span>
+        <button type="button" id="btnCancelSettings" class="btnMuted">Kapat</button>
+        <button type="button" id="btnSavePanelSettings">Kaydet</button>
+      </div>
+    </div>
   </div>
 
   <script src="/app.js"></script>

@@ -1,5 +1,5 @@
 const delay = require('../utils/delay');
-const cfg = require('../config');
+const { getCfg } = require('../runCfg');
 const { formatError } = require('../utils/messages');
 const { openSeatMapStrict, readBasketData, clickContinueInsidePage, ensureUrlContains, SEAT_NODE_SELECTOR } = require('./page');
 const logger = require('../utils/logger');
@@ -301,7 +301,7 @@ async function ensureSingleProductQuantity(page, context) {
 
 /** A: random seat seç + sepet doğrulaması (re-click yok) */
 async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
-  maxMs = maxMs || cfg.TIMEOUTS.SEAT_PICK_MAX || cfg.TIMEOUTS.SEAT_SELECTION_MAX;
+  maxMs = maxMs || getCfg().TIMEOUTS.SEAT_PICK_MAX || getCfg().TIMEOUTS.SEAT_SELECTION_MAX;
   const startTs = Date.now();
   const initialEnd = startTs + maxMs;
   let end = initialEnd;
@@ -314,6 +314,8 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
   const ensureTurnstileFn = options.ensureTurnstileTokenOnPage || options.ensureTurnstileFn || null;
   const reloginIfRedirected = typeof options.reloginIfRedirected === 'function' ? options.reloginIfRedirected : null;
   const password = options.password || null;
+  const chooseCategoryFn = typeof options.chooseCategoryFn === 'function' ? options.chooseCategoryFn : null;
+  const categorySelectionMode = options.categorySelectionMode || 'legacy';
 
   const extendDeadline = (ms, reason) => {
     try {
@@ -974,10 +976,10 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                       logger.info(`seatPick:${context}:seatmap_unlock_reload_turnstile_ensure_start`, { attempt: seatmapUnlockAttempts });
                       // After reload the widget can mount late; wait a bit so ensureTurnstileFn actually runs.
                       await page.waitForFunction(() => {
-                        return !!document.querySelector('.cf-turnstile') || !!document.querySelector('input[name="cf-turnstile-response"]');
+                        return !!document.querySelector('.cf-turnstile') || !!document.querySelector('input[name="cf-turnstile-response"]') || !!document.querySelector('iframe[src*="recaptcha"]') || !!document.querySelector('.g-recaptcha');
                       }, { timeout: 8000 }).catch(() => {});
                       await ensureTurnstileFn(page, email, `seatPick:${context}:seatmapUnlockReload${seatmapUnlockAttempts}`, { background: false });
-                      logger.info(`seatPick:${context}:seatmap_unlock_reload_turnstile_ensure_done`, { attempt: seatmapUnlockAttempts });
+                      logger.info(`seatPick:${context}:seatmap_unlock_reload_captcha_ensure_done`, { attempt: seatmapUnlockAttempts });
                     } catch (e) {
                       logger.warn(`seatPick:${context}:seatmap_unlock_reload_turnstile_ensure_failed`, { attempt: seatmapUnlockAttempts, error: e?.message || String(e) });
                     }
@@ -1101,7 +1103,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
               // If the token field/widget isn't mounted yet, give it a short chance to appear.
               if (tokenState0 && !tokenState0.hasToken && (!tokenState0.hasWidget && !tokenState0.hasTokenField)) {
                 await page.waitForFunction(() => {
-                  return !!document.querySelector('.cf-turnstile') || !!document.querySelector('input[name="cf-turnstile-response"]');
+                  return !!document.querySelector('.cf-turnstile') || !!document.querySelector('input[name="cf-turnstile-response"]') || !!document.querySelector('iframe[src*="recaptcha"]') || !!document.querySelector('.g-recaptcha');
                 }, { timeout: 8000 }).catch(() => {});
               }
 
@@ -1126,6 +1128,23 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                 extendDeadline(dt + 6000, 'turnstile_seatmap_recover');
               } catch (e) {
                 logger.warn(`seatPick:${context}:seatmap_recover_turnstile_blocking_failed`, { error: e?.message || String(e) });
+              }
+
+              // After CAPTCHA solve, the page may have unlocked (dropdown appeared).
+              // Re-do category/block selection so seatmap can load.
+              if (chooseCategoryFn && roamCategoryTexts.length > 0) {
+                try {
+                  const hasDropdown = await page.evaluate(() => {
+                    return !!document.querySelector('.custom-select-box, select option, .dropdown-option');
+                  }).catch(() => false);
+                  if (hasDropdown) {
+                    logger.info(`seatPick:${context}:seatmap_recover_reselect_category`, { cats: roamCategoryTexts });
+                    await chooseCategoryFn(page, roamCategoryTexts[0], roamCategoryTexts[1] || '', categorySelectionMode);
+                    extendDeadline(8000, 'category_reselect_after_captcha');
+                  }
+                } catch (e) {
+                  logger.warn(`seatPick:${context}:seatmap_recover_reselect_category_failed`, { error: e?.message || String(e) });
+                }
               }
             }
           }
@@ -1172,12 +1191,27 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
               await delay(600);
               if (ensureTurnstileFn && email) {
                 await page.waitForFunction(() => {
-                  return !!document.querySelector('.cf-turnstile') || !!document.querySelector('input[name="cf-turnstile-response"]');
+                  return !!document.querySelector('.cf-turnstile') || !!document.querySelector('input[name="cf-turnstile-response"]') || !!document.querySelector('iframe[src*="recaptcha"]') || !!document.querySelector('.g-recaptcha');
                 }, { timeout: 8000 }).catch(() => {});
                 try {
                   await ensureTurnstileFn(page, email, `seatPick:${context}:seatmapRecoverNav`, { background: false });
                 } catch (e) {
                   if (e && /detached|Target closed|Sayfa oturumu sonlandı/i.test(String(e.message))) throw e;
+                }
+              }
+              // After nav + CAPTCHA solve, redo category/block selection
+              if (chooseCategoryFn && roamCategoryTexts.length > 0) {
+                try {
+                  const hasDropdown = await page.evaluate(() => {
+                    return !!document.querySelector('.custom-select-box, select option, .dropdown-option');
+                  }).catch(() => false);
+                  if (hasDropdown) {
+                    logger.info(`seatPick:${context}:seatmap_recoverNav_reselect_category`, { cats: roamCategoryTexts });
+                    await chooseCategoryFn(page, roamCategoryTexts[0], roamCategoryTexts[1] || '', categorySelectionMode);
+                    extendDeadline(8000, 'category_reselect_after_nav');
+                  }
+                } catch (e) {
+                  logger.warn(`seatPick:${context}:seatmap_recoverNav_reselect_category_failed`, { error: e?.message || String(e) });
                 }
               }
               await openSeatMapStrict(page);
@@ -1598,7 +1632,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
 
 /** B: aynı koltuğu seç (KİLİTLİ — seçiliyken re-click YOK) */
 async function pickExactSeatWithVerify_Locked(page, target, maxMs = null, options = null) {
-  maxMs = maxMs || cfg.TIMEOUTS.SEAT_PICK_EXACT_MAX;
+  maxMs = maxMs || getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX;
   const end = Date.now() + maxMs;
   await openSeatMapStrict(page);
 
@@ -1753,7 +1787,7 @@ async function waitForTargetSeatReady(page, target, maxMs = null) {
 }
 
 async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) {
-  maxMs = maxMs || cfg.TIMEOUTS.SEAT_PICK_EXACT_MAX;
+  maxMs = maxMs || getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX;
   const end = Date.now() + maxMs;
   await openSeatMapStrict(page);
 

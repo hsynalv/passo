@@ -3,6 +3,16 @@ const router = express.Router();
 const { startBot, startBotAsync, registerCAccount, requestFinalize, getRunStatus, killSessions } = require('../controllers/botController');
 const { botRateLimiter } = require('../middleware/rateLimiter');
 const logger = require('../utils/logger');
+const cfg = require('../config');
+
+router.get('/api/panel-settings', (req, res) => {
+  try {
+    const defaults = cfg.getPanelDefaultsFlat();
+    return res.json({ success: true, defaults, keys: cfg.PANEL_ENV_KEYS });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e?.message || String(e) });
+  }
+});
 
 router.post('/start-bot', botRateLimiter, startBot);
 router.post('/start-bot-async', botRateLimiter, startBotAsync);

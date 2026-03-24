@@ -1,4 +1,5 @@
 const { z } = require('zod');
+const { PANEL_ENV_KEYS } = require('../config');
 
 const accountSchema = z.object({
   email: z.string().email('Geçerli bir email adresi giriniz'),
@@ -17,6 +18,15 @@ const botRequestSchema = z.object({
   categoryType: z.string().optional(),
   alternativeCategory: z.string().optional(),
   transferTargetEmail: z.string().email('Geçerli bir transfer email adresi giriniz').optional(),
+  /** Çoklu A/B eşleşmelerinde C finalize hangi çifti kullansın (1 = A1↔B1, 2 = A2↔B2, …). */
+  cTransferPairIndex: z
+    .union([z.number(), z.string()])
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val === null || val === '') return 1;
+      const n = typeof val === 'number' ? val : parseInt(String(val).trim(), 10);
+      return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
+    }),
   extendWhenRemainingSecondsBelow: z.union([z.number(), z.string()])
     .optional()
     .transform((val) => {
@@ -50,6 +60,22 @@ const botRequestSchema = z.object({
   proxyPort: z.string().nullable().optional(),
   proxyUsername: z.string().nullable().optional(),
   proxyPassword: z.string().nullable().optional(),
+
+  /** Arayüzden gelen env üzerine yazılan değerler (sadece whitelist anahtarlar). */
+  panelSettings: z
+    .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+    .optional()
+    .transform((obj) => {
+      if (!obj || typeof obj !== 'object') return undefined;
+      const allowed = new Set(PANEL_ENV_KEYS);
+      const out = {};
+      for (const [k, v] of Object.entries(obj)) {
+        if (!allowed.has(k)) continue;
+        if (v === undefined || v === null) continue;
+        out[k] = String(v).trim();
+      }
+      return Object.keys(out).length ? out : undefined;
+    }),
 }).superRefine((data, ctx) => {
   const mode = String(data.categorySelectionMode || 'scan');
   if (mode === 'legacy') {

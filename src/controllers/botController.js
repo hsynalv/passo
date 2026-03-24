@@ -6,7 +6,8 @@ const { randomUUID } = require('crypto');
 const fs = require('fs');
 const { botRequestSchema } = require('../validators/botRequest');
 
-const cfg = require('../config');
+const configRoot = require('../config');
+const { withRunCfg, getCfg } = require('../runCfg');
 const delay = require('../utils/delay');
 const { evaluateSafe, waitForFunctionSafe } = require('../utils/browserEval');
 const logger = require('../utils/logger');
@@ -16,7 +17,18 @@ const {confirmSwalYes, clickRemoveFromCartAndConfirm} = require('../helpers/swal
 const { captureSeatIdFromNetwork, readBasketData, readCatBlock, setCatBlockOnB, openSeatMapStrict, clickContinueInsidePage, gotoWithRetry, ensureUrlContains, isHomeUrl, SEAT_NODE_SELECTOR, ensureTcAssignedOnBasket, clickBasketDevamToOdeme, dismissPaymentInfoModalIfPresent, fillInvoiceTcAndContinue, acceptAgreementsAndContinue, fillNkolayPaymentIframe } = require('../helpers/page');
 const { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware } = require('../helpers/seat');
 
-ac.setAPIKey(cfg.ANTICAPTCHA_KEY || '');
+function applyAnticaptchaFromCfg(c) {
+    ac.setAPIKey(c.ANTICAPTCHA_KEY || '');
+    try {
+        if (typeof ac.settings === 'object' && ac.settings) {
+            const first = Number(c.ANTICAPTCHA_FIRST_POLL_SEC);
+            const normal = Number(c.ANTICAPTCHA_POLL_SEC);
+            if (Number.isFinite(first) && first > 0) ac.settings.firstAttemptWaitingInterval = first;
+            if (Number.isFinite(normal) && normal > 0) ac.settings.normalWaitingInterval = normal;
+        }
+    } catch {}
+}
+applyAnticaptchaFromCfg(configRoot);
 
 async function selectSvgBlockById(page, blockId) {
     const safeId = String(blockId || '').trim();
@@ -299,6 +311,7 @@ async function startBotAsync(req, res) {
         finalizeRequested: false,
         finalizeRequestedAt: null,
         cAccount: null,
+        cTransferPairIndex: validatedData.cTransferPairIndex ?? 1,
         result: null,
         error: null
     });
@@ -337,7 +350,13 @@ async function registerCAccount(req, res) {
     if (!email || !password) return res.status(400).json({ error: 'email/password required' });
     const cur = runStore.get(runId);
     if (!cur) return res.status(404).json({ error: 'runId not found' });
-    runStore.upsert(runId, { cAccount: { email, password } });
+    const rawPair = req?.body?.cTransferPairIndex ?? req?.body?.pairIndex;
+    const patch = { cAccount: { email, password } };
+    if (rawPair !== undefined && rawPair !== null && String(rawPair).trim() !== '') {
+        const n = parseInt(String(rawPair).trim(), 10);
+        if (Number.isFinite(n) && n >= 1) patch.cTransferPairIndex = n;
+    }
+    runStore.upsert(runId, patch);
     return res.json({ success: true, runId });
 }
 
@@ -442,7 +461,12 @@ const createSemaphore = (max) => {
     return { acquire, release, stats };
 };
 
-const turnstileSolveSem = createSemaphore(cfg?.TIMEOUTS?.TURNSTILE_SOLVE_CONCURRENCY || 2);
+const turnstileSemCache = new Map();
+function getTurnstileSolveSem() {
+    const lim = Math.max(1, Number(getCfg()?.TIMEOUTS?.TURNSTILE_SOLVE_CONCURRENCY) || 2);
+    if (!turnstileSemCache.has(lim)) turnstileSemCache.set(lim, createSemaphore(lim));
+    return turnstileSemCache.get(lim);
+}
 
 async function evalOnPage(page, scriptBody, args) {
     const payload = JSON.stringify(Array.isArray(args) ? args : []).replace(/</g, '\\u003c');
@@ -450,11 +474,107 @@ async function evalOnPage(page, scriptBody, args) {
     return evaluateSafe(page, script);
 }
 
+async function evalOnTarget(target, scriptBody, args) {
+    const payload = JSON.stringify(Array.isArray(args) ? args : []).replace(/</g, '\\u003c');
+    const script = `(function(){var __args=${payload};${scriptBody}})()`;
+    return evaluateSafe(target, script);
+}
+
 async function ensureTurnstileTokenOnPage(page, email, label, options) {
     if (!page) return { attempted: false };
 
     const opts = (options && typeof options === 'object') ? options : {};
     const background = !!opts.background;
+    const targetFrame = opts.targetFrame || null;
+
+    const evalTarget = targetFrame || page;
+
+    // Install a one-time network watcher to capture Turnstile sitekey from CF challenge URLs.
+    // This works even when the widget iframe is inside a closed shadow root and cannot be queried from DOM.
+    try {
+        if (!page.__turnstileSiteKeyWatcherInstalled) {
+            page.__turnstileSiteKeyWatcherInstalled = true;
+            const extractKey = (u) => {
+                try {
+                    const s = String(u || '');
+                    if (s.indexOf('challenges.cloudflare.com') < 0) return null;
+                    // Key can appear in path or query params depending on integration.
+                    // Examples:
+                    // - .../turnstile/v0/api.js?render=0x...
+                    // - .../turnstile/0x.../...
+                    // - ...?k=0x... or ?sitekey=0x...
+                    const mPath = s.match(/turnstile\/[^\s"'<>]*?\/(0x[0-9A-Za-z]+)(?:\/|\b)/i);
+                    if (mPath && mPath[1]) return mPath[1];
+                    const mAny = s.match(/\b(0x[0-9A-Za-z]{10,})\b/);
+                    if (mAny && mAny[1] && s.indexOf('/turnstile/') >= 0) return mAny[1];
+                    const mQuery = s.match(/[?&](?:k|sitekey|render)=((?:0x)?[0-9A-Za-z_-]+)/i);
+                    if (mQuery && mQuery[1]) {
+                        const v = String(mQuery[1]);
+                        return v.startsWith('0x') ? v : ('0x' + v);
+                    }
+                    return null;
+                } catch { return null; }
+            };
+            const onReq = (req) => {
+                try {
+                    const key = extractKey(req?.url?.());
+                    if (key) page.__turnstileLastSiteKey = key;
+                } catch {}
+            };
+            const onResp = (resp) => {
+                try {
+                    const key = extractKey(resp?.url?.());
+                    if (key) page.__turnstileLastSiteKey = key;
+                } catch {}
+            };
+            try { page.on('request', onReq); } catch {}
+            try { page.on('response', onResp); } catch {}
+
+            try {
+                const t = page.target?.();
+                const create = t && typeof t.createCDPSession === 'function' ? t.createCDPSession.bind(t) : null;
+                if (create) {
+                    const client = await create();
+                    page.__turnstileCdpClient = client;
+                    try { await client.send('Network.enable'); } catch {}
+                    try {
+                        client.on('Network.requestWillBeSent', (ev) => {
+                            try {
+                                const key = extractKey(ev?.request?.url);
+                                if (key) page.__turnstileLastSiteKey = key;
+                            } catch {}
+                        });
+                    } catch {}
+                    try {
+                        client.on('Network.responseReceived', (ev) => {
+                            try {
+                                const key = extractKey(ev?.response?.url);
+                                if (key) page.__turnstileLastSiteKey = key;
+                            } catch {}
+                        });
+                    } catch {}
+                }
+            } catch {}
+            logger.debug('turnstile:sitekey_watcher_installed', { email });
+        }
+    } catch {}
+
+    const extractKeyFromUrl = (u) => {
+        try {
+            const s = String(u || '');
+            if (s.indexOf('challenges.cloudflare.com') < 0) return null;
+            const mPath = s.match(/turnstile\/[^\s"'<>]*?\/(0x[0-9A-Za-z]+)(?:\/|\b)/i);
+            if (mPath && mPath[1]) return mPath[1];
+            const mAny = s.match(/\b(0x[0-9A-Za-z]{10,})\b/);
+            if (mAny && mAny[1] && s.indexOf('/turnstile/') >= 0) return mAny[1];
+            const mQuery = s.match(/[?&](?:k|sitekey|render)=((?:0x)?[0-9A-Za-z_-]+)/i);
+            if (mQuery && mQuery[1]) {
+                const v = String(mQuery[1]);
+                return v.startsWith('0x') ? v : ('0x' + v);
+            }
+            return null;
+        } catch { return null; }
+    };
 
     // Cache in-flight solves per Page to avoid starting multiple expensive captcha requests.
     const getCache = () => {
@@ -467,19 +587,77 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
     };
     const cache = getCache();
 
-    const maxAttempts = Math.max(1, Number(cfg?.TIMEOUTS?.TURNSTILE_MAX_ATTEMPTS) || 2);
+    const maxAttempts = Math.max(1, Number(getCfg()?.TIMEOUTS?.TURNSTILE_MAX_ATTEMPTS) || 2);
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-            const state = await evalOnPage(page, `
-                var body = document.body;
-                var bodyText = body && body.innerText ? String(body.innerText).toLowerCase() : '';
-                var hasVerifyHuman = bodyText.indexOf('verify you are human') >= 0;
-                var hasWidget = !!document.querySelector('.cf-turnstile');
-                var input = document.querySelector('input[name="cf-turnstile-response"]');
-                var hasTokenField = !!input;
-                var tokenLen = (input && input.value) ? String(input.value).length : 0;
-                return { hasVerifyHuman: hasVerifyHuman, hasWidget: hasWidget, hasTokenField: hasTokenField, tokenLen: tokenLen };
-            `);
+            const state = await evaluateSafe(evalTarget, () => {
+                const body = document.body;
+                const bodyText = body && body.innerText ? String(body.innerText).toLowerCase() : '';
+                const hasVerifyHuman = bodyText.indexOf('verify you are human') >= 0;
+                const hasWidget = !!document.querySelector('.cf-turnstile');
+                const widget = document.querySelector('.cf-turnstile');
+                const siteKeyFromWidget = widget ? (widget.getAttribute('data-sitekey') || null) : null;
+                // Some integrations do not expose the key on the main widget node. Try any element with data-sitekey.
+                const allKeyNodes = Array.from(document.querySelectorAll('[data-sitekey]'));
+                const allSiteKeys = allKeyNodes
+                    .map(n => (n.getAttribute('data-sitekey') || '').trim())
+                    .filter(Boolean)
+                    .slice(0, 6);
+                // Passo's Turnstile often uses a closed shadowroot; the sitekey is embedded in the iframe src.
+                let siteKeyFromIframe = null;
+                try {
+                    const ifr = document.querySelector('#turnstile-container iframe, .cf-turnstile iframe');
+                    const src = ifr ? (ifr.getAttribute('src') || '') : '';
+                    const m = src.match(/\/(0x[0-9A-Za-z]+)\//);
+                    if (m && m[1]) siteKeyFromIframe = m[1];
+                } catch {}
+
+                // If iframe is in a closed shadow root, we cannot query it directly.
+                // In that case, parse sitekey from loaded resource URLs (Turnstile iframe src appears there).
+                let siteKeyFromPerf = null;
+                try {
+                    const ents = (performance && typeof performance.getEntriesByType === 'function')
+                        ? performance.getEntriesByType('resource')
+                        : [];
+                    for (let i = Math.max(0, ents.length - 120); i < ents.length; i++) {
+                        const name = ents[i] && ents[i].name ? String(ents[i].name) : '';
+                        if (!name) continue;
+                        if (name.indexOf('challenges.cloudflare.com') < 0) continue;
+                        if (name.indexOf('/turnstile/') < 0) continue;
+                        const m2 = name.match(/turnstile\/[^\s"'<>]*?\/(0x[0-9A-Za-z]+)(?:\/|\b)/i);
+                        if (m2 && m2[1]) { siteKeyFromPerf = m2[1]; break; }
+                        const mq = name.match(/[?&](?:k|sitekey|render)=((?:0x)?[0-9A-Za-z_-]+)/i);
+                        if (mq && mq[1]) { siteKeyFromPerf = String(mq[1]).startsWith('0x') ? mq[1] : ('0x' + mq[1]); break; }
+                    }
+                } catch {}
+
+                // Last resort in page context: scan HTML source for embedded Turnstile URLs.
+                // Some browsers expose closed shadowroot contents in the DOM snapshot HTML.
+                let siteKeyFromHtml = null;
+                try {
+                    const html = document.documentElement && document.documentElement.outerHTML
+                        ? String(document.documentElement.outerHTML)
+                        : '';
+                    if (html && html.indexOf('challenges.cloudflare.com') >= 0 && html.indexOf('/turnstile/') >= 0) {
+                        const re1 = /challenges\.cloudflare\.com[^"'<>]*\/turnstile\/[^"'<>]*\/(0x[0-9A-Za-z]+)(?:\/|\b)/i;
+                        const m3 = html.match(re1);
+                        if (m3 && m3[1]) siteKeyFromHtml = m3[1];
+                        if (!siteKeyFromHtml) {
+                            const re2 = /challenges\.cloudflare\.com[^"'<>]*\/turnstile\/[^"'<>]*[?&](?:k|sitekey|render)=((?:0x)?[0-9A-Za-z_-]+)/i;
+                            const m4 = html.match(re2);
+                            if (m4 && m4[1]) siteKeyFromHtml = String(m4[1]).startsWith('0x') ? m4[1] : ('0x' + m4[1]);
+                        }
+                    }
+                } catch {}
+
+                const siteKey = siteKeyFromWidget || siteKeyFromIframe || siteKeyFromPerf || siteKeyFromHtml || (allSiteKeys.length ? allSiteKeys[0] : null);
+                const input = document.querySelector('input[name="cf-turnstile-response"]');
+                const hasTokenField = !!input;
+                const tokenLen = (input && input.value) ? String(input.value).length : 0;
+                let href = null;
+                try { href = location && location.href ? String(location.href) : null; } catch {}
+                return { hasVerifyHuman, hasWidget, hasTokenField, tokenLen, siteKey, href, allSiteKeys, siteKeyFromIframe, siteKeyFromPerf, siteKeyFromHtml };
+            }).catch(() => ({ hasVerifyHuman: false, hasWidget: false, hasTokenField: false, tokenLen: 0 }));
 
             const shouldSolve = (state.hasVerifyHuman || state.hasWidget || state.hasTokenField) && state.tokenLen <= 0;
             if (shouldSolve) {
@@ -489,12 +667,86 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
             }
             if (!shouldSolve) return { attempted: false, state };
 
-            if (!cfg.PASSO_SITE_KEY || !cfg.ANTICAPTCHA_KEY) {
+            let cachedKey = (() => { try { return page.__turnstileLastSiteKey || null; } catch { return null; } })();
+            // Seat selection pages often keep the Turnstile iframe in a closed shadow root; the key may
+            // not be available immediately. Poll briefly to capture it from network watchers/perf/frames.
+            if (!cachedKey && !state?.siteKey) {
+                const effectiveUrl0 = state?.href || (() => { try { return page.url(); } catch { return null; } })() || '';
+                const isSeatSel = /\/koltuk-secim(\b|\/|\?|#)/i.test(String(effectiveUrl0 || ''));
+                if (isSeatSel) {
+                    const until = Date.now() + 3500;
+                    while (Date.now() < until) {
+                        try { cachedKey = page.__turnstileLastSiteKey || null; } catch {}
+                        if (cachedKey) break;
+                        try {
+                            const k2 = await evaluateSafe(evalTarget, () => {
+                                try {
+                                    const ents = (performance && typeof performance.getEntriesByType === 'function')
+                                        ? performance.getEntriesByType('resource')
+                                        : [];
+                                    for (let i = Math.max(0, ents.length - 160); i < ents.length; i++) {
+                                        const name = ents[i] && ents[i].name ? String(ents[i].name) : '';
+                                        if (!name) continue;
+                                        if (name.indexOf('challenges.cloudflare.com') < 0) continue;
+                                        if (name.indexOf('/turnstile/') < 0) continue;
+                                        const m = name.match(/\/(0x[0-9A-Za-z]+)\//);
+                                        if (m && m[1]) return m[1];
+                                    }
+                                } catch {}
+                                return null;
+                            }).catch(() => null);
+                            if (k2) { cachedKey = k2; try { page.__turnstileLastSiteKey = k2; } catch {} break; }
+                        } catch {}
+                        try { await delay(250); } catch {}
+                    }
+                    if (!cachedKey) {
+                        try {
+                            const hint = await evaluateSafe(evalTarget, () => {
+                                try {
+                                    const ents = (performance && typeof performance.getEntriesByType === 'function')
+                                        ? performance.getEntriesByType('resource')
+                                        : [];
+                                    const last = [];
+                                    for (let i = Math.max(0, ents.length - 30); i < ents.length; i++) {
+                                        const n = ents[i] && ents[i].name ? String(ents[i].name) : '';
+                                        if (n && n.indexOf('challenges.cloudflare.com') >= 0) last.push(n.slice(0, 200));
+                                    }
+                                    return { count: ents.length, last };
+                                } catch { return null; }
+                            }).catch(() => null);
+                            if (hint?.last?.length) logger.debug('turnstile:sitekey_missing_hint', { email, label, hint });
+                        } catch {}
+                    }
+                }
+            }
+            if (!cachedKey && !state?.siteKey) {
+                // Last-resort: scan frame URLs for the Turnstile key (works when iframe is in closed shadow root).
+                try {
+                    const frames = typeof page.frames === 'function' ? page.frames() : [];
+                    for (const fr of frames) {
+                        const u = (() => { try { return fr?.url?.() || ''; } catch { return ''; } })();
+                        const k = extractKeyFromUrl(u);
+                        if (k) {
+                            cachedKey = k;
+                            try { page.__turnstileLastSiteKey = k; } catch {}
+                            break;
+                        }
+                    }
+                } catch {}
+            }
+            const effectiveUrl = state?.href || (() => { try { return page.url(); } catch { return null; } })() || getCfg().PASSO_LOGIN;
+            const isSeatSel2 = /\/koltuk-secim(\b|\/|\?|#)/i.test(String(effectiveUrl || ''));
+
+            // IMPORTANT: Do not solve with the fallback env key on seat-selection pages.
+            // If we couldn't detect the real sitekey, a token from a wrong key will not unlock the page.
+            const effectiveSiteKey = state?.siteKey || cachedKey || (isSeatSel2 ? null : (getCfg().PASSO_SITE_KEY || null));
+
+            if (!effectiveSiteKey || !getCfg().ANTICAPTCHA_KEY) {
                 logger.warn('turnstile:cannot_solve_missing_keys', {
                     email,
                     label,
-                    hasSiteKey: !!cfg.PASSO_SITE_KEY,
-                    hasAntiCaptchaKey: !!cfg.ANTICAPTCHA_KEY
+                    hasSiteKey: !!effectiveSiteKey,
+                    hasAntiCaptchaKey: !!getCfg().ANTICAPTCHA_KEY
                 });
                 return { attempted: false, state, missingKeys: true };
             }
@@ -507,58 +759,71 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
             }
 
             const solveWork = (async () => {
-                logger.warn('turnstile:solve_attempt', { email, label, attempt });
+                logger.warn('turnstile:solve_attempt', { email, label, attempt, hasCachedKey: !!cachedKey });
                 const solveStart = Date.now();
 
                 const semStart = Date.now();
-                await turnstileSolveSem.acquire();
+                await getTurnstileSolveSem().acquire();
                 const waitedMs = Date.now() - semStart;
                 if (waitedMs > 250) {
-                    logger.info('turnstile:semaphore_wait', { email, label, waitedMs, sem: turnstileSolveSem.stats() });
+                    logger.info('turnstile:semaphore_wait', { email, label, waitedMs, sem: getTurnstileSolveSem().stats() });
                 }
 
                 let tok;
                 try {
-                    const solveTimeoutMs = Math.max(15000, Number(cfg?.TIMEOUTS?.TURNSTILE_SOLVE_TIMEOUT) || 120000);
+                    const solveTimeoutMs = Math.max(15000, Number(getCfg()?.TIMEOUTS?.TURNSTILE_SOLVE_TIMEOUT) || 120000);
                     tok = await Promise.race([
-                        ac.solveTurnstileProxyless(cfg.PASSO_LOGIN, cfg.PASSO_SITE_KEY),
+                        ac.solveTurnstileProxyless(String(effectiveUrl), String(effectiveSiteKey)),
                         delay(solveTimeoutMs).then(() => {
                             throw new Error(`TURNSTILE_SOLVE_TIMEOUT_${solveTimeoutMs}`);
                         })
                     ]);
                 } finally {
-                    turnstileSolveSem.release();
+                    getTurnstileSolveSem().release();
                 }
                 logger.info('turnstile:solve_result', {
                     email,
                     label,
                     attempt,
                     solveMs: Date.now() - solveStart,
-                    tokenLength: tok ? String(tok).length : 0
+                    tokenLength: tok ? String(tok).length : 0,
+                    siteKey: String(effectiveSiteKey || '').slice(0, 80),
+                    url: String(effectiveUrl || '').slice(0, 200)
                 });
 
-                await evalOnPage(page, `
+                await evalOnTarget(evalTarget, `
                     var token = (__args && __args.length) ? __args[0] : '';
-                    var f = document.querySelector('form') || document.body;
-                    if (!f) return;
-                    var i = document.querySelector('input[name="cf-turnstile-response"]');
+                    var container = document.querySelector('#turnstile-container') || document.querySelector('.cf-turnstile') || document.querySelector('quick-form[name="loginform"]') || document.querySelector('quick-form');
+                    var i = document.querySelector('#turnstile-container input[name="cf-turnstile-response"]') || document.querySelector('.cf-turnstile input[name="cf-turnstile-response"]') || document.querySelector('input[name="cf-turnstile-response"]');
                     if (!i) {
+                        var parent = container || document.querySelector('form') || document.body;
                         i = document.createElement('input');
                         i.type = 'hidden';
                         i.name = 'cf-turnstile-response';
-                        f.appendChild(i);
+                        parent.appendChild(i);
                     }
                     i.value = token;
                     i.dispatchEvent(new Event('input', { bubbles: true }));
                     i.dispatchEvent(new Event('change', { bubbles: true }));
+                    i.dispatchEvent(new Event('blur', { bubbles: true }));
+                    if (typeof window.__passobotTurnstileCallback === 'function') {
+                        try { window.__passobotTurnstileCallback(token); } catch (e) {}
+                    }
+                    var turnstileEl = document.querySelector('#turnstile-container') || document.querySelector('.cf-turnstile');
+                    var cb = turnstileEl ? turnstileEl.getAttribute('data-callback') : null;
+                    if (cb && typeof window[cb] === 'function') { try { window[cb](token); } catch (e) {} }
+                    var tryNames = ['onTurnstileSuccess', 'onTurnstileCallback', 'handleTurnstileSuccess', 'turnstileCallback', 'cfCallback'];
+                    for (var n = 0; n < tryNames.length; n++) {
+                        if (typeof window[tryNames[n]] === 'function') { try { window[tryNames[n]](token); break; } catch (e) {} }
+                    }
                 `, [tok]);
 
-                const after = await evalOnPage(page, `
-                    var input = document.querySelector('input[name="cf-turnstile-response"]');
-                    var tokenLen = (input && input.value) ? String(input.value).length : 0;
-                    return { hasTokenField: !!input, tokenLen: tokenLen };
-                `);
-                logger.info('turnstile:inject_check', { email, label, attempt, after });
+                const after = await evaluateSafe(evalTarget, () => {
+                    const input = document.querySelector('input[name="cf-turnstile-response"]');
+                    const tokenLen = (input && input.value) ? String(input.value).length : 0;
+                    return { hasTokenField: !!input, tokenLen };
+                }).catch(() => ({ hasTokenField: false, tokenLen: 0 }));
+                logger.info('turnstile:inject_check', { email, label, attempt, after, targetFrame: !!targetFrame });
                 return { attempted: true, state, after };
             })();
 
@@ -602,29 +867,618 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
     return { attempted: false, error: 'unknown', attempt: maxAttempts };
 }
 
+/**
+ * reCAPTCHA v2 detection & solve.
+ * Some Passo pages (e.g. /koltuk-secim) use Google reCAPTCHA v2 instead of Turnstile.
+ * This function detects the reCAPTCHA iframe, extracts the sitekey, solves it via AntiCaptcha,
+ * and injects the token into the page.
+ */
+async function ensureRecaptchaV2OnPage(page, email, label, options) {
+    if (!page) return { attempted: false, type: 'recaptcha' };
+    const opts = (options && typeof options === 'object') ? options : {};
+    const background = !!opts.background;
+    const waitForIframe = opts.waitForIframe !== false; // default true
+
+    try {
+        const extractRecaptchaKey = async () => {
+            let key = null;
+            try {
+                const frames = typeof page.frames === 'function' ? page.frames() : [];
+                for (const fr of frames) {
+                    const u = (() => { try { return fr?.url?.() || ''; } catch { return ''; } })();
+                    if (!u) continue;
+                    if (u.indexOf('google.com/recaptcha') < 0 && u.indexOf('recaptcha/api2') < 0 && u.indexOf('recaptcha/enterprise') < 0) continue;
+                    const m = u.match(/[?&]k=([0-9A-Za-z_-]+)/);
+                    if (m && m[1]) { key = m[1]; break; }
+                }
+            } catch {}
+            if (!key) {
+                try {
+                    key = await evaluateSafe(page, () => {
+                        const el = document.querySelector('.g-recaptcha[data-sitekey], [data-sitekey]');
+                        if (el) return el.getAttribute('data-sitekey') || null;
+                        try {
+                            const iframes = document.querySelectorAll('iframe[src*="recaptcha"]');
+                            for (const ifr of iframes) {
+                                const src = ifr.getAttribute('src') || '';
+                                const m = src.match(/[?&]k=([0-9A-Za-z_-]+)/);
+                                if (m && m[1]) return m[1];
+                            }
+                        } catch {}
+                        return null;
+                    }).catch(() => null);
+                } catch {}
+            }
+            return key;
+        };
+
+        // Poll for reCAPTCHA iframe to appear (it loads late on some pages)
+        let recaptchaSiteKey = await extractRecaptchaKey();
+        if (!recaptchaSiteKey && waitForIframe) {
+            const pollEnd = Date.now() + 10000;
+            while (!recaptchaSiteKey && Date.now() < pollEnd) {
+                await delay(800);
+                recaptchaSiteKey = await extractRecaptchaKey();
+            }
+            if (recaptchaSiteKey) {
+                logger.info('recaptcha:key_found_after_poll', { email, label, siteKey: recaptchaSiteKey });
+            }
+        }
+
+        if (!recaptchaSiteKey) {
+            return { attempted: false, type: 'recaptcha', reason: 'no_sitekey' };
+        }
+
+        logger.info('recaptcha:detected', { email, label, siteKey: recaptchaSiteKey, background });
+
+        if (background) {
+            // Start solve in background, don't block
+            const work = (async () => {
+                try {
+                    const pageUrl = (() => { try { return page.url(); } catch { return ''; } })();
+                    const solveStart = Date.now();
+                    await getTurnstileSolveSem().acquire();
+                    let tok;
+                    try {
+                        const solveTimeoutMs = Math.max(15000, Number(getCfg()?.TIMEOUTS?.TURNSTILE_SOLVE_TIMEOUT) || 120000);
+                        tok = await Promise.race([
+                            ac.solveRecaptchaV2Proxyless(String(pageUrl), String(recaptchaSiteKey)),
+                            delay(solveTimeoutMs).then(() => { throw new Error(`RECAPTCHA_SOLVE_TIMEOUT_${solveTimeoutMs}`); })
+                        ]);
+                    } finally {
+                        getTurnstileSolveSem().release();
+                    }
+                    logger.info('recaptcha:solve_result', { email, label, solveMs: Date.now() - solveStart, tokenLength: tok ? String(tok).length : 0 });
+                    await injectRecaptchaToken(page, tok);
+                    return { attempted: true, type: 'recaptcha', tokenLength: tok ? String(tok).length : 0 };
+                } catch (e) {
+                    logger.warn('recaptcha:solve_failed', { email, label, error: e?.message || String(e) });
+                    return { attempted: false, type: 'recaptcha', error: e?.message || String(e) };
+                }
+            })();
+            work.catch(() => {});
+            return { attempted: false, type: 'recaptcha', started: true, background: true };
+        }
+
+        // Blocking solve — try invisible v2 FIRST (Passo always uses invisible reCAPTCHA on koltuk-secim),
+        // then fall back to standard v2 if invisible fails. Saves ~10s per solve.
+        const pageUrl = (() => { try { return page.url(); } catch { return ''; } })();
+        const solveStart = Date.now();
+        const solveTimeoutMs = Math.max(15000, Number(getCfg()?.TIMEOUTS?.TURNSTILE_SOLVE_TIMEOUT) || 120000);
+
+        let tok = null;
+        let solveType = 'v2';
+        for (const invisible of [true, false]) {
+            try {
+                await getTurnstileSolveSem().acquire();
+                try {
+                    tok = await Promise.race([
+                        ac.solveRecaptchaV2Proxyless(String(pageUrl), String(recaptchaSiteKey), invisible),
+                        delay(solveTimeoutMs).then(() => { throw new Error(`RECAPTCHA_SOLVE_TIMEOUT_${solveTimeoutMs}`); })
+                    ]);
+                    solveType = invisible ? 'v2-invisible' : 'v2';
+                } finally {
+                    getTurnstileSolveSem().release();
+                }
+                break;
+            } catch (e) {
+                const msg = e?.message || String(e);
+                if (invisible && /INVALID_KEY_TYPE/i.test(msg)) {
+                    logger.info('recaptcha:retry_standard', { email, label, error: msg });
+                    continue;
+                }
+                throw e;
+            }
+        }
+
+        logger.info('recaptcha:solve_result', { email, label, solveMs: Date.now() - solveStart, tokenLength: tok ? String(tok).length : 0, siteKey: recaptchaSiteKey, solveType });
+
+        await injectRecaptchaToken(page, tok);
+        return { attempted: true, type: 'recaptcha', tokenLength: tok ? String(tok).length : 0, solveType };
+    } catch (e) {
+        logger.warn('recaptcha:ensure_failed', { email, label, error: e?.message || String(e) });
+        return { attempted: false, type: 'recaptcha', error: e?.message || String(e) };
+    }
+}
+
+async function injectRecaptchaToken(page, token) {
+    if (!page || !token) return;
+    try {
+        const cbResult = await evaluateSafe(page, (tok) => {
+            var result = { textarea: false, interceptedCallback: false, dataCallback: false, cfgCallback: false, executeTriggered: false };
+
+            // 1. Set textarea value (all matching textareas)
+            var tas = document.querySelectorAll('textarea[name="g-recaptcha-response"]');
+            if (!tas.length) {
+                var form = document.querySelector('form') || document.body;
+                var ta = document.createElement('textarea');
+                ta.id = 'g-recaptcha-response';
+                ta.name = 'g-recaptcha-response';
+                ta.style.display = 'none';
+                form.appendChild(ta);
+                tas = [ta];
+            }
+            for (var i = 0; i < tas.length; i++) {
+                tas[i].value = tok;
+                tas[i].innerHTML = tok;
+            }
+            result.textarea = true;
+
+            // 2. Store token for intercepted grecaptcha.execute() override
+            window.__passobotRecaptchaToken = tok;
+
+            // 3. PRIORITY: use intercepted callback from installRecaptchaCallbackInterceptor
+            if (typeof window.__passobotRecaptchaCallback === 'function') {
+                try {
+                    window.__passobotRecaptchaCallback(tok);
+                    result.interceptedCallback = true;
+                } catch (e1) { result.interceptedCallbackErr = String(e1); }
+            }
+
+            // 4. data-callback attribute
+            if (!result.interceptedCallback) {
+                try {
+                    var els = document.querySelectorAll('.g-recaptcha[data-callback], [data-callback]');
+                    for (var j = 0; j < els.length; j++) {
+                        var cbName = els[j].getAttribute('data-callback');
+                        if (cbName && typeof window[cbName] === 'function') {
+                            window[cbName](tok);
+                            result.dataCallback = true;
+                        }
+                    }
+                } catch (e2) {}
+            }
+
+            // 5. ___grecaptcha_getCfg().clients — find callback named 'callback' in widget config
+            if (!result.interceptedCallback && !result.dataCallback) {
+                try {
+                    if (window.___grecaptcha_cfg && window.___grecaptcha_getCfg().clients) {
+                        var clients = window.___grecaptcha_getCfg().clients;
+                        var called = false;
+                        for (var ck in clients) {
+                            if (!clients.hasOwnProperty(ck)) continue;
+                            var client = clients[ck];
+                            var findCallback = function(obj, depth) {
+                                if (depth > 6 || !obj || typeof obj !== 'object') return null;
+                                if (typeof obj.callback === 'function') return obj.callback;
+                                for (var fp in obj) {
+                                    if (!obj.hasOwnProperty(fp)) continue;
+                                    if (typeof obj[fp] === 'object') {
+                                        var r = findCallback(obj[fp], depth + 1);
+                                        if (r) return r;
+                                    }
+                                }
+                                return null;
+                            };
+                            var cb = findCallback(client, 0);
+                            if (cb) { try { cb(tok); called = true; } catch (e3) {} break; }
+                        }
+                        result.cfgCallback = called;
+                    }
+                } catch (e4) {}
+            }
+
+            // 6. Override grecaptcha.getResponse to return our token
+            try {
+                if (window.grecaptcha && typeof window.grecaptcha.getResponse === 'function') {
+                    window.grecaptcha.getResponse = function() { return tok; };
+                }
+            } catch (e5) {}
+
+            // 7. Try grecaptcha.execute() to trigger the site's invisible reCAPTCHA flow
+            if (!result.interceptedCallback && !result.dataCallback) {
+                try {
+                    if (window.grecaptcha && typeof window.grecaptcha.execute === 'function') {
+                        window.grecaptcha.execute();
+                        result.executeTriggered = true;
+                    }
+                } catch (e6) { result.executeErr = String(e6); }
+            }
+
+            return result;
+        }, token);
+
+        logger.info('recaptcha:inject_callbacks', { cbResult });
+
+        // After injection, wait briefly then check if page reacted
+        await delay(1500);
+
+        const check = await evaluateSafe(page, () => {
+            var ta = document.querySelector('textarea[name="g-recaptcha-response"]');
+            var hasDropdown = !!document.querySelector('.custom-select-box, select option, .dropdown-option');
+            var hasSeatmap = document.querySelectorAll('svg.seatmap-svg, .seatmap-container, [class*="seatmap"]').length > 0;
+            var hasSeatBtn = false;
+            try {
+                var norm = function(s) { return (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase(); };
+                var btns = document.querySelectorAll('button, a, [role="button"]');
+                for (var b = 0; b < btns.length; b++) {
+                    if (norm(btns[b].innerText || btns[b].textContent || '').includes('kendim seçmek istiyorum')) { hasSeatBtn = true; break; }
+                }
+            } catch (e) {}
+            return {
+                hasField: !!ta,
+                tokenLen: ta ? String(ta.value || '').length : 0,
+                hasDropdown: hasDropdown,
+                hasSeatmap: hasSeatmap,
+                hasSeatBtn: hasSeatBtn,
+                hasInterceptedCb: typeof window.__passobotRecaptchaCallback === 'function',
+                hasParams: !!window.__passobotRecaptchaParams
+            };
+        }).catch(() => ({ hasField: false, tokenLen: 0 }));
+        logger.info('recaptcha:inject_check', { check });
+    } catch (e) {
+        logger.warn('recaptcha:inject_failed', { error: e?.message || String(e) });
+    }
+}
+
+/**
+ * Wrapper: tries Turnstile first, then falls back to reCAPTCHA v2 if Turnstile can't solve.
+ */
+async function ensureCaptchaOnPage(page, email, label, options) {
+    const turnstileResult = await ensureTurnstileTokenOnPage(page, email, label, options);
+    // If Turnstile solved successfully or is in-flight, return
+    if (turnstileResult?.attempted || turnstileResult?.started || turnstileResult?.inFlight) {
+        logger.info('captcha:wrapper_turnstile_ok', { email, label, attempted: turnstileResult?.attempted, started: turnstileResult?.started });
+        return turnstileResult;
+    }
+    // If Turnstile found a widget with token already set, no need to solve
+    if (turnstileResult?.state?.tokenLen > 0) {
+        return turnstileResult;
+    }
+    // If Turnstile couldn't solve (missing keys / no widget), try reCAPTCHA v2
+    // On /koltuk-secim pages, the reCAPTCHA iframe loads late — enable polling wait
+    const isKoltukSecim = (() => { try { return /\/koltuk-secim/i.test(page.url()); } catch { return false; } })();
+    logger.info('captcha:wrapper_try_recaptcha', { email, label, isKoltukSecim, turnstileMissingKeys: !!turnstileResult?.missingKeys });
+    const recaptchaOpts = { ...(options || {}), waitForIframe: isKoltukSecim };
+    const recaptchaResult = await ensureRecaptchaV2OnPage(page, email, label, recaptchaOpts);
+    logger.info('captcha:wrapper_recaptcha_result', { email, label, attempted: recaptchaResult?.attempted, started: recaptchaResult?.started, reason: recaptchaResult?.reason, solveType: recaptchaResult?.solveType });
+    if (recaptchaResult?.attempted || recaptchaResult?.started) {
+        return recaptchaResult;
+    }
+    return turnstileResult;
+}
+
+const FINALIZE_C_MIN_CHALLENGE_TOKEN_LEN = 80;
+
+async function readFinalizeCChallengeTokens(page) {
+    if (!page) return { tsLen: 0, hasTsWidget: false, tsFieldPresent: false, recLen: 0, hasRec: false };
+    return await evaluateSafe(page, () => {
+        const tsIn = document.querySelector('input[name="cf-turnstile-response"]');
+        const tsLen = tsIn && tsIn.value ? String(tsIn.value).length : 0;
+        const tsFieldPresent = !!tsIn;
+        const hasTsWidget = !!document.querySelector('.cf-turnstile, #turnstile-container');
+        const recTa = document.querySelector('textarea[name="g-recaptcha-response"]');
+        const recLen = recTa && recTa.value ? String(recTa.value).length : 0;
+        const hasRec =
+            !!document.querySelector('iframe[src*="recaptcha" i]') ||
+            !!document.querySelector('iframe[src*="google.com/recaptcha" i]') ||
+            !!document.querySelector('.g-recaptcha');
+        return { tsLen, hasTsWidget, tsFieldPresent, recLen, hasRec };
+    }).catch(() => ({ tsLen: 0, hasTsWidget: false, tsFieldPresent: false, recLen: 0, hasRec: false }));
+}
+
+/** Passo /koltuk-secim: Turnstile + reCAPTCHA birlikte; sadece biri dolu olsa holder kaldırma yapılmamalı. */
+function isFinalizeCHumanChallengeSatisfied(s) {
+    const minL = FINALIZE_C_MIN_CHALLENGE_TOKEN_LEN;
+    const needTsToken = !!(s.hasTsWidget || s.tsFieldPresent);
+    if (needTsToken && s.tsLen < minL) return false;
+    if (s.hasRec && s.recLen < minL) return false;
+    if (!needTsToken && !s.hasRec && s.tsLen < minL && s.recLen < minL) return false;
+    return true;
+}
+
+/** Finalize: holder A/B sepetten çıkarmadan önce C /koltuk-secim sayfasında gerçek token olmalı. */
+async function waitUntilFinalizeCHumanChallengeReady(page, email) {
+    const solveCap = Math.max(60000, Number(getCfg()?.TIMEOUTS?.TURNSTILE_SOLVE_TIMEOUT) || 120000);
+    const until = Date.now() + solveCap + 45000;
+    let iteration = 0;
+    while (Date.now() < until) {
+        iteration += 1;
+        const s = await readFinalizeCChallengeTokens(page);
+        if (isFinalizeCHumanChallengeSatisfied(s)) {
+            logger.info('finalize_c_challenge_ready', { email, iteration, ...s });
+            return;
+        }
+        logger.warn('finalize_c_challenge_still_waiting', { email, iteration, ...s });
+        try {
+            await ensureCaptchaOnPage(page, email, `C.waitHumanTok.${iteration}`, { background: false });
+        } catch (e) {
+            logger.warnSafe('finalize_c_challenge_ensure_tick_failed', { email, iteration, error: e?.message || String(e) });
+        }
+        await delay(Math.min(5000, 700 + iteration * 150));
+    }
+    const fin = await readFinalizeCChallengeTokens(page);
+    if (!isFinalizeCHumanChallengeSatisfied(fin)) {
+        throw new Error(
+            `FINALIZE_C_CAPTCHA_NOT_READY:ts=${fin.tsLen},rec=${fin.recLen},hasTs=${fin.hasTsWidget},hasRec=${fin.hasRec}`
+        );
+    }
+}
+
+/**
+ * Turnstile render intercept: window.turnstile.render çağrılmadan önce
+ * callback'i yakalar. 2Captcha/Stack Overflow yöntemi - addInitScript ile
+ * sayfa yüklenmeden önce enjekte edilir.
+ * Kaynak: https://stackoverflow.com/questions/79027476/how-to-inject-a-cloudflare-turnstile-token-into-puppeteer
+ * Kaynak: https://2captcha.com/api-docs/cloudflare-turnstile
+ */
+async function installTurnstileCallbackInterceptor(page) {
+    const addScript = page?.addInitScript || page?.evaluateOnNewDocument;
+    if (!page || typeof addScript !== 'function') return;
+    try {
+        await addScript.call(page, () => {
+            (function () {
+                var check = setInterval(function () {
+                    if (typeof window.turnstile !== 'undefined') {
+                        clearInterval(check);
+                        var orig = window.turnstile.render;
+                        if (!orig) return;
+                        window.turnstile.render = function (a, b) {
+                            if (b && typeof b.callback === 'function') {
+                                window.__passobotTurnstileCallback = b.callback;
+                            }
+                            return orig.apply(this, arguments);
+                        };
+                    }
+                }, 5);
+                setTimeout(function () { clearInterval(check); }, 30000);
+            })();
+        });
+        logger.debug('installTurnstileCallbackInterceptor: init script eklendi');
+    } catch (e) {
+        logger.warn('installTurnstileCallbackInterceptor: hata', { error: e?.message });
+    }
+}
+
+/**
+ * reCAPTCHA render intercept: grecaptcha.render çağrılmadan önce
+ * callback'i yakalar ve grecaptcha.execute()'u override eder.
+ * Bu sayede invisible reCAPTCHA'da token enjeksiyonu sonrası
+ * sitenin callback'i doğru tetiklenir.
+ */
+async function installRecaptchaCallbackInterceptor(page) {
+    const addScript = page?.addInitScript || page?.evaluateOnNewDocument;
+    if (!page || typeof addScript !== 'function') return;
+    try {
+        await addScript.call(page, () => {
+            (function () {
+                var check = setInterval(function () {
+                    if (typeof window.grecaptcha !== 'undefined' && window.grecaptcha) {
+                        clearInterval(check);
+
+                        // Intercept grecaptcha.render to capture callback
+                        var origRender = window.grecaptcha.render;
+                        if (origRender && typeof origRender === 'function') {
+                            window.grecaptcha.render = function (container, params) {
+                                if (params && typeof params.callback === 'function') {
+                                    window.__passobotRecaptchaCallback = params.callback;
+                                }
+                                if (params && typeof params === 'object') {
+                                    window.__passobotRecaptchaParams = JSON.parse(JSON.stringify({
+                                        sitekey: params.sitekey || null,
+                                        size: params.size || null,
+                                        badge: params.badge || null
+                                    }));
+                                }
+                                return origRender.apply(this, arguments);
+                            };
+                        }
+
+                        // Intercept grecaptcha.execute to allow token injection
+                        var origExecute = window.grecaptcha.execute;
+                        if (origExecute && typeof origExecute === 'function') {
+                            window.grecaptcha.execute = function () {
+                                // If we have a pre-solved token, call the callback directly
+                                if (window.__passobotRecaptchaToken && window.__passobotRecaptchaCallback) {
+                                    try {
+                                        window.__passobotRecaptchaCallback(window.__passobotRecaptchaToken);
+                                        window.__passobotRecaptchaToken = null; // consume
+                                        return;
+                                    } catch (e) {}
+                                }
+                                return origExecute.apply(this, arguments);
+                            };
+                        }
+                    }
+                }, 50);
+                setTimeout(function () { clearInterval(check); }, 60000);
+            })();
+        });
+        logger.debug('installRecaptchaCallbackInterceptor: init script eklendi');
+    } catch (e) {
+        logger.warn('installRecaptchaCallbackInterceptor: hata', { error: e?.message });
+    }
+}
+
+/** Ticketing API'den captchaGuid alır */
+async function getcaptchaGuid() {
+    const base = (getCfg().TICKETING_API_BASE || 'https://ticketingweb.passo.com.tr').replace(/\/$/, '');
+    const url = `${base}/api/passoweb/getcaptcha`;
+    try {
+        const res = await axios.post(url, {}, {
+            timeout: 15000,
+            headers: { 'Content-Type': 'application/json' }
+        });
+        const guid = res?.data?.captchaGuid || res?.data?.data?.captchaGuid;
+        if (guid) return guid;
+        logger.warn('getcaptchaGuid: captchaGuid bulunamadı', { data: res?.data });
+        return null;
+    } catch (e) {
+        logger.warn('getcaptchaGuid: hata', { error: e?.message });
+        return null;
+    }
+}
+
+/**
+ * Form submit başarısızsa doğrudan API ile giriş dener.
+ * Şifreleme sayfa tarafında yapıldığı için page.evaluate ile form submit'ı tetikler.
+ */
+async function tryLoginViaApi(page, email, password, cloudflareToken, captchaGuid, evalTarget) {
+    if (!page || !email || !password || !cloudflareToken) return false;
+    const target = evalTarget || page;
+    const base = (getCfg().TICKETING_API_BASE || 'https://ticketingweb.passo.com.tr').replace(/\/$/, '');
+    const loginUrl = `${base}/api/passoweb/login`;
+
+    try {
+        const result = await evalOnTarget(target, `
+            var email = __args[0];
+            var password = __args[1];
+            var token = __args[2];
+            var loginUrl = __args[3];
+
+            var trySubmit = function() {
+                    var userEl = document.querySelector('input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"]');
+                    var passEl = document.querySelector('input[autocomplete="current-password"], input[type="password"], input[name*="pass"]');
+                    if (!userEl || !passEl) return false;
+
+                    var form = userEl.closest('form') || passEl.closest('form');
+                    var quickForm = userEl.closest('quick-form') || passEl.closest('quick-form') || document.querySelector('quick-form[name="loginform"]') || document.querySelector('quick-form');
+
+                    if (form && typeof form.requestSubmit === 'function') {
+                        try { form.requestSubmit(); return 'form'; } catch (e) {}
+                    }
+                    if (quickForm) {
+                        var btns = quickForm.querySelectorAll('button.black-btn, button');
+                        for (var i = 0; i < btns.length; i++) {
+                            var btn = btns[i];
+                            var t = (btn.innerText || btn.textContent || '').trim().toUpperCase();
+                            if ((t.indexOf('GİRİŞ') >= 0 || t.indexOf('GIRIS') >= 0) && t.indexOf('ÜYE') < 0 && t.indexOf('KAYIT') < 0) {
+                                btn.style.display = 'block';
+                                btn.style.visibility = 'visible';
+                                btn.style.opacity = '1';
+                                btn.removeAttribute('disabled');
+                                btn.disabled = false;
+                                btn.click();
+                                return 'quick_form';
+                            }
+                        }
+                        if (quickForm.shadowRoot) {
+                            var sBtns = quickForm.shadowRoot.querySelectorAll('button');
+                            for (var j = 0; j < sBtns.length; j++) {
+                                var sBtn = sBtns[j];
+                                var st = (sBtn.innerText || sBtn.textContent || '').trim().toUpperCase();
+                                if ((st.indexOf('GİRİŞ') >= 0 || st.indexOf('GIRIS') >= 0)) {
+                                    sBtn.click();
+                                    return 'shadow_btn';
+                                }
+                            }
+                        }
+                    }
+                    return false;
+                };
+
+                var originalFetch = window.fetch;
+                var captured = null;
+                window.fetch = function() {
+                    var url = arguments[0];
+                    if (url && String(url).indexOf('/api/passoweb/login') >= 0 && arguments[1] && arguments[1].body) {
+                        captured = arguments[1].body;
+                    }
+                    return originalFetch.apply(this, arguments);
+                };
+
+                var userEl = document.querySelector('input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"]');
+                var passEl = document.querySelector('input[autocomplete="current-password"], input[type="password"], input[name*="pass"]');
+                if (userEl && passEl) {
+                    userEl.value = email;
+                    userEl.dispatchEvent(new Event('input', { bubbles: true }));
+                    userEl.dispatchEvent(new Event('change', { bubbles: true }));
+                    passEl.value = password;
+                    passEl.dispatchEvent(new Event('input', { bubbles: true }));
+                    passEl.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+
+                var tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
+                if (tokenInput) {
+                    tokenInput.value = token;
+                    tokenInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    tokenInput.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+
+                var submitResult = trySubmit();
+                if (submitResult) {
+                    return { ok: true, method: submitResult, captured: !!captured };
+                }
+
+                window.fetch = originalFetch;
+                if (captured) return { ok: false, captured: true };
+
+                var ng = window.ng;
+                if (ng && typeof ng.getComponent === 'function') {
+                    var qf = document.querySelector('quick-form');
+                    if (qf) {
+                        try {
+                            var comp = ng.getComponent(qf);
+                            if (comp && typeof comp.onSubmit === 'function') {
+                                comp.onSubmit();
+                                return { ok: true, method: 'ng_component' };
+                            }
+                        } catch (e) {}
+                    }
+                }
+                return { ok: false };
+        `, [email, password, cloudflareToken, loginUrl]);
+
+        if (result?.ok) {
+            logger.info('tryLoginViaApi: submit tetiklendi', { method: result.method });
+            return true;
+        }
+        return false;
+    } catch (e) {
+        logger.warn('tryLoginViaApi: hata', { error: e?.message });
+        return false;
+    }
+}
+
 function buildProxyArgs(proxyHost, proxyPort) {
-    const windowSize = process.env.BROWSER_WINDOW_SIZE || '1280,720';
-    const args = [
-        `--window-size=${windowSize}`,
-        '--disable-extensions',
-        '--disable-sync',
-        '--disable-translate',
-        '--mute-audio',
-        '--no-first-run',
-        '--disable-default-apps',
-        '--disable-background-networking',
-        '--disable-background-downloads',
-        '--disable-hang-monitor',
-        '--disable-prompt-on-repost',
-        '--metrics-recording-only',
-        '--safebrowsing-disable-auto-update',
-        '--disable-client-side-phishing-detection'
-    ];
+    const c = getCfg();
+    const windowSize = c.BROWSER_WINDOW_SIZE || '1280,720';
+    const useMinimalArgs = c.FLAGS.BROWSER_MINIMAL_ARGS === true;
+    let args = useMinimalArgs
+        ? [`--window-size=${windowSize}`]
+        : [
+            `--window-size=${windowSize}`,
+            '--disable-extensions',
+            '--disable-sync',
+            '--disable-translate',
+            '--mute-audio',
+            '--no-first-run',
+            '--disable-default-apps',
+            '--disable-background-networking',
+            '--disable-background-downloads',
+            '--disable-hang-monitor',
+            '--disable-prompt-on-repost',
+            '--metrics-recording-only',
+            '--safebrowsing-disable-auto-update',
+            '--disable-client-side-phishing-detection'
+        ];
     if (process.platform !== 'win32') {
         args.push('--no-sandbox', '--disable-setuid-sandbox');
         args.push('--disable-dev-shm-usage');
-        args.push('--disable-gpu', '--disable-software-rasterizer');
-        args.push('--disable-features=VizDisplayCompositor');
+        if (!useMinimalArgs) {
+            args.push('--disable-gpu', '--disable-software-rasterizer');
+            args.push('--disable-features=VizDisplayCompositor');
+        }
     }
     let proxyApplied = false;
     if (proxyHost && proxyPort) {
@@ -635,7 +1489,7 @@ function buildProxyArgs(proxyHost, proxyPort) {
         args.push(`--proxy-server=${u.protocol}//${u.hostname}:${u.port}`);
         proxyApplied = true;
     }
-    return {args, proxyApplied};
+    return {args, proxyApplied, useMinimalArgs};
 }
 
 function resolveBrowserExecutablePath(configuredPath) {
@@ -674,12 +1528,13 @@ function resolveBrowserExecutablePath(configuredPath) {
     return null;
 }
 
-async function connectStableBrowser({ chromePath, userDataDir, args }) {
+async function connectStableBrowser({ chromePath, userDataDir, args, ignoreAllFlags }) {
     try {
         return await realBrowserConnect({
             headless: false,
             turnstile: false,
             args,
+            ignoreAllFlags: !!ignoreAllFlags,
             customConfig: {
                 chromePath,
                 userDataDir
@@ -725,8 +1580,8 @@ async function launchAndLogin(options) {
     const proxyUsername = opts.proxyUsername;
     const proxyPassword = opts.proxyPassword;
 
-    const {args, proxyApplied} = buildProxyArgs(proxyHost, proxyPort);
-    const chromePath = resolveBrowserExecutablePath(cfg.CHROME_PATH);
+    const {args, proxyApplied, useMinimalArgs} = buildProxyArgs(proxyHost, proxyPort);
+    const chromePath = resolveBrowserExecutablePath(getCfg().CHROME_PATH);
 
     if (userDataDir) {
         try {
@@ -742,7 +1597,7 @@ async function launchAndLogin(options) {
         proxyApplied,
         chromePath: chromePath || 'not-found'
     });
-    const ret = await connectStableBrowser({ chromePath, userDataDir, args });
+    const ret = await connectStableBrowser({ chromePath, userDataDir, args, ignoreAllFlags: useMinimalArgs });
     const browser = ret.browser;
     const page = ret.page || await ensurePage(browser);
     try {
@@ -763,7 +1618,9 @@ async function launchAndLogin(options) {
         }
     }
 
-    logger.debug('launchAndLogin: login sayfasına gidiliyor', { email, url: cfg.PASSO_LOGIN });
+    logger.debug('launchAndLogin: login sayfasına gidiliyor', { email, url: getCfg().PASSO_LOGIN });
+
+    await installTurnstileCallbackInterceptor(page);
 
     // Capture main document response info for /giris
     let lastLoginDoc = null;
@@ -784,7 +1641,7 @@ async function launchAndLogin(options) {
         } catch {}
     };
     try { page.on('response', onResp); } catch {}
-    let gotoRes = await gotoWithRetry(page, cfg.PASSO_LOGIN, {
+    let gotoRes = await gotoWithRetry(page, getCfg().PASSO_LOGIN, {
         retries: 2,
         waitUntil: 'domcontentloaded',
         expectedUrlIncludes: '/giris',
@@ -797,7 +1654,7 @@ async function launchAndLogin(options) {
             goto: gotoRes,
             currentUrl: (() => { try { return page.url(); } catch { return null; } })()
         });
-        gotoRes = await gotoWithRetry(page, cfg.PASSO_LOGIN, {
+        gotoRes = await gotoWithRetry(page, getCfg().PASSO_LOGIN, {
             retries: 1,
             waitUntil: 'networkidle2',
             expectedUrlIncludes: '/giris',
@@ -879,7 +1736,7 @@ async function launchAndLogin(options) {
 
     try { page.removeListener('response', onResp); } catch {}
 
-    const userSel = 'input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"], input[id*="user"], input[id*="email"]';
+    const userSel = 'input[autocomplete="username"], input[type="email"], input[type="text"][placeholder*="E-Posta"], input[name*="email"], input[name*="user"], input[id*="user"], input[id*="email"]';
     const passSel = 'input[autocomplete="current-password"], input[type="password"], input[name*="pass"], input[id*="pass"]';
 
     const findLoginContext = async () => {
@@ -897,8 +1754,7 @@ async function launchAndLogin(options) {
     };
 
     const tryRevealLoginForm = async () => {
-        const hasForm = await findLoginContext();
-        if (hasForm) return true;
+        if (await findLoginContext()) return true;
         try {
             await page.evaluate(() => {
                 const norm = (s) => (s || '').toString().trim().toLowerCase();
@@ -931,11 +1787,12 @@ async function launchAndLogin(options) {
             const ctx = await tryEnsureLoginForm(12000);
             if (ctx) return ctx;
             try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }); } catch {}
-            try { await delay(600 * attempt); } catch {}
+            const backoff = 600 * attempt;
+            try { await delay(backoff); } catch {}
             const u = (() => { try { return page.url(); } catch { return ''; } })();
             if (!/\/tr\/giris(\?|$)/i.test(String(u || ''))) {
                 try {
-                    await gotoWithRetry(page, cfg.PASSO_LOGIN, { retries: 1, waitUntil: 'domcontentloaded', expectedUrlIncludes: '/giris', backoffMs: 350 });
+                    await gotoWithRetry(page, getCfg().PASSO_LOGIN, { retries: 1, waitUntil: 'domcontentloaded', expectedUrlIncludes: '/giris', backoffMs: 350 });
                 } catch {}
             }
         }
@@ -952,68 +1809,381 @@ async function launchAndLogin(options) {
         try {
             const diag = await evalOnPage(page, `
                 var allInputs = document.querySelectorAll('input');
-                var inputs = [];
+                var allForms = document.querySelectorAll('form');
+                var inputs = []; var forms = [];
                 for (var i = 0; i < Math.min(allInputs.length, 40); i++) {
                     var inp = allInputs[i];
                     inputs.push({ type: inp.getAttribute('type') || '', name: inp.getAttribute('name') || '', id: inp.getAttribute('id') || '' });
                 }
-                return { inputCount: allInputs.length, inputs };
+                for (i = 0; i < Math.min(allForms.length, 10); i++) {
+                    var f = allForms[i];
+                    forms.push({ id: f.getAttribute('id') || '', name: f.getAttribute('name') || '', action: f.getAttribute('action') || '' });
+                }
+                return { inputCount: allInputs.length, inputs, formCount: allForms.length, forms };
             `);
             logger.warn('launchAndLogin: login formu bulunamadı (diagnostic)', { email, url: u, diag });
         } catch {}
         throw new Error('Login formu bulunamadı');
     }
 
-    await delay(800);
-    await page.waitForSelector('.cf-turnstile, input[name="cf-turnstile-response"]', { timeout: 15000 }).catch(() => {});
+    await delay(500);
+    const turnstileTarget = loginCtx.frame || page;
+    await (turnstileTarget.waitForSelector ? turnstileTarget.waitForSelector('.cf-turnstile, input[name="cf-turnstile-response"]', { timeout: 15000 }) : page.waitForSelector('.cf-turnstile, input[name="cf-turnstile-response"]', { timeout: 15000 })).catch(() => {});
 
-    const target = loginCtx.frame || page;
     const userEl = loginCtx.userEl;
     const passEl = loginCtx.passEl;
     if (!userEl || !passEl) throw new Error('Login inputları bulunamadı');
 
     await userEl.click({ clickCount: 3 }).catch(() => {});
-    await target.type(userSel, String(email || ''), { delay: 15 }).catch(async () => {
-        await userEl.type(String(email || ''), { delay: 15 }).catch(() => {});
-    });
+    await userEl.type(String(email || ''), { delay: 20 });
+    await userEl.evaluate((el) => { el.dispatchEvent(new Event('blur', { bubbles: true })); }).catch(() => {});
     await passEl.click({ clickCount: 3 }).catch(() => {});
-    await target.type(passSel, String(password || ''), { delay: 15 }).catch(async () => {
-        await passEl.type(String(password || ''), { delay: 15 }).catch(() => {});
-    });
+    await passEl.type(String(password || ''), { delay: 20 });
+    await passEl.evaluate((el) => { el.dispatchEvent(new Event('blur', { bubbles: true })); }).catch(() => {});
     await delay(500);
 
-    await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.warmup', { background: true });
-    await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.beforeSubmit');
-    await delay(300);
-
+    // Some Passo login pages require an additional "I am human" checkbox.
+    // If it's present and unchecked, submit attempts can trigger a generic "Genel hata" modal.
     try {
-        const preLoginSnap = await evalOnPage(page, `
-            var bodyText = (document.body && document.body.innerText) ? String(document.body.innerText).toLowerCase() : '';
-            var hasVerifyHuman = bodyText.indexOf('verify you are human') >= 0;
-            var input = document.querySelector('input[name="cf-turnstile-response"]');
-            var hasTurnstileTokenField = !!input;
-            var tokenLen = (input && input.value) ? String(input.value).length : 0;
-            var title = document.title || '';
-            return { title: title, hasVerifyHuman: hasVerifyHuman, hasTurnstileTokenField: hasTurnstileTokenField, tokenLen: tokenLen };
-        `);
-        logger.debug('launchAndLogin: login submit öncesi snapshot', { email, snap: preLoginSnap });
-    } catch {}
+        const humanRes = await evaluateSafe(loginCtx.frame || page, () => {
+            const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+            const candidates = Array.from(document.querySelectorAll('input[type="checkbox"]'))
+                .map((cb) => {
+                    let txt = '';
+                    try {
+                        const id = cb.getAttribute('id') || '';
+                        if (id) txt = document.querySelector(`label[for="${CSS.escape(id)}"]`)?.innerText || '';
+                    } catch {}
+                    if (!txt) {
+                        try { txt = cb.closest('label')?.innerText || cb.parentElement?.innerText || ''; } catch {}
+                    }
+                    return { cb, txt: norm(txt) };
+                })
+                .filter(x => x.cb);
 
-    try {
-        await evaluateSafe(page, () => {
-            const form = document.querySelector('form');
-            if (form) {
-                const submitBtn = [...form.querySelectorAll('button, input[type="submit"]')].find(x => (x.innerText || x.value || '').trim().toUpperCase().includes('GİRİŞ'));
-                if (submitBtn) { submitBtn.click(); return; }
-                try { form.requestSubmit(); return; } catch {}
-                try { form.submit(); return; } catch {}
+            const target = candidates.find(x => x.txt.includes('gerçek kişi') || x.txt.includes('gercek kisi') || x.txt.includes('doğrulay') || x.txt.includes('dogrula')) || null;
+            if (!target || !target.cb) return { attempted: false, found: false };
+            if (target.cb.checked) return { attempted: true, found: true, changed: false };
+            try { target.cb.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+            try { target.cb.click(); } catch {
+                try { (target.cb.closest('label') || target.cb.parentElement || target.cb).click(); } catch {}
             }
-            const any = [...document.querySelectorAll('button, input[type="submit"], [role="button"]')].find(x => (x.innerText || x.value || '').trim().toLowerCase().includes('giriş'));
-            any?.click();
-        });
+            return { attempted: true, found: true, changed: true, checked: !!target.cb.checked };
+        }).catch(() => null);
+        if (humanRes?.attempted && humanRes?.found) {
+            logger.info('launchAndLogin: human checkbox', { email, humanRes });
+            await delay(350);
+        }
     } catch {}
-    logger.debug('launchAndLogin: GİRİŞ butonu click gönderildi', { email });
-    await delay(cfg.DELAYS.AFTER_LOGIN);
+
+    if (loginCtx.frame) {
+        logger.info('launchAndLogin: form iframe içinde, token aynı frame\'e enjekte edilecek', { email });
+    }
+    await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.warmup', { background: true, targetFrame: loginCtx.frame || undefined });
+    await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.beforeSubmit', { targetFrame: loginCtx.frame || undefined });
+    // Token injected; avoid long fixed sleeps. We'll rely on the button-enabled wait below.
+    await delay(450);
+
+    const evalTarget = loginCtx.frame || page;
+
+    // Wait until the login button becomes enabled after Turnstile is solved.
+    // On Passo the "GİRİŞ" button can remain disabled until the widget signals success.
+    try {
+        await waitForFunctionSafe(evalTarget, () => {
+            const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+            const btns = Array.from(document.querySelectorAll('quick-form[name="loginform"] button.black-btn, quick-form button.black-btn, button.black-btn'));
+            const btn = btns.find(b => norm(b.innerText || b.textContent || '') === 'giriş' || norm(b.innerText || b.textContent || '').includes('giriş')) || null;
+            if (!btn) return false;
+            const st = window.getComputedStyle(btn);
+            const visible = st && st.display !== 'none' && st.visibility !== 'hidden' && st.opacity !== '0' && btn.offsetParent !== null;
+            if (!visible) return false;
+            return !btn.disabled && btn.getAttribute('disabled') === null;
+        }, { timeout: 15000, polling: 250 });
+        logger.info('launchAndLogin: login button enabled after turnstile', { email });
+    } catch {
+        // If we can't detect enabled state, continue with existing click fallbacks.
+    }
+
+    const dismissObstructions = async (label) => {
+        try {
+            const res = await evaluateSafe(evalTarget, (lbl) => {
+                const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+                const isVisible = (el) => {
+                    try {
+                        const st = window.getComputedStyle(el);
+                        if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                        const r = el.getBoundingClientRect();
+                        if (!r || r.width < 2 || r.height < 2) return false;
+                        return true;
+                    } catch { return false; }
+                };
+
+                const roots = Array.from(document.querySelectorAll(
+                    '.swal2-container.swal2-shown, .modal.show, [role="dialog"][aria-modal="true"], .cdk-overlay-container, .cookie, .cookie-banner, .cookie-consent, .cookies'
+                )).filter(isVisible);
+
+                // Also treat any fixed overlay with a close button as a root.
+                const extra = Array.from(document.querySelectorAll('[class*="overlay" i], [class*="popup" i], [class*="modal" i]')).filter(isVisible).slice(0, 4);
+                for (const e of extra) if (!roots.includes(e)) roots.push(e);
+
+                if (!roots.length) return { label: lbl, dismissed: false, reason: 'no_root' };
+
+                const want = ['tamam', 'ok', 'kapat', 'iptal', 'vazgeç', 'vazgec', 'no', 'hayır', 'hayir', 'x', '×'];
+                let clicked = false;
+                let clickedText = null;
+                let rootText = '';
+                for (const root of roots) {
+                    if (!rootText) rootText = norm(root.innerText || root.textContent || '').slice(0, 140);
+                    const btns = Array.from(root.querySelectorAll('button, a, [role="button"], .swal2-confirm, .swal2-cancel'));
+                    for (const b of btns) {
+                        if (!isVisible(b)) continue;
+                        const t = norm(b.innerText || b.textContent || b.value || b.getAttribute('aria-label') || b.getAttribute('title') || '');
+                        if (!t) continue;
+                        if (want.includes(t) || want.some(w => t === w || t.startsWith(w))) {
+                            try { b.click(); clicked = true; clickedText = t; break; } catch {}
+                        }
+                    }
+                    if (clicked) break;
+
+                    // Try common close icons
+                    const closeEl = root.querySelector('[aria-label*="kapat" i], [aria-label*="close" i], .close, .btn-close, .swal2-close');
+                    if (closeEl && isVisible(closeEl)) {
+                        try { closeEl.click(); clicked = true; clickedText = 'close_icon'; } catch {}
+                    }
+                    if (clicked) break;
+                }
+                return { label: lbl, dismissed: clicked, clickedText, rootText };
+            }, label).catch(() => null);
+
+            if (res?.dismissed) {
+                logger.info('launchAndLogin: obstruction dismissed', { email, res });
+                await delay(500);
+                return true;
+            }
+        } catch {}
+        return false;
+    };
+
+    await dismissObstructions('before_wait_login_btn');
+
+    const waitForGirisBtn = async (maxMs = 12000) => {
+        const start = Date.now();
+        while (Date.now() - start < maxMs) {
+            await dismissObstructions('wait_login_btn_loop');
+            const found = await evaluateSafe(evalTarget, () => {
+                var qf = document.querySelector('quick-form');
+                if (qf) {
+                    var qbtns = qf.querySelectorAll('button');
+                    if (qbtns.length > 0) return true;
+                    if (qf.shadowRoot) {
+                        var sbtns = qf.shadowRoot.querySelectorAll('button');
+                        if (sbtns.length > 0) return true;
+                    }
+                }
+                var btns = document.querySelectorAll('button');
+                for (var i = 0; i < btns.length; i++) {
+                    var t = (btns[i].innerText || btns[i].textContent || '').trim().toUpperCase();
+                    if ((t.indexOf('GİRİŞ') >= 0 || t.indexOf('GIRIS') >= 0) && t.indexOf('ÜYE') < 0) return true;
+                }
+                return false;
+            }).catch(() => false);
+            if (found) return;
+            await delay(500);
+        }
+    };
+    await waitForGirisBtn();
+    const tryFormSubmitEarly = async () => {
+        await dismissObstructions('before_early_submit');
+        const r = await evaluateSafe(evalTarget, () => {
+            var passEl = document.querySelector('input[type="password"], input[name*="pass"]');
+            if (!passEl) return null;
+            var form = passEl.closest('form');
+            var qf = passEl.closest('quick-form');
+            if (form && typeof form.requestSubmit === 'function') {
+                try { form.requestSubmit(); return 'form'; } catch (e) {}
+            }
+            if (qf) {
+                var btn = qf.querySelector('button[type="submit"], button.black-btn');
+                if (btn && !btn.disabled) { btn.click(); return 'qf_btn'; }
+            }
+            return null;
+        }).catch(() => null);
+        return r;
+    };
+    const earlySubmit = await tryFormSubmitEarly();
+    if (earlySubmit) logger.info('launchAndLogin: erken form submit', { method: earlySubmit });
+    const tryClickGirisBtn = () => evaluateSafe(evalTarget, () => {
+        var norm = function (s) { return String(s || '').trim().toUpperCase(); };
+        var revealAndClick = function (btn) {
+            if (!btn) return false;
+            var p = btn;
+            while (p && p !== document.body) {
+                try { p.style.display = ''; p.style.visibility = ''; p.style.opacity = ''; } catch (e) {}
+                p = p.parentElement;
+            }
+            btn.style.display = 'block';
+            btn.style.visibility = 'visible';
+            btn.style.opacity = '1';
+            btn.removeAttribute('disabled');
+            btn.disabled = false;
+            btn.scrollIntoView({ block: 'center' });
+            btn.click();
+            return true;
+        };
+        var allBtns = document.querySelectorAll('button, input[type="submit"]');
+        for (var b = 0; b < allBtns.length; b++) {
+            var btn = allBtns[b];
+            var t = norm(btn.innerText || btn.textContent || btn.value || '');
+            if ((t.indexOf('GİRİŞ') >= 0 || t.indexOf('GIRIS') >= 0) && t.indexOf('ÜYE') < 0 && t.indexOf('KAYIT') < 0) {
+                if (revealAndClick(btn)) return 'giris_btn';
+            }
+        }
+        var blackBtns = document.querySelectorAll('button.black-btn');
+        for (b = 0; b < blackBtns.length; b++) {
+            var girisBtn = blackBtns[b];
+            t = norm(girisBtn.innerText || girisBtn.textContent || '');
+            if ((t.indexOf('GİRİŞ') >= 0 || t.indexOf('GIRIS') >= 0) && t.indexOf('ÜYE') < 0 && t.indexOf('KAYIT') < 0) {
+                if (revealAndClick(girisBtn)) return 'black_btn';
+            }
+        }
+        var quickForm = document.querySelector('quick-form[name="loginform"], quick-form');
+        if (quickForm) {
+            var qbtns = quickForm.querySelectorAll('button.black-btn, button');
+            for (var q = 0; q < qbtns.length; q++) {
+                var qbtn = qbtns[q];
+                var qt = norm(qbtn.innerText || qbtn.textContent || '');
+                if ((qt.indexOf('GİRİŞ') >= 0 || qt.indexOf('GIRIS') >= 0) && qt.indexOf('ÜYE') < 0 && qt.indexOf('KAYIT') < 0) {
+                    if (revealAndClick(qbtn)) return 'quick_form_btn';
+                }
+            }
+            if (quickForm.shadowRoot) {
+                var sBtns = quickForm.shadowRoot.querySelectorAll('button');
+                for (var sq = 0; sq < sBtns.length; sq++) {
+                    var sqbtn = sBtns[sq];
+                    var sqt = norm(sqbtn.innerText || sqbtn.textContent || '');
+                    if ((sqt.indexOf('GİRİŞ') >= 0 || sqt.indexOf('GIRIS') >= 0) && sqt.indexOf('ÜYE') < 0 && sqt.indexOf('KAYIT') < 0) {
+                        sqbtn.style.display = 'block';
+                        sqbtn.style.visibility = 'visible';
+                        sqbtn.style.opacity = '1';
+                        sqbtn.removeAttribute('disabled');
+                        sqbtn.disabled = false;
+                        sqbtn.click();
+                        return 'quick_form_shadow';
+                    }
+                }
+            }
+        }
+        return null;
+    });
+
+    let submitResult = null;
+    const pollStart = Date.now();
+    const pollMaxMs = 8000;
+    const pollIntervalMs = 500;
+    while (Date.now() - pollStart < pollMaxMs) {
+        try {
+            await dismissObstructions('before_click_giris');
+            submitResult = await tryClickGirisBtn();
+            if (submitResult) break;
+        } catch (e) {
+            logger.warn('launchAndLogin: submit hatası', { error: e?.message });
+        }
+        await delay(pollIntervalMs);
+    }
+    if (!submitResult && passEl) {
+        try {
+            const didSubmit = await passEl.evaluate((el) => {
+                var form = el.form || (el.closest && el.closest('form'));
+                var quickForm = el.closest && el.closest('quick-form');
+                if (form) {
+                    try { form.requestSubmit(); return 'form'; } catch (e) {}
+                    try { form.submit(); return 'form_submit'; } catch (e) {}
+                }
+                if (quickForm) {
+                    var btns = quickForm.querySelectorAll('button.black-btn, button');
+                    for (var bi = 0; bi < btns.length; bi++) {
+                        var btn = btns[bi];
+                        var t = (btn.innerText || btn.textContent || '').trim().toUpperCase();
+                        if ((t.indexOf('GİRİŞ') >= 0 || t.indexOf('GIRIS') >= 0) && t.indexOf('ÜYE') < 0 && t.indexOf('KAYIT') < 0) {
+                            btn.removeAttribute('disabled'); btn.disabled = false; btn.click();
+                            return 'quick_form';
+                        }
+                    }
+                }
+                return false;
+            });
+            if (didSubmit) submitResult = 'passEl_form';
+        } catch {}
+    }
+    if (!submitResult) {
+        try {
+            const diag = await evaluateSafe(evalTarget, () => {
+                var btns = document.querySelectorAll('button, input[type="submit"]');
+                var texts = []; for (var di = 0; di < Math.min(btns.length, 15); di++) texts.push((btns[di].innerText || btns[di].value || '').trim().substring(0, 30));
+                var qf = document.querySelector('quick-form');
+                var qfBtns = qf ? qf.querySelectorAll('button') : [];
+                var qfTexts = []; for (var qi = 0; qi < qfBtns.length; qi++) qfTexts.push((qfBtns[qi].innerText || '').trim().substring(0, 30));
+                return { btnCount: btns.length, btnTexts: texts, quickFormBtns: qfBtns.length, qfBtnTexts: qfTexts };
+            });
+            logger.warn('launchAndLogin: GİRİŞ butonu bulunamadı (diagnostic)', { email, diag });
+        } catch {}
+        try {
+            await passEl.focus();
+            await page.keyboard.press('Enter');
+            logger.info('launchAndLogin: Enter tuşu gönderildi (fallback)');
+        } catch {}
+        if (!submitResult) {
+            const cloudflareToken = await evaluateSafe(evalTarget, () => {
+                var i = document.querySelector('input[name="cf-turnstile-response"]');
+                return (i && i.value) ? i.value : null;
+            }).catch(() => null);
+            if (cloudflareToken) {
+                logger.info('launchAndLogin: tryLoginViaApi fallback deneniyor', { email, tokenLen: cloudflareToken.length });
+                const apiOk = await tryLoginViaApi(page, email, password, cloudflareToken, null, evalTarget);
+                if (apiOk) submitResult = 'api_fallback';
+            } else {
+                logger.warn('launchAndLogin: cloudflareToken bulunamadı, API fallback atlanıyor');
+            }
+        }
+    }
+    logger.info('launchAndLogin: GİRİŞ submit', { method: submitResult });
+
+    await delay(500);
+    const dismissLoginErrorModal = async () => {
+        const evalTarget = loginCtx?.frame || page;
+        for (let i = 0; i < 15; i++) {
+            await delay(2000);
+            const dismissed = await evaluateSafe(evalTarget, () => {
+                var root = document.querySelector('.swal2-container.swal2-shown, .modal.show, [role="dialog"][aria-modal="true"]');
+                if (!root) return false;
+                var text = (root.innerText || root.textContent || '').toLowerCase();
+                if (text.indexOf('genel hata') < 0 && text.indexOf('hata') < 0 && text.indexOf('error') < 0) return false;
+                var btns = root.querySelectorAll('button, a, [role="button"], .swal2-confirm');
+                for (var j = 0; j < btns.length; j++) {
+                    var t = (btns[j].innerText || btns[j].textContent || '').trim().toLowerCase();
+                    if (t === 'tamam' || t === 'ok' || t === 'kapat') {
+                        try { btns[j].click(); return true; } catch (e) {}
+                    }
+                }
+                return false;
+            }).catch(() => false);
+            if (dismissed) {
+                logger.info('launchAndLogin: Genel hata modalı kapatıldı', { email });
+                return true;
+            }
+        }
+        return false;
+    };
+    await Promise.race([
+        page.waitForNavigation({ waitUntil: 'load', timeout: 25000 }).catch(() => {}),
+        page.waitForFunction(() => !/\/giris(\?|$)/i.test(location.href || ''), { timeout: 25000 }).catch(() => {}),
+        (async () => {
+            const d = await dismissLoginErrorModal();
+            if (d) await delay(2000);
+        })(),
+        delay(25000)
+    ]);
+    await delay(getCfg().DELAYS.AFTER_LOGIN || 800);
 
     try {
         const postLogin = await evalOnPage(page, `
@@ -1041,6 +2211,44 @@ async function launchAndLogin(options) {
         `);
         logger.info('launchAndLogin: login sonrası snapshot', { email, snap: postLogin });
     } catch {}
+
+    let finalUrl = (() => { try { return page.url(); } catch { return ''; } })();
+    if (/\/giris(\?|$)/i.test(finalUrl) && submitResult) {
+        await delay(1500);
+        const modalDismissed = await evaluateSafe(evalTarget, () => {
+            var root = document.querySelector('.swal2-container.swal2-shown, .modal.show');
+            if (!root) return false;
+            var btns = root.querySelectorAll('button');
+            for (var j = 0; j < btns.length; j++) {
+                var t = (btns[j].innerText || btns[j].textContent || '').trim().toLowerCase();
+                if (t === 'tamam' || t === 'ok') { try { btns[j].click(); return true; } catch (e) {} }
+            }
+            return false;
+        }).catch(() => false);
+        if (modalDismissed) {
+            await delay(2000);
+            logger.info('launchAndLogin: Genel hata sonrası yeniden deneme', { email });
+            await evaluateSafe(evalTarget, () => {
+                var i = document.querySelector('input[name="cf-turnstile-response"]');
+                if (i) i.value = '';
+            }).catch(() => {});
+            await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.retry', { targetFrame: loginCtx?.frame || undefined });
+            await delay(1500);
+            const retrySubmit = await tryFormSubmitEarly();
+            if (retrySubmit) {
+                await Promise.race([
+                    page.waitForNavigation({ waitUntil: 'load', timeout: 20000 }).catch(() => {}),
+                    page.waitForFunction(() => !/\/giris(\?|$)/i.test(location.href || ''), { timeout: 20000 }).catch(() => {}),
+                    delay(20000)
+                ]);
+                await delay(getCfg().DELAYS.AFTER_LOGIN || 800);
+            }
+            finalUrl = (() => { try { return page.url(); } catch { return ''; } })();
+        }
+    }
+    if (/\/giris(\?|$)/i.test(finalUrl)) {
+        throw new Error('Giriş başarısız: sayfa değişmedi, hâlâ giriş sayfasında.');
+    }
 
     return {browser, page};
 }
@@ -1073,27 +2281,33 @@ async function reloginIfRedirected(page, email, password) {
         returnUrl
     });
 
-    try {
-        await page.waitForSelector('input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"]', { timeout: 10000 });
-    } catch {}
-
-    try {
-        await evaluateSafe(page, () => {
-            const u = document.querySelector('input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"]');
-            const p = document.querySelector('input[autocomplete="current-password"], input[type="password"]');
-            if (u) { u.value = ''; u.dispatchEvent(new Event('input', { bubbles: true })); u.dispatchEvent(new Event('change', { bubbles: true })); }
-            if (p) { p.value = ''; p.dispatchEvent(new Event('input', { bubbles: true })); p.dispatchEvent(new Event('change', { bubbles: true })); }
-        });
-    } catch {}
-
-    try {
-        await page.type('input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"]', String(email || ''), { delay: 15 });
-        await page.type('input[autocomplete="current-password"], input[type="password"]', String(password || ''), { delay: 15 });
-    } catch {
+    const userSel = 'input[autocomplete="username"], input[type="email"], input[name*="email"], input[name*="user"], input[id*="email"]';
+    const passSel = 'input[autocomplete="current-password"], input[type="password"], input[name*="pass"]';
+    let userEl = await page.$(userSel).catch(() => null);
+    let passEl = await page.$(passSel).catch(() => null);
+    if (!userEl || !passEl) {
+        const frames = page.frames();
+        for (const fr of frames) {
+            if (fr === page.mainFrame()) continue;
+            userEl = await fr.$(userSel).catch(() => null);
+            passEl = await fr.$(passSel).catch(() => null);
+            if (userEl && passEl) break;
+        }
+    }
+    if (userEl && passEl) {
         try {
-            await page.type('input[autocomplete="username"]', String(email || ''), { delay: 15 });
-            await page.type('input[autocomplete="current-password"]', String(password || ''), { delay: 15 });
-        } catch {}
+            await userEl.click({ clickCount: 3 });
+            await userEl.type(String(email || ''), { delay: 20 });
+            await passEl.click({ clickCount: 3 });
+            await passEl.type(String(password || ''), { delay: 20 });
+        } catch (e) {
+            logger.warn('reloginIfRedirected: element type failed, fallback to page.type', { error: e?.message });
+            await page.type(userSel, String(email || ''), { delay: 20 }).catch(() => {});
+            await page.type(passSel, String(password || ''), { delay: 20 }).catch(() => {});
+        }
+    } else {
+        await page.type(userSel, String(email || ''), { delay: 20 }).catch(() => {});
+        await page.type(passSel, String(password || ''), { delay: 20 }).catch(() => {});
     }
 
     await delay(500);
@@ -1103,29 +2317,34 @@ async function reloginIfRedirected(page, email, password) {
 
     try {
         const submitted = await evaluateSafe(page, () => {
-            const form = document.querySelector('form');
-            if (form) {
-                const submitBtn = [...form.querySelectorAll('button, input[type="submit"]')].find(x => (x.innerText || x.value || '').trim().toUpperCase().includes('GİRİŞ'));
-                if (submitBtn) {
-                    try { submitBtn.click(); return 'click'; } catch {}
+            const forms = document.querySelectorAll('form');
+            for (const form of forms) {
+                const hasTurnstile = form.querySelector('.cf-turnstile, input[name="cf-turnstile-response"]');
+                const hasEmail = form.querySelector('input[type="email"], input[name*="email"], input[autocomplete="username"]');
+                if (hasTurnstile || hasEmail) {
+                    const btn = [...form.querySelectorAll('button, input[type="submit"]')].find(x => (x.innerText || x.value || '').trim().toUpperCase().includes('GİRİŞ'));
+                    if (btn) { btn.scrollIntoView({ block: 'center' }); btn.click(); return 'form_btn'; }
+                    try { form.requestSubmit(); return 'requestSubmit'; } catch {}
+                    try { form.submit(); return 'submit'; } catch {}
                 }
-                try { form.requestSubmit(); return 'requestSubmit'; } catch {}
-                try { form.submit(); return 'submit'; } catch {}
             }
-            const any = [...document.querySelectorAll('button.black-btn, button, [role="button"]')].find(x => (x.innerText || '').trim().toUpperCase() === 'GİRİŞ');
-            if (any) { any.click(); return 'fallback_click'; }
+            const any = [...document.querySelectorAll('button.black-btn, button, input[type="submit"]')].find(x => (x.innerText || x.value || '').trim().toLowerCase().includes('giriş'));
+            if (any) { any.scrollIntoView({ block: 'center' }); any.click(); return 'fallback'; }
             return null;
         });
         logger.debug('reloginIfRedirected: form submit', { method: submitted });
-    } catch {}
+    } catch (e) {
+        logger.warn('reloginIfRedirected: submit hatası', { error: e?.message });
+    }
 
     try { await delay(350); } catch {}
 
     const preUrl = currentUrl;
     const navRes = await Promise.race([
         page.waitForNavigation({ waitUntil: 'load', timeout: 45000 }).then(() => ({ type: 'nav_ok' })).catch((e) => ({ type: 'nav_error', message: e?.message || String(e) })),
+        page.waitForFunction(() => !/\/giris(\?|$)/i.test(location.href || ''), { timeout: 45000 }).then(() => ({ type: 'url_changed' })).catch(() => null),
         delay(45000).then(() => ({ type: 'timeout' }))
-    ]);
+    ]).then((r) => r || { type: 'timeout' });
 
     // Re-check URL after navigation settles (even if timeout)
     await delay(500);
@@ -1179,23 +2398,45 @@ async function reloginIfRedirected(page, email, password) {
     // Force navigation to returnUrl (if any) to re-enter the flow.
     if (returnUrl) {
         logger.info('reloginIfRedirected: returnUrl sayfasına dönülüyor', { email, returnUrl });
-        await gotoWithRetry(page, returnUrl, {
-            retries: 2,
-            waitUntil: 'domcontentloaded',
-            expectedUrlIncludes: '/koltuk-secim',
-            rejectIfHome: false,
-            backoffMs: 400
-        }).catch(() => {});
-        
-        // Check URL again after returnUrl navigation
-        await delay(500);
-        const finalUrl = (() => {
-            try { return page.url(); } catch { return ''; }
-        })();
-        
-        const isStillHomePage = finalUrl === 'https://www.passo.com.tr/' || finalUrl === 'https://www.passo.com.tr' || finalUrl?.endsWith('passo.com.tr/');
-        if (isStillHomePage) {
-            logger.error('reloginIfRedirected: returnUrl navigation sonrası hala ana sayfadayız', { email, finalUrl, originalAfterUrl: afterUrl });
+        const tryReturnUrl = async (waitUntil) => {
+            await gotoWithRetry(page, returnUrl, {
+                retries: 2,
+                waitUntil,
+                expectedUrlIncludes: '/koltuk-secim',
+                rejectIfHome: false,
+                backoffMs: 500
+            }).catch(() => {});
+            await delay(600);
+            return (() => {
+                try {
+                    return page.url();
+                } catch {
+                    return '';
+                }
+            })();
+        };
+
+        let finalUrl = await tryReturnUrl('domcontentloaded');
+        const isBad =
+            finalUrl === 'https://www.passo.com.tr/' ||
+            finalUrl === 'https://www.passo.com.tr' ||
+            (finalUrl?.endsWith('passo.com.tr/') && !finalUrl.includes('/koltuk-secim')) ||
+            !String(finalUrl || '').includes('/koltuk-secim');
+        if (isBad) {
+            logger.warn('reloginIfRedirected: returnUrl ilk deneme yetersiz, networkidle2 ile tekrar', { email, finalUrl });
+            finalUrl = await tryReturnUrl('networkidle2');
+        }
+
+        const isStillHomePage =
+            finalUrl === 'https://www.passo.com.tr/' ||
+            finalUrl === 'https://www.passo.com.tr' ||
+            (finalUrl?.endsWith('passo.com.tr/') && !String(finalUrl || '').includes('/koltuk-secim'));
+        if (isStillHomePage || !String(finalUrl || '').includes('/koltuk-secim')) {
+            logger.error('reloginIfRedirected: returnUrl sonrası koltuk sayfasına ulaşılamadı', {
+                email,
+                finalUrl,
+                originalAfterUrl: afterUrl
+            });
             return false;
         }
     }
@@ -1216,7 +2457,7 @@ async function reloginIfRedirected(page, email, password) {
 }
 
 async function clickBuy(page, eventAddress = null) {
-    const retries = Number.isFinite(cfg.TIMEOUTS.CLICK_BUY_RETRIES) ? cfg.TIMEOUTS.CLICK_BUY_RETRIES : 12;
+    const retries = Number.isFinite(getCfg().TIMEOUTS.CLICK_BUY_RETRIES) ? getCfg().TIMEOUTS.CLICK_BUY_RETRIES : 12;
     for (let i = 0; i < retries; i++) {
         const found = await page.evaluate(() => {
             const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
@@ -1299,7 +2540,7 @@ async function clickBuy(page, eventAddress = null) {
         }
 
         if (found && found.ok) return true;
-        await delay(cfg.TIMEOUTS.CLICK_BUY_DELAY);
+        await delay(getCfg().TIMEOUTS.CLICK_BUY_DELAY);
     }
     
     // FALLBACK: If button not found/clickable, navigate directly to /koltuk-secim
@@ -1983,7 +3224,7 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
     const alt = String(alternativeCategory || '').trim();
     const reCat = new RegExp(cat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
     const reAlt = alt ? new RegExp(alt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') : null;
-    const UNAVAILABLE_TEXT = 'şu anda uygun bilet bulunamamaktadır';
+    const UNAVAILABLE_TEXT = 'şu anda uygun bilet bulunmamaktadır';
 
     const mode = String(selectionMode || 'legacy').toLowerCase();
 
@@ -2523,7 +3764,7 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
     // Dropdown path: legacy mode, or scan when SVG not found / failed
     if (!useSvgFlow || proceedToDropdown) {
         await (async () => {
-    for (let i = 0; i < cfg.TIMEOUTS.CATEGORY_SELECTION_RETRIES; i++) {
+    for (let i = 0; i < getCfg().TIMEOUTS.CATEGORY_SELECTION_RETRIES; i++) {
         const cur = (() => { try { return page.url(); } catch { return ''; } })();
         if (/\/giris(\?|$)/i.test(cur)) throw new Error('Kategori seçimi login sayfasında yapılamaz');
         if (isHomeUrl(cur)) {
@@ -2531,10 +3772,10 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
         }
         const ok = await page.evaluate(() => {
             const selectBox = document.querySelector('.custom-select-box');
-            return selectBox && selectBox.offsetParent !== null; // Görünür olup olmadığını kontrol et
+            return selectBox && selectBox.offsetParent !== null;
         });
         if (ok) break;
-        await delay(cfg.DELAYS.CATEGORY_SELECTION);
+        await delay(getCfg().DELAYS.CATEGORY_SELECTION);
     }
 
     const beforeWait = (() => { try { return page.url(); } catch { return ''; } })();
@@ -2542,14 +3783,155 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
         if (/\/giris(\?|$)/i.test(beforeWait)) throw new Error('Kategori seçimi login sayfasında yapılamaz');
         throw new Error('Koltuk seçim sayfasına ulaşılamadı (giriş yapılmamış veya oturum sonlandı). Şu an: ' + (beforeWait || 'bilinmiyor'));
     }
+
+    // Step 0: Remove .form-control-disabled overlays that block clicks on Angular form groups
+    try {
+        await page.evaluate(() => {
+            const overlays = document.querySelectorAll('.form-control-disabled');
+            for (const el of overlays) {
+                try { el.style.setProperty('display', 'none', 'important'); } catch {}
+                try { el.style.setProperty('pointer-events', 'none', 'important'); } catch {}
+            }
+        });
+    } catch {}
+
+    // Step 1: Select "Üyelik / Kampanya Tipi" (membership/campaign type) — required before category options load
+    try {
+        const membershipResult = await page.evaluate(() => {
+            const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+            const selects = Array.from(document.querySelectorAll('select.form-control'));
+            // Find the membership/campaign type select (has "Üyelik" or "Kampanya" in placeholder)
+            const memberSelect = selects.find(s => {
+                const opts = Array.from(s.options || []);
+                return opts.some(o => norm(o.textContent).includes('üyelik') || norm(o.textContent).includes('kampanya'));
+            });
+            if (!memberSelect) return { ok: false, reason: 'no_membership_select' };
+
+            const opts = Array.from(memberSelect.options || []);
+            const currentVal = memberSelect.value;
+            // If already selected (not placeholder), skip
+            if (currentVal && !/^0:\s*null$/i.test(currentVal)) {
+                return { ok: true, already: true, value: currentVal, text: norm(memberSelect.options[memberSelect.selectedIndex]?.textContent || '') };
+            }
+
+            // Select first non-placeholder option (e.g. "Genel Satış")
+            const validOpt = opts.find(o => o.value && !/^0:\s*null$/i.test(o.value) && !o.disabled);
+            if (!validOpt) return { ok: false, reason: 'no_valid_option', optionCount: opts.length };
+
+            memberSelect.value = validOpt.value;
+            memberSelect.dispatchEvent(new Event('input', { bubbles: true }));
+            memberSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            // Angular change detection
+            try { memberSelect.dispatchEvent(new Event('ngModelChange', { bubbles: true })); } catch {}
+            return { ok: true, selected: true, value: validOpt.value, text: norm(validOpt.textContent) };
+        });
+        logger.info('categoryBlock:membership_type_select', membershipResult);
+
+        if (membershipResult?.selected) {
+            // Wait for Angular to react and populate category options
+            await delay(1500);
+            // Re-disable overlays that may re-appear after Angular renders
+            try {
+                await page.evaluate(() => {
+                    const overlays = document.querySelectorAll('.form-control-disabled');
+                    for (const el of overlays) {
+                        try { el.style.setProperty('display', 'none', 'important'); } catch {}
+                        try { el.style.setProperty('pointer-events', 'none', 'important'); } catch {}
+                    }
+                });
+            } catch {}
+        }
+    } catch (e) {
+        logger.warn('categoryBlock:membership_type_select_failed', { error: e?.message || String(e) });
+    }
+
     try {
         await page.waitForSelector('.custom-select-box', { visible: true, timeout: 15000 });
     } catch (e) {
+        // Some events render category as a native <select> (no .custom-select-box). We'll handle that below.
         const after = (() => { try { return page.url(); } catch { return ''; } })();
         if (/\/giris(\?|$)/i.test(after)) throw new Error('Kategori seçimi login sayfasında yapılamaz');
         if (isHomeUrl(after)) throw new Error('Koltuk seçim sayfasına ulaşılamadı (ana sayfaya yönlendirildi - giriş yapılmamış veya oturum sonlandı)');
-        throw e;
     }
+
+    // Prefer native <select> category when present (matches the UI in the screenshot).
+    try {
+        const didNative = await page.evaluate((catText, altText, scanMode) => {
+            const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+            const wantCat = norm(catText);
+            const wantAlt = norm(altText);
+
+            const isVisible = (el) => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect?.();
+                if (!r || r.width < 2 || r.height < 2) return false;
+                const st = window.getComputedStyle(el);
+                if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || '1') === 0)) return false;
+                return true;
+            };
+
+            const selectsAll = Array.from(document.querySelectorAll('select'));
+            const selects = selectsAll.filter(isVisible);
+            if (!selects.length) return { ok: false, reason: 'no_select' };
+
+            const hasTicketish = (s) => {
+                try {
+                    const opts = Array.from(s.options || []).map(o => norm(o.textContent || o.innerText || ''));
+                    return opts.some(t => t.includes('kategori')) && opts.some(t => /₺|try|tl/i.test(t));
+                } catch { return false; }
+            };
+
+            // First: try select whose options contain the requested category text.
+            const findByDesiredText = (arr) => {
+                for (const s of arr) {
+                    try {
+                        const opts = Array.from(s.options || []);
+                        const texts = opts.map(o => norm(o.textContent || o.innerText || ''));
+                        const hit = texts.some(t => (wantCat && t.includes(wantCat)) || (wantAlt && t.includes(wantAlt)));
+                        if (hit) return s;
+                    } catch {}
+                }
+                return null;
+            };
+
+            const pickSelect = findByDesiredText(selects) || selects.find(hasTicketish) || selects.find(s => {
+                const id = norm(s.id);
+                const name = norm(s.getAttribute('name') || '');
+                return id.includes('kategori') || name.includes('kategori') || id.includes('category') || name.includes('category');
+            }) || null;
+            if (!pickSelect) return { ok: false, reason: 'no_match_select' };
+
+            const opts = Array.from(pickSelect.options || []);
+            const texts = opts.map(o => norm(o.textContent || o.innerText || ''));
+
+            let idx = -1;
+            if (scanMode) {
+                idx = texts.findIndex(t => t && t !== 'kategori' && !t.includes('uygun bilet bulunamamaktadır'));
+            } else {
+                idx = texts.findIndex(t => (wantCat && t.includes(wantCat)) || (wantAlt && t.includes(wantAlt)));
+            }
+            if (idx < 0) return { ok: false, reason: 'no_option' };
+
+            try {
+                pickSelect.value = opts[idx].value;
+                pickSelect.dispatchEvent(new Event('input', { bubbles: true }));
+                pickSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            } catch {}
+            return { ok: true, idx, selectedText: (opts[idx].textContent || '').trim() };
+        }, cat, alt, mode === 'scan');
+
+        if (didNative?.ok) {
+            logger.info('categoryBlock:native_select_used', { selectedText: didNative.selectedText });
+            const uiReadyNative = await page.waitForFunction(() => {
+                const blocks = document.querySelector('select#blocks');
+                const blocksOk = !!(blocks && blocks.options && blocks.options.length > 1);
+                const seatBtn = !!document.getElementById('custom_seat_button');
+                const seatNodes = document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect').length;
+                return blocksOk || seatBtn || seatNodes > 0;
+            }, { timeout: 15000 }).then(() => true).catch(() => false);
+            if (uiReadyNative) return;
+        }
+    } catch {}
 
     // open dropdown + choose category
     const optSel = '.dropdown-option:not(.disabled), .dropdown-option, [role="option"], .dropdown-menu [role="menuitem"], .dropdown-menu .dropdown-item';
@@ -2650,18 +4032,40 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
         // ESC fallback: bazı overlay/modallar click yemeden kapanıyor
         try { await page.keyboard.press('Escape'); } catch {}
 
-        // .custom-select-box'a gerçek mouse click (SPA handler için daha stabil)
+        // Remove .form-control-disabled overlay before each click attempt
+        try {
+            await page.evaluate(() => {
+                document.querySelectorAll('.form-control-disabled').forEach(el => {
+                    try { el.style.setProperty('display', 'none', 'important'); } catch {}
+                    try { el.style.setProperty('pointer-events', 'none', 'important'); } catch {}
+                });
+            });
+        } catch {}
+
+        // Click .custom-select-box to open the category dropdown
         let optTexts = [];
         let options = [];
         try {
-            const box = await page.$('.custom-select-box');
-            const bb = box ? await box.boundingBox() : null;
-            if (bb) {
-                await page.mouse.move(bb.x + (bb.width / 2), bb.y + (bb.height / 2));
-                await page.mouse.down();
-                await page.mouse.up();
-            } else {
-                await page.click('.custom-select-box', { delay: 30 });
+            // Primary: Angular-compatible evaluate click
+            await page.evaluate(() => {
+                const box = document.querySelector('.custom-select-box');
+                if (!box) return;
+                try { box.scrollIntoView({ block: 'center' }); } catch {}
+                box.click();
+            });
+            await delay(300);
+
+            // Check if options appeared
+            let hasOpts = await page.evaluate((sel) => document.querySelectorAll(sel).length > 0, optSel).catch(() => false);
+
+            // Fallback: real mouse click if evaluate click didn't work
+            if (!hasOpts) {
+                const box = await page.$('.custom-select-box');
+                const bb = box ? await box.boundingBox() : null;
+                if (bb) {
+                    await page.mouse.click(bb.x + (bb.width / 2), bb.y + (bb.height / 2), { delay: 50 });
+                    await delay(300);
+                }
             }
         } catch {}
         try {
@@ -2669,7 +4073,28 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
             optTexts = await page.$$eval(optSel, els => els.map(el => (el.innerText || el.textContent || '').trim()).filter(Boolean));
             options = await page.$$(optSel);
         } catch (e) {
-            logger.warn('categoryBlock:dropdown_options_missing', { attempt: attempt + 1, error: e?.message || String(e) });
+            // Diagnostic: what's actually inside .custom-select-box after click?
+            const clickDiag = await page.evaluate(() => {
+                const box = document.querySelector('.custom-select-box');
+                if (!box) return { boxExists: false };
+                const children = Array.from(box.querySelectorAll('*')).map(el => ({
+                    tag: el.tagName,
+                    cls: (el.className || '').toString().slice(0, 60),
+                    text: (el.textContent || '').trim().slice(0, 80),
+                    visible: el.offsetParent !== null
+                })).slice(0, 20);
+                const overlay = document.querySelector('.form-control-disabled');
+                const overlayStyle = overlay ? window.getComputedStyle(overlay) : null;
+                return {
+                    boxExists: true,
+                    boxText: (box.textContent || '').trim().slice(0, 200),
+                    childCount: box.querySelectorAll('*').length,
+                    children,
+                    overlayDisplay: overlayStyle?.display || 'N/A',
+                    overlayPointerEvents: overlayStyle?.pointerEvents || 'N/A'
+                };
+            }).catch(() => ({}));
+            logger.warn('categoryBlock:dropdown_options_missing', { attempt: attempt + 1, error: e?.message || String(e), clickDiag });
         }
 
         if (!options || !options.length || !optTexts || !optTexts.length) {
@@ -2677,100 +4102,176 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
             continue;
         }
 
-        let selectedText = null;
-        let idx = -1;
-        if (mode === 'scan') {
-            idx = optTexts.findIndex((text) => {
+        // Read previously tried categories from page state
+        const triedSet = await page.evaluate(() => {
+            try { return Array.from(window.__passobotTriedCategories || []); } catch { return []; }
+        }).catch(() => []);
+
+        // Build priority-sorted list: preferred → alternative → available rest → unavailable rest
+        const validOpts = optTexts
+            .map((text, i) => {
                 const t = String(text || '').trim().toLowerCase();
-                if (!t) return false;
-                if (t === 'kategori') return false;
-                if (t.includes(UNAVAILABLE_TEXT)) return false;
+                const firstLine = String(text || '').split('\n')[0].trim();
+                const isUnavailable = t.includes(UNAVAILABLE_TEXT);
+                return { text, firstLine, i, isUnavailable };
+            })
+            .filter(o => {
+                const t = String(o.text || '').trim().toLowerCase();
+                if (!t || t === 'kategori') return false;
                 return true;
             });
-            if (idx < 0) {
-                await delay(600);
-                continue;
-            }
-            selectedText = optTexts[idx];
-            logger.info('categoryBlock:scan_selected', { idx, selectedText });
-        } else {
-            selectedText = optTexts.find(text => reCat.test(text) || (reAlt ? reAlt.test(text) : false));
-            if (!selectedText) {
-                await delay(600);
-                continue;
-            }
-            idx = optTexts.findIndex(t => t === selectedText);
-            logger.info('categoryBlock:legacy_selected', { idx, selectedText, categoryType: cat, alternativeCategory: alt || null });
+
+        // Sort: preferred first, alternative second, available before unavailable, then original order
+        const sorted = validOpts.sort((a, b) => {
+            const aText = String(a.text || '');
+            const bText = String(b.text || '');
+            const aIsPref = reCat.test(aText) ? 0 : (reAlt && reAlt.test(aText) ? 1 : 2);
+            const bIsPref = reCat.test(bText) ? 0 : (reAlt && reAlt.test(bText) ? 1 : 2);
+            if (aIsPref !== bIsPref) return aIsPref - bIsPref;
+            // Available before unavailable
+            if (a.isUnavailable !== b.isUnavailable) return a.isUnavailable ? 1 : -1;
+            return a.i - b.i;
+        });
+
+        // Filter out already tried categories (but keep them if all have been tried → reset)
+        let candidates = sorted.filter(o => !triedSet.includes(String(o.firstLine || o.text || '').trim()));
+        if (!candidates.length) {
+            // All categories tried → reset and try again
+            await page.evaluate(() => { try { window.__passobotTriedCategories = new Set(); } catch {} }).catch(() => {});
+            candidates = sorted;
         }
 
-        const btn = options[idx] || null;
-        if (!btn) {
+        if (!candidates.length) {
             await delay(600);
             continue;
         }
-        try { await btn.click(); } catch {}
-        try {
-            const bb = await btn.boundingBox();
-            if (bb) {
-                await page.mouse.move(bb.x + (bb.width / 2), bb.y + (bb.height / 2));
-                await page.mouse.down();
-                await page.mouse.up();
-            }
-        } catch {}
 
-        // Seçim UI'ya yansıdı mı? ("Kategori" gibi placeholder'dan çıkmalı)
-        let selectionOk = false;
-        try {
-            await page.waitForFunction((txt) => {
-                const sel = document.querySelector('.custom-select-box .selected-option');
-                const v = (sel?.innerText || sel?.textContent || '').trim().toLowerCase();
-                if (!v) return false;
-                if (v === 'kategori') return false;
-                return v.includes(String(txt || '').trim().toLowerCase());
-            }, { timeout: 9000 }, selectedText);
-            selectionOk = true;
-        } catch (e) {
-            const diag = await page.evaluate(() => {
-                const sel = document.querySelector('.custom-select-box .selected-option');
-                return {
-                    url: location.href,
-                    title: document.title,
-                    selectedOption: (sel?.innerText || sel?.textContent || '').trim(),
-                    hasTurnstileWidget: !!document.querySelector('.cf-turnstile'),
-                    hasTurnstileTokenField: !!document.querySelector('input[name="cf-turnstile-response"]')
-                };
-            }).catch(() => null);
-            logger.warn('categoryBlock:selected_option_verify_failed', { attempt: attempt + 1, error: e?.message || String(e), diag });
+        const availableCount = candidates.filter(c => !c.isUnavailable).length;
+        const unavailableCount = candidates.filter(c => c.isUnavailable).length;
+        logger.info('categoryBlock:candidates', {
+            total: validOpts.length,
+            available: availableCount,
+            unavailable: unavailableCount,
+            tried: triedSet.length,
+            trying: candidates.map(c => c.firstLine).slice(0, 6),
+            mode
+        });
+
+        // Try each candidate category until one has blocks/seats
+        let categoryFound = false;
+        for (let ci = 0; ci < candidates.length; ci++) {
+            const candidate = candidates[ci];
+            const { text: selectedText, firstLine, i: idx, isUnavailable } = candidate;
+            const btn = options[idx] || null;
+            if (!btn) continue;
+
+            // UI status: show which category is being checked
+            logger.info(`📋 Kategori kontrol ediliyor [${ci + 1}/${candidates.length}]: ${firstLine}${isUnavailable ? ' (bilet yok işaretli)' : ''}`, {
+                category: firstLine,
+                index: ci + 1,
+                total: candidates.length,
+                unavailable: isUnavailable,
+                mode
+            });
+
+            // Click the category option
+            try { await btn.click(); } catch {}
+            try {
+                const bb = await btn.boundingBox();
+                if (bb) {
+                    await page.mouse.move(bb.x + (bb.width / 2), bb.y + (bb.height / 2));
+                    await page.mouse.down();
+                    await page.mouse.up();
+                }
+            } catch {}
+
+            // Mark as tried (use firstLine for consistent tracking)
+            await page.evaluate((txt) => {
+                try {
+                    if (!window.__passobotTriedCategories) window.__passobotTriedCategories = new Set();
+                    window.__passobotTriedCategories.add(String(txt || '').trim());
+                } catch {}
+            }, firstLine).catch(() => {});
+
+            // Verify selection reflected in UI (compare firstLine only, not full multiline text)
+            // Unavailable categories may be rejected by Angular → shorter timeout
+            const verifyTimeout = isUnavailable ? 2000 : 5000;
+            let selectionOk = false;
+            try {
+                await page.waitForFunction((txt) => {
+                    const sel = document.querySelector('.custom-select-box .selected-option');
+                    const v = (sel?.innerText || sel?.textContent || '').trim().toLowerCase();
+                    if (!v || v === 'kategori') return false;
+                    return v.includes(String(txt || '').trim().toLowerCase());
+                }, { timeout: verifyTimeout }, firstLine);
+                selectionOk = true;
+            } catch {}
+
+            if (!selectionOk) {
+                logger.info(`⏭️ Kategori atlandı: ${firstLine}${isUnavailable ? ' — uygun bilet yok' : ' — seçim yapılamadı'}`, {
+                    category: firstLine, unavailable: isUnavailable
+                });
+                continue;
+            }
+
+            // Wait for blocks/seats to load for this category
+            const uiReady = await page.waitForFunction(() => {
+                const blocks = document.querySelector('select#blocks');
+                const blocksOk = !!(blocks && blocks.options && blocks.options.length > 1);
+                const seatBtn = !!document.getElementById('custom_seat_button');
+                const seatNodes = document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect').length;
+                return blocksOk || seatBtn || seatNodes > 0;
+            }, { timeout: 8000 }).then(() => true).catch(() => false);
+
+            if (uiReady) {
+                logger.info(`✅ Kategori seçildi: ${firstLine} — bloklar yüklendi`, { category: firstLine, idx });
+                categoryFound = true;
+                break;
+            }
+
+            // This category has no blocks/seats → try next
+            logger.info(`❌ Kategori boş: ${firstLine} — blok/koltuk bulunamadı, sonraki deneniyor`, {
+                category: firstLine, unavailable: isUnavailable
+            });
+
+            // Re-open dropdown for next candidate
+            if (ci < candidates.length - 1) {
+                try {
+                    await page.evaluate(() => {
+                        document.querySelectorAll('.form-control-disabled').forEach(el => {
+                            try { el.style.setProperty('display', 'none', 'important'); } catch {}
+                            try { el.style.setProperty('pointer-events', 'none', 'important'); } catch {}
+                        });
+                        const box = document.querySelector('.custom-select-box');
+                        if (box) { box.scrollIntoView({ block: 'center' }); box.click(); }
+                    });
+                    await delay(400);
+                    // Re-read options (they may have changed)
+                    try {
+                        const newOpts = await page.$$eval(optSel, els => els.map(el => (el.innerText || el.textContent || '').trim()).filter(Boolean));
+                        if (newOpts.length) {
+                            optTexts.splice(0, optTexts.length, ...newOpts);
+                            const newHandles = await page.$$(optSel);
+                            options.splice(0, options.length, ...newHandles);
+                        }
+                    } catch {}
+                } catch {}
+            }
         }
 
-        // Kategori seçildikten sonra UI'nin devamını bekle: blocks veya seat button veya seatmap.
-        const uiReady = await page.waitForFunction(() => {
-            const blocks = document.querySelector('select#blocks');
-            const blocksOk = !!(blocks && blocks.options && blocks.options.length > 1);
-            const seatBtn = !!document.getElementById('custom_seat_button');
-            const seatNodes = document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect').length;
-            return blocksOk || seatBtn || seatNodes > 0;
-        }, { timeout: 12000 }).then(() => true).catch(() => false);
+        if (categoryFound) break;
 
-        if (selectionOk && uiReady) break;
-
-        const diag = await page.evaluate(() => {
-            const blocks = document.querySelector('select#blocks');
-            return {
-                url: location.href,
-                title: document.title,
-                selectedOption: (document.querySelector('.custom-select-box .selected-option')?.textContent || '').trim(),
-                hasBlocksSelect: !!blocks,
-                blocksOptionLen: blocks?.options?.length || 0,
-                hasSeatButton: !!document.getElementById('custom_seat_button'),
-                seatNodeCount: document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect').length
-            };
-        }).catch(() => null);
-        logger.warn('categoryBlock:cycle_retry', { attempt: attempt + 1, selectionOk, uiReady, diag });
+        // All categories checked, none had seats
+        if (!categoryFound && candidates.length > 0) {
+            logger.info(`⚠️ Tüm kategoriler kontrol edildi (${candidates.length} adet) — hiçbirinde uygun koltuk bulunamadı, tekrar denenecek`, {
+                checkedCount: candidates.length,
+                categories: candidates.map(c => c.firstLine)
+            });
+        }
         await delay(600);
     }
 
-    const blocksTimeout = Math.max(cfg.TIMEOUTS.BLOCKS_WAIT_TIMEOUT || 0, 10000);
+    const blocksTimeout = Math.max(getCfg().TIMEOUTS.BLOCKS_WAIT_TIMEOUT || 0, 10000);
     logger.info('categoryBlock:waiting_for_blocks', { blocksTimeout });
     let blocksReady = false;
     let lastBlocksDiag = null;
@@ -2844,6 +4345,14 @@ async function startBot(req, res) {
         return res.status(400).json({error: formatError('INVALID_REQUEST_DATA')});
     }
 
+    const runCfg = configRoot.createRunConfigFromOverrides(validatedData.panelSettings);
+    return withRunCfg(runCfg, async () => {
+        applyAnticaptchaFromCfg(getCfg());
+        return startBotAfterValidation(req, res, validatedData);
+    });
+}
+
+async function startBotAfterValidation(req, res, validatedData) {
     const {
         team, ticketType, eventAddress, categoryType, alternativeCategory,
         categorySelectionMode,
@@ -2902,9 +4411,9 @@ async function startBot(req, res) {
         const hasTrailingSep = /[\\\/]$/.test(base);
         return `${base}${hasTrailingSep ? '' : '/'}${suffix}`;
     };
-    const userDataDirA = buildRunUserDataDir(cfg.USER_DATA_DIR_A, 'A');
-    const userDataDirB = buildRunUserDataDir(cfg.USER_DATA_DIR_B, 'B');
-    const userDataDirC = buildRunUserDataDir(cfg.USER_DATA_DIR_B, 'C');
+    const userDataDirA = buildRunUserDataDir(getCfg().USER_DATA_DIR_A, 'A');
+    const userDataDirB = buildRunUserDataDir(getCfg().USER_DATA_DIR_B, 'B');
+    const userDataDirC = buildRunUserDataDir(getCfg().USER_DATA_DIR_B, 'C');
     const audit = (event, meta = {}, level = 'info') => {
         const payload = {
             runId,
@@ -2924,11 +4433,100 @@ async function startBot(req, res) {
     let currentHolder = null; // 'A' | 'B'
     let currentSeatInfo = null;
     let currentCatBlock = null;
+
+    /** Arayüz: eşleşme tablosu (GET /run/:id/status → pairDashboard). */
+    let dashboardPairs = [];
+    const dashboardMeta = { cTargetPairIndex: 1 };
+
+    const fmtSeatLabel = (si) => {
+        if (!si) return '—';
+        try {
+            if (si.combined) return String(si.combined).trim();
+            const parts = [si.row, si.seat].filter(Boolean).map(String);
+            if (parts.length) return parts.join(' / ');
+            if (si.seatId) return String(si.seatId);
+        } catch {}
+        return '—';
+    };
+
+    /** Tek çift + panelde yanlış C eşleşme # ile canlı tutucu/koltuk hiç satıra yazılmamasını önler. */
+    const resolveDashboardCTarget = () => {
+        let cTarget = Math.max(1, Number(dashboardMeta.cTargetPairIndex) || 1);
+        try {
+            const st = runStore.get(runId);
+            if (st && st.cTransferPairIndex != null) {
+                const w = parseInt(String(st.cTransferPairIndex).trim(), 10);
+                if (Number.isFinite(w) && w >= 1) cTarget = w;
+            }
+        } catch {}
+        const pairIndices = dashboardPairs
+            .map((p) => Number(p.pairIndex))
+            .filter((n) => Number.isFinite(n) && n >= 1);
+        const maxPair = pairIndices.length ? Math.max(...pairIndices) : 1;
+        if (dashboardPairs.length === 1) {
+            cTarget = Number(dashboardPairs[0].pairIndex) || 1;
+        } else if (cTarget > maxPair) {
+            cTarget = maxPair;
+        }
+        dashboardMeta.cTargetPairIndex = cTarget;
+        return cTarget;
+    };
+
+    const syncDashboardToRunStore = () => {
+        try {
+            if (!dashboardPairs.length) return;
+            const cTarget = resolveDashboardCTarget();
+            const merged = dashboardPairs.map((p) => {
+                const idx = Number(p.pairIndex);
+                const isTarget = Number.isFinite(idx) && idx === cTarget;
+                const row = { ...p, isCTarget: isTarget };
+                if (isTarget) {
+                    row.holder = currentHolder;
+                    row.seatLabel = fmtSeatLabel(currentSeatInfo) || row.seatLabel || '—';
+                    row.seatId = currentSeatInfo?.seatId ? String(currentSeatInfo.seatId) : row.seatId;
+                    if (currentSeatInfo) {
+                        row.tribune = currentSeatInfo.tribune ?? row.tribune ?? null;
+                        row.seatRow = currentSeatInfo.row ?? row.seatRow ?? null;
+                        row.seatNumber = currentSeatInfo.seat ?? row.seatNumber ?? null;
+                    }
+                }
+                return row;
+            });
+            runStore.upsert(runId, {
+                pairDashboard: {
+                    mode: isMulti ? 'multi' : 'single',
+                    pairCount: merged.length,
+                    cTargetPairIndex: cTarget,
+                    pairs: merged,
+                    updatedAt: new Date().toISOString()
+                }
+            });
+        } catch {}
+    };
+
     const setHolder = (role, seatInfo, catBlock) => {
         currentHolder = role;
         if (seatInfo) currentSeatInfo = seatInfo;
         if (catBlock) currentCatBlock = catBlock;
+        try {
+            if (dashboardPairs.length) {
+                const cTarget = resolveDashboardCTarget();
+                dashboardPairs = dashboardPairs.map((p) => {
+                    if (Number(p.pairIndex) !== cTarget) return p;
+                    const next = { ...p, holder: role };
+                    if (seatInfo) {
+                        next.seatId = seatInfo.seatId ? String(seatInfo.seatId) : next.seatId;
+                        next.seatLabel = fmtSeatLabel(seatInfo) || next.seatLabel || '—';
+                        next.tribune = seatInfo.tribune ?? next.tribune ?? null;
+                        next.seatRow = seatInfo.row ?? next.seatRow ?? null;
+                        next.seatNumber = seatInfo.seat ?? next.seatNumber ?? null;
+                    }
+                    return next;
+                });
+            }
+        } catch {}
         try { audit('holder_updated', { holder: currentHolder, seatId: currentSeatInfo?.seatId || null }); } catch {}
+        try { syncDashboardToRunStore(); } catch {}
     };
 
     const getFinalizeRequest = () => {
@@ -2949,6 +4547,8 @@ async function startBot(req, res) {
         if (!cAcc?.email || !cAcc?.password) throw new Error('FINALIZE_C_ACCOUNT_MISSING');
         if (!currentSeatInfo?.seatId) throw new Error('FINALIZE_SEATID_MISSING');
         if (!currentHolder) throw new Error('FINALIZE_HOLDER_UNKNOWN');
+
+        try { clearPassiveSessionWatch(); } catch {}
 
         // Prefer finalize payload sensitive fields (identity/card) over initial request values.
         const identityFinal = (finMeta?.identity != null && String(finMeta.identity).trim()) ? String(finMeta.identity).trim() : (identity != null ? String(identity).trim() : null);
@@ -3000,6 +4600,7 @@ async function startBot(req, res) {
         });
         setStep('C.gotoEvent.done', { snap: await snapshotPage(pageC, 'C.afterEventGoto') });
 
+        await installRecaptchaCallbackInterceptor(pageC);
         setStep('C.clickBuy.start');
         await clickBuy(pageC, eventAddress);
         setStep('C.clickBuy.done');
@@ -3027,21 +4628,23 @@ async function startBot(req, res) {
 
         try {
             setStep('C.turnstile.preRelease.ensure.start');
-            await ensureTurnstileTokenOnPage(pageC, cAcc.email, 'C.seatSelection', { background: false });
+            await ensureCaptchaOnPage(pageC, cAcc.email, 'C.seatSelection', { background: false });
             setStep('C.turnstile.preRelease.ensure.done');
-        } catch {}
+        } catch (e) {
+            logger.warnSafe('finalize C.seatSelection captcha (ilk)', { error: e?.message || String(e) });
+            throw e;
+        }
+
+        setStep('C.turnstile.preRelease.waitToken.start');
+        await waitUntilFinalizeCHumanChallengeReady(pageC, cAcc.email);
+        setStep('C.turnstile.preRelease.waitToken.done');
 
         try {
-            const tokenState = await pageC.evaluate(() => {
-                const input = document.querySelector('input[name="cf-turnstile-response"]');
-                const tokenLen = input?.value ? input.value.length : 0;
-                const hasWidget = !!document.querySelector('.cf-turnstile');
-                return { hasWidget, tokenLen };
-            }).catch(() => null);
+            const tokenState = await readFinalizeCChallengeTokens(pageC);
             audit('finalize_c_turnstile_pre_release', { cEmail: cAcc.email, seatId: currentSeatInfo?.seatId || null, tokenState });
         } catch {}
 
-        // IMPORTANT: Do not remove from holder until C is ready on category/seat selection.
+        // IMPORTANT: Holder sepetten kaldırmadan önce C tarafında doğrulama token'ı hazır (yukarıdaki bekleme).
         audit('finalize_c_ready_for_release', {
             cEmail: cAcc.email,
             holder: currentHolder,
@@ -3065,7 +4668,7 @@ async function startBot(req, res) {
         let removed = false;
         for (let attempt = 1; attempt <= 3; attempt++) {
             if (removed) break;
-            removed = await clickRemoveFromCartAndConfirm(holderPage, cfg.TIMEOUTS.REMOVE_FROM_CART_TIMEOUT);
+            removed = await clickRemoveFromCartAndConfirm(holderPage, getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT);
             if (removed) break;
             try {
                 await gotoWithRetry(holderPage, 'https://www.passo.com.tr/tr/sepet', {
@@ -3081,11 +4684,21 @@ async function startBot(req, res) {
         if (!removed) throw new Error('FINALIZE_HOLDER_REMOVE_FAILED');
         audit('finalize_holder_remove_done', { holder: currentHolder, holderEmail, seatId: currentSeatInfo?.seatId || null });
 
-        const exactMaxMs = Math.max(30000, Math.min(cfg.TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 180000));
+        const exactMaxMs = Math.max(30000, Math.min(getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 180000));
         try { await delay(350); } catch {}
         try { await reloginIfRedirected(pageC, cAcc.email, cAcc.password); } catch {}
         try { await ensureUrlContains(pageC, '/koltuk-secim', { retries: 1, waitMs: 9000, backoffMs: 450 }); } catch {}
-        try { await ensureTurnstileTokenOnPage(pageC, cAcc.email, 'C.seatSelection', { background: false }); } catch {}
+        try {
+            setStep('C.afterRelease.captcha.ensure.start');
+            await ensureCaptchaOnPage(pageC, cAcc.email, 'C.afterRelease.seatSelection', { background: false });
+            setStep('C.afterRelease.captcha.ensure.done');
+        } catch (e) {
+            logger.warnSafe('finalize C.afterRelease captcha', { error: e?.message || String(e) });
+            throw e;
+        }
+        setStep('C.afterRelease.waitToken.start');
+        await waitUntilFinalizeCHumanChallengeReady(pageC, cAcc.email);
+        setStep('C.afterRelease.waitToken.done');
 
         try {
             if (currentSeatInfo && !currentSeatInfo.svgBlockId) {
@@ -3139,7 +4752,7 @@ async function startBot(req, res) {
 
         setStep('C.clickContinue.start');
         await clickContinueInsidePage(pageC);
-        await delay(cfg.DELAYS.AFTER_CONTINUE);
+        await delay(getCfg().DELAYS.AFTER_CONTINUE);
         setStep('C.clickContinue.done', { snap: await snapshotPage(pageC, 'C.afterContinue') });
 
         // Payment / TCKN flow (best-effort; does not click final PAY)
@@ -3222,19 +4835,52 @@ async function startBot(req, res) {
         if (finalizeWatch) return;
         finalizeWatch = setInterval(() => {
             try {
+                if (finalizedToCResult) return;
                 if (finalizeInFlight) return;
                 const fin = getFinalizeRequest();
                 if (!fin?.requested) return;
                 if (!fin?.cAccount?.email || !fin?.cAccount?.password) return;
                 if (!currentSeatInfo?.seatId || !currentHolder) return;
-                finalizeInFlight = Promise.resolve()
-                    .then(finalizeToC)
-                    .catch((e) => {
+                const run = (async () => {
+                    try {
+                        return await finalizeToC();
+                    } catch (e) {
                         try { audit('finalize_failed', { error: e?.message || String(e), seatId: currentSeatInfo?.seatId || null }, 'warn'); } catch {}
                         throw e;
-                    });
+                    }
+                })();
+                finalizeInFlight = run;
+                run.finally(() => {
+                    try {
+                        if (finalizeInFlight === run) finalizeInFlight = null;
+                    } catch {}
+                });
             } catch {}
         }, 1000);
+    };
+
+    /** Finalize panelden istendiğinde basket loop / pasif B oturum ping'i ile yarışmayı keser. */
+    const pauseForFinalizeIfRequested = async (label) => {
+        const fin = getFinalizeRequest();
+        if (!fin?.requested || !fin?.cAccount?.email || !fin?.cAccount?.password) return null;
+        if (finalizedToCResult) return 'done';
+        try { ensureFinalizeWatcher(); } catch {}
+        try { clearPassiveSessionWatch(); } catch {}
+        for (let i = 0; i < 150 && !finalizeInFlight && !finalizedToCResult; i++) {
+            await delay(100);
+        }
+        if (finalizedToCResult) return 'done';
+        if (!finalizeInFlight) {
+            try { audit('finalize_pause_no_inflight', { label }); } catch {}
+            return null;
+        }
+        try {
+            await finalizeInFlight;
+        } catch {
+            return 'error';
+        }
+        if (finalizedToCResult) return 'done';
+        return 'error';
     };
 
     let browserA, pageA, browserB, pageB;
@@ -3242,6 +4888,9 @@ async function startBot(req, res) {
     let multiBrowsers = [];
     let basketTimer;
     let basketMonitor;
+    let passiveSessionWatch = null;
+    let passiveSessionEarlyTimer = null;
+    let passiveSeatTouchBusy = false;
     let dynamicTimingCheck;
     let finalizeWatch;
     let finalizeInFlight;
@@ -3286,6 +4935,88 @@ async function startBot(req, res) {
         }
     };
 
+    const clearPassiveSessionWatch = () => {
+        try {
+            if (passiveSessionWatch) clearInterval(passiveSessionWatch);
+        } catch {}
+        passiveSessionWatch = null;
+        try {
+            if (passiveSessionEarlyTimer) clearTimeout(passiveSessionEarlyTimer);
+        } catch {}
+        passiveSessionEarlyTimer = null;
+    };
+
+    /** Sepet A'dayken B koltuk sayfasında beklerken (veya döngüde tersi) oturum düşerse toparlar. */
+    const touchPassiveSeatWaiter = async (page, email, password, recoveryUrl, label) => {
+        if (!page) return;
+        if (passiveSeatTouchBusy) return;
+        passiveSeatTouchBusy = true;
+        try {
+            try {
+                const fr = getFinalizeRequest();
+                if (fr?.requested && fr?.cAccount?.email) return;
+            } catch {}
+            try {
+                await reloginIfRedirected(page, email, password);
+            } catch {}
+            let u = (() => {
+                try {
+                    return String(page.url() || '');
+                } catch {
+                    return '';
+                }
+            })();
+            if (recoveryUrl && !u.includes('/koltuk-secim')) {
+                try {
+                    await gotoWithRetry(page, String(recoveryUrl), {
+                        retries: 1,
+                        waitUntil: 'domcontentloaded',
+                        expectedUrlIncludes: 'passo',
+                        rejectIfHome: false,
+                        backoffMs: 450
+                    });
+                } catch {}
+                try {
+                    await reloginIfRedirected(page, email, password);
+                } catch {}
+                try {
+                    await ensureUrlContains(page, '/koltuk-secim', { retries: 2, waitMs: 14000, backoffMs: 500 });
+                } catch {}
+            }
+            u = (() => {
+                try {
+                    return String(page.url() || '');
+                } catch {
+                    return '';
+                }
+            })();
+            try {
+                audit('passive_seat_session_ping', { label, email: email || null, url: u.slice(0, 240) });
+            } catch {}
+        } catch (e) {
+            try {
+                logger.warnSafe('touchPassiveSeatWaiter failed', { label, error: e?.message || String(e) });
+            } catch {}
+        } finally {
+            passiveSeatTouchBusy = false;
+        }
+    };
+
+    const startPassiveSeatWatch = (opts) => {
+        clearPassiveSessionWatch();
+        const ms = Math.max(10000, Number(getCfg()?.BASKET?.PASSIVE_SESSION_CHECK_MS) || 45000);
+        passiveSessionWatch = setInterval(() => {
+            touchPassiveSeatWaiter(opts.page, opts.email, opts.password, opts.recoveryUrl, opts.label).catch(() => {});
+        }, ms);
+        try {
+            const firstDelay = Math.min(15000, Math.max(4000, Math.floor(ms / 3)));
+            passiveSessionEarlyTimer = setTimeout(() => {
+                passiveSessionEarlyTimer = null;
+                touchPassiveSeatWaiter(opts.page, opts.email, opts.password, opts.recoveryUrl, `${opts.label}:early`).catch(() => {});
+            }, firstDelay);
+        } catch {}
+    };
+
     logger.infoSafe('Bot başlatılıyor', {
         team,
         ticketType,
@@ -3308,10 +5039,27 @@ async function startBot(req, res) {
         multi: isMulti,
         aCount: aList.length,
         bCount: bList.length,
-        transferTargetEmail: transferTargetEmail || null
+        transferTargetEmail: transferTargetEmail || null,
+        cTransferPairIndex: validatedData.cTransferPairIndex ?? 1
     });
 
     try {
+        const eventPathIncludes = (() => {
+            try {
+                const u = new URL(String(eventAddress));
+                return u.pathname || null;
+            } catch {
+                return null;
+            }
+        })();
+
+        let multiPostTransferReady = false;
+        let catBlockA = { categoryText: '', blockText: '', blockVal: '' };
+        let seatInfoA = null;
+        let seatInfoB = null;
+        let idProfileA = aList[0] || null;
+        let idProfileB = bList[0] || null;
+
         if (isMulti) {
             const poolMap = async (items, concurrency, handler) => {
                 const conc = Math.max(1, Number(concurrency) || 1);
@@ -3328,19 +5076,10 @@ async function startBot(req, res) {
                 return results;
             };
 
-            const eventPathIncludes = (() => {
-                try {
-                    const u = new URL(String(eventAddress));
-                    return u.pathname || null;
-                } catch {
-                    return null;
-                }
-            })();
-
             // 1) Prepare all B accounts to seat selection (ready state)
-            const multiAConcurrency = Math.max(1, Number(cfg?.MULTI?.A_CONCURRENCY || 4));
-            const multiBConcurrency = Math.max(1, Number(cfg?.MULTI?.B_CONCURRENCY || 2));
-            const multiStaggerMs = Math.max(0, Number(cfg?.MULTI?.STAGGER_MS || 0));
+            const multiAConcurrency = Math.max(1, Number(getCfg()?.MULTI?.A_CONCURRENCY || 4));
+            const multiBConcurrency = Math.max(1, Number(getCfg()?.MULTI?.B_CONCURRENCY || 2));
+            const multiStaggerMs = Math.max(0, Number(getCfg()?.MULTI?.STAGGER_MS || 0));
 
             // Prepare B accounts and A holds concurrently (optionally staggered)
             setStep('MULTI.parallel.start', { aCount: aList.length, bCount: bList.length, multiAConcurrency, multiBConcurrency, multiStaggerMs });
@@ -3355,7 +5094,7 @@ async function startBot(req, res) {
                 }
                 setStep(`${label}.launchAndLogin.start`, { email: acc.email });
                 audit('account_launch_start', { role: 'B', idx: i, email: acc.email });
-                const userDataDir = buildRunUserDataDir(cfg.USER_DATA_DIR_B, `B${i}`);
+                const userDataDir = buildRunUserDataDir(getCfg().USER_DATA_DIR_B, `B${i}`);
                 const { browser, page } = await launchAndLogin({
                     email: acc.email,
                     password: acc.password,
@@ -3381,6 +5120,7 @@ async function startBot(req, res) {
                 setStep(`${label}.gotoEvent.done`, { snap: await snapshotPage(page, `${label}.afterEventGoto`) });
                 audit('account_goto_event_done', { role: 'B', idx: i, email: acc.email, url: (() => { try { return page.url(); } catch { return null; } })() });
 
+                await installRecaptchaCallbackInterceptor(page);
                 setStep(`${label}.clickBuy.start`);
                 audit('account_click_buy_start', { role: 'B', idx: i, email: acc.email });
                 const clicked = await clickBuy(page, eventAddress);
@@ -3492,7 +5232,7 @@ async function startBot(req, res) {
                 audit('multi_a_hold_start', { aCount: aList.length, concurrency: multiAConcurrency, multiStaggerMs });
                 const aCtxList = await poolMap(aList, multiAConcurrency, async (acc, i) => {
                 const label = `A${i}`;
-                const userDataDir = buildRunUserDataDir(cfg.USER_DATA_DIR_A, `A${i}`);
+                const userDataDir = buildRunUserDataDir(getCfg().USER_DATA_DIR_A, `A${i}`);
 
                 if (multiStaggerMs > 0) {
                     try { await delay(i * multiStaggerMs); } catch {}
@@ -3525,6 +5265,7 @@ async function startBot(req, res) {
                 setStep(`${label}.gotoEvent.done`, { snap: await snapshotPage(page, `${label}.afterEventGoto`) });
                 audit('account_goto_event_done', { role: 'A', idx: i, email: acc.email, url: (() => { try { return page.url(); } catch { return null; } })() });
 
+                await installRecaptchaCallbackInterceptor(page);
                 setStep(`${label}.clickBuy.start`);
                 audit('account_click_buy_start', { role: 'A', idx: i, email: acc.email });
                 const clicked = await clickBuy(page, eventAddress);
@@ -3608,18 +5349,18 @@ async function startBot(req, res) {
 
                 setStep(`${label}.seat.pickRandom.start`);
                 const seatSelectionUrl = (() => { try { return page.url(); } catch { return null; } })();
-                const netSeat = captureSeatIdFromNetwork(page, cfg.TIMEOUTS.NETWORK_CAPTURE_TIMEOUT);
+                const netSeat = captureSeatIdFromNetwork(page, getCfg().TIMEOUTS.NETWORK_CAPTURE_TIMEOUT);
                 const seatHelper = require('../helpers/seat');
                 let seatInfo = null;
                 const seatPickStart = Date.now();
-                const maxCycle = Math.max(12, Number(cfg?.TIMEOUTS?.SEAT_SELECTION_CYCLES || 0) || 12);
-                const waitUntilFound = cfg?.TIMEOUTS?.SEAT_WAIT_UNTIL_FOUND === true;
-                const waitMaxMinutes = Math.max(1, Number(cfg?.TIMEOUTS?.SEAT_WAIT_MAX_MINUTES || 90) || 90);
+                const maxCycle = Math.max(12, Number(getCfg()?.TIMEOUTS?.SEAT_SELECTION_CYCLES || 0) || 12);
+                const waitUntilFound = getCfg()?.TIMEOUTS?.SEAT_WAIT_UNTIL_FOUND === true;
+                const waitMaxMinutes = Math.max(1, Number(getCfg()?.TIMEOUTS?.SEAT_WAIT_MAX_MINUTES || 90) || 90);
                 const waitDeadlineAt = Date.now() + (waitMaxMinutes * 60 * 1000);
                 let cycleStartedAt = Date.now();
                 for (let cycle = 1; (waitUntilFound ? (Date.now() < waitDeadlineAt) : (cycle <= maxCycle)); cycle++) {
                     try {
-                        const remaining = Math.max(15000, Number(cfg.TIMEOUTS.SEAT_SELECTION_MAX) - (Date.now() - cycleStartedAt));
+                        const remaining = Math.max(15000, Number(getCfg().TIMEOUTS.SEAT_SELECTION_MAX) - (Date.now() - cycleStartedAt));
                         seatInfo = await seatHelper.pickRandomSeatWithVerify(page, remaining, {
                             context: label,
                             expectedUrlIncludes: '/koltuk-secim',
@@ -3628,7 +5369,9 @@ async function startBot(req, res) {
                             email: acc.email,
                             password: acc.password,
                             reloginIfRedirected,
-                            ensureTurnstileFn: ensureTurnstileTokenOnPage
+                            ensureTurnstileFn: ensureCaptchaOnPage,
+                            chooseCategoryFn: chooseCategoryAndRandomBlock,
+                            categorySelectionMode
                         });
                         break;
                     } catch (e) {
@@ -3636,7 +5379,7 @@ async function startBot(req, res) {
                         if (/NO_SELECTABLE_SEATS/i.test(msg) || msg.includes('Seçilen blokta boş/aktif koltuk bulunamadı')) {
                             logger.warn(`${label}.seat.noSelectable.retry_block`, { cycle, msg });
                             audit('a_seat_pick_retry_no_selectable', { idx: i, email: acc.email, cycle, error: msg }, 'warn');
-                            const roamEvery = Math.max(0, Number(cfg?.TIMEOUTS?.CATEGORY_ROAM_EVERY_CYCLES || 0) || 0);
+                            const roamEvery = Math.max(0, Number(getCfg()?.TIMEOUTS?.CATEGORY_ROAM_EVERY_CYCLES || 0) || 0);
                             const baseMode = String(categorySelectionMode || 'legacy').toLowerCase();
                             const mode2 = (baseMode === 'svg') ? categorySelectionMode : ((roamEvery > 0 && (cycle % roamEvery) === 0) ? 'scan' : categorySelectionMode);
                             const cbRes2 = await chooseCategoryAndRandomBlock(page, categoryType, alternativeCategory, mode2);
@@ -3714,17 +5457,56 @@ async function startBot(req, res) {
             const [bCtxList, aCtxList] = await Promise.all([bCtxPromise, aCtxPromise]);
             setStep('MULTI.parallel.done', { aCount: aCtxList.length, bCount: bCtxList.length });
 
-            // 3) Transfer phase: A[i] -> B[i] if B exists, otherwise keep A holding.
-            setStep('MULTI.transfer.start', { pairs: Math.min(aCtxList.length, bCtxList.length) });
-            audit('multi_transfer_start', { pairCount: Math.min(aCtxList.length, bCtxList.length) });
-            const results = [];
             const pairCount = Math.min(aCtxList.length, bCtxList.length);
+            const stDash = runStore.get(runId) || {};
+            let wantPairDash = parseInt(String(stDash.cTransferPairIndex ?? validatedData.cTransferPairIndex ?? 1), 10);
+            if (!Number.isFinite(wantPairDash) || wantPairDash < 1) wantPairDash = 1;
+            if (wantPairDash > pairCount) wantPairDash = pairCount;
+            dashboardMeta.cTargetPairIndex = wantPairDash;
+            dashboardPairs = aCtxList.slice(0, pairCount).map((ctx, i) => {
+                const hasA = !!(ctx?.seatInfo?.seatId);
+                return {
+                    pairIndex: i + 1,
+                    aEmail: ctx.email || '',
+                    bEmail: bList[i]?.email || '',
+                    holder: hasA ? 'A' : null,
+                    seatId: ctx?.seatInfo?.seatId ? String(ctx.seatInfo.seatId) : null,
+                    seatLabel: fmtSeatLabel(ctx?.seatInfo),
+                    phase: hasA ? 'A sepette — B transfer bekleniyor' : 'A hazırlık',
+                    transferOk: null
+                };
+            });
+            for (let j = 0; j < aCtxList.length - pairCount; j++) {
+                const ctx = aCtxList[pairCount + j];
+                const hasA = !!(ctx?.seatInfo?.seatId);
+                dashboardPairs.push({
+                    pairIndex: pairCount + j + 1,
+                    aEmail: ctx.email || '',
+                    bEmail: '—',
+                    holder: hasA ? 'A' : null,
+                    seatId: ctx?.seatInfo?.seatId ? String(ctx.seatInfo.seatId) : null,
+                    seatLabel: fmtSeatLabel(ctx?.seatInfo),
+                    phase: 'Eşleşen B hesabı yok',
+                    transferOk: null,
+                    unmatched: true
+                });
+            }
+            syncDashboardToRunStore();
+
+            // 3) Transfer phase: A[i] -> B[i] if B exists, otherwise keep A holding.
+            setStep('MULTI.transfer.start', { pairs: pairCount });
+            audit('multi_transfer_start', { pairCount });
+            const results = [];
             for (let i = 0; i < pairCount; i++) {
                 const aCtx = aCtxList[i];
                 const bCtx = bCtxList[i];
                 if (!aCtx?.seatInfo?.seatId) {
                     results.push({ idx: i, ok: false, error: 'A seatId yok', seatA: aCtx?.seatInfo || null });
                     audit('transfer_pair_skip_no_seatid', { idx: i, aEmail: aCtx?.email || null, bEmail: bCtx?.email || null }, 'warn');
+                    if (dashboardPairs[i]) {
+                        dashboardPairs[i] = { ...dashboardPairs[i], phase: 'Hata: A koltuk yok', transferOk: false, holder: null };
+                        syncDashboardToRunStore();
+                    }
                     continue;
                 }
 
@@ -3750,7 +5532,7 @@ async function startBot(req, res) {
                         email: bCtx.email,
                         password: bCtx.password,
                         reloginIfRedirected,
-                        ensureTurnstileFn: ensureTurnstileTokenOnPage
+                        ensureTurnstileFn: ensureCaptchaOnPage
                     };
                 } catch {}
 
@@ -3763,7 +5545,7 @@ async function startBot(req, res) {
                 audit('a_remove_from_basket_flow_start', { idx: i, aEmail: aCtx.email, seatId: aCtx.seatInfo.seatId });
 
                 const ensureRemoveDelayAfterBasket = async () => {
-                    const minMsRaw = Number(cfg?.BASKET?.REMOVE_MIN_AFTER_BASKET_MS);
+                    const minMsRaw = Number(getCfg()?.BASKET?.REMOVE_MIN_AFTER_BASKET_MS);
                     const minMs = Number.isFinite(minMsRaw) ? Math.max(0, minMsRaw) : 30000;
 
                     const sleep = async (ms) => { try { await delay(ms); } catch {} };
@@ -3776,7 +5558,7 @@ async function startBot(req, res) {
                             await aCtx.page.waitForSelector('basket-countdown .basket-remaining-container, .basket-remaining-container', { timeout: 5000 });
                         } catch {}
 
-                        const holdSec = Number(cfg?.BASKET?.HOLDING_TIME_SECONDS);
+                        const holdSec = Number(getCfg()?.BASKET?.HOLDING_TIME_SECONDS);
                         if (Number.isFinite(holdSec) && holdSec > 0) {
                             for (let r = 0; r < 8; r++) {
                                 const ui = await checkBasketTimeoutFromPage(aCtx.page);
@@ -3839,7 +5621,7 @@ async function startBot(req, res) {
                     aRemoveAttempts = attempt;
                     await ensureRemoveDelayAfterBasket();
                     audit('a_remove_from_basket_start', { idx: i, aEmail: aCtx.email, seatId: aCtx.seatInfo.seatId, attempt });
-                    removed = await clickRemoveFromCartAndConfirm(aCtx.page, cfg.TIMEOUTS.REMOVE_FROM_CART_TIMEOUT);
+                    removed = await clickRemoveFromCartAndConfirm(aCtx.page, getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT);
                     if (removed) break;
                     try { await delay(1500); } catch {}
                 }
@@ -3853,6 +5635,10 @@ async function startBot(req, res) {
                         ms: Date.now() - aRemoveStartedAt,
                         attempts: aRemoveAttempts
                     }, 'warn');
+                    if (dashboardPairs[i]) {
+                        dashboardPairs[i] = { ...dashboardPairs[i], phase: 'Hata: A sepetten kaldırılamadı', transferOk: false, holder: 'A' };
+                        syncDashboardToRunStore();
+                    }
                     continue;
                 }
 
@@ -3892,7 +5678,7 @@ async function startBot(req, res) {
                 setStep(`PAIR${i}.b_apply_catblock.done`);
 
                 // start B exact pick immediately with short timeout for fast response
-                const exactMaxMs = Math.max(8000, Math.min(cfg.TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 30000));
+                const exactMaxMs = Math.max(8000, Math.min(getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 30000));
 
                 audit('b_exact_pick_start', { idx: i, bEmail: bCtx.email, seatId: aCtx.seatInfo.seatId, maxMs: exactMaxMs, seatmapReady: bCtx.seatmapReady });
                 const exactPromise = pickExactSeatWithVerify_ReleaseAware(bCtx.page, aCtx.seatInfo, exactMaxMs);
@@ -3903,6 +5689,10 @@ async function startBot(req, res) {
                 } catch (e) {
                     results.push({ idx: i, ok: false, error: e?.message || String(e), seatA: aCtx.seatInfo });
                     audit('b_exact_pick_failed', { idx: i, bEmail: bCtx.email, seatId: aCtx.seatInfo.seatId, error: e?.message || String(e) }, 'warn');
+                    if (dashboardPairs[i]) {
+                        dashboardPairs[i] = { ...dashboardPairs[i], phase: 'Hata: B koltuğu alamadı', transferOk: false, holder: null };
+                        syncDashboardToRunStore();
+                    }
                     continue;
                 }
 
@@ -3925,6 +5715,18 @@ async function startBot(req, res) {
                     bEmail: bCtx.email,
                     ms: Date.now() - pairStart
                 });
+
+                if (dashboardPairs[i]) {
+                    dashboardPairs[i] = {
+                        ...dashboardPairs[i],
+                        holder: 'B',
+                        seatId: seatBInfo?.seatId ? String(seatBInfo.seatId) : dashboardPairs[i].seatId,
+                        seatLabel: fmtSeatLabel(seatBInfo),
+                        phase: 'B sepette (A→B transfer tamam)',
+                        transferOk: true
+                    };
+                    syncDashboardToRunStore();
+                }
             }
             setStep('MULTI.transfer.done', { resultsCount: results.length });
             audit('multi_transfer_done', { resultsCount: results.length });
@@ -3933,20 +5735,109 @@ async function startBot(req, res) {
             const holdingOnly = aCtxList.slice(pairCount).map(a => ({ idx: a.idx, email: a.email, seatInfo: a.seatInfo }));
             audit('multi_holding_only', { count: holdingOnly.length, holdingOnly: holdingOnly.map(x => ({ idx: x.idx, email: x.email, seatId: x?.seatInfo?.seatId || null })) });
 
-            logger.infoSafe('Bot başarıyla tamamlandı (multi)', {
-                grabbedBy: bCtxList.filter(Boolean).map(x => x.email),
-                results,
-                holdingOnly
+            const stRun = runStore.get(runId) || {};
+            let pairWant = parseInt(String(stRun.cTransferPairIndex ?? validatedData.cTransferPairIndex ?? 1), 10);
+            if (!Number.isFinite(pairWant) || pairWant < 1) pairWant = 1;
+            if (pairWant > pairCount) pairWant = pairCount;
+            const pairIdx0 = pairWant - 1;
+
+            const chosen = results.find((r) => r.idx === pairIdx0 && r.ok === true);
+            if (!chosen) {
+                const errMsg = `Seçilen C eşleşmesi (#${pairWant}) için başarılı transfer yok`;
+                audit('multi_c_pair_unavailable', { pairWant, pairIdx0, results }, 'warn');
+                logger.warnSafe(errMsg, { pairWant, results });
+                throw new Error(errMsg);
+            }
+
+            const aPick = aCtxList[pairIdx0];
+            const bPick = bCtxList[pairIdx0];
+            browserA = aPick.browser;
+            pageA = aPick.page;
+            browserB = bPick.browser;
+            pageB = bPick.page;
+            emailA = aPick.email;
+            passwordA = aPick.password;
+            emailB = bPick.email;
+            passwordB = bPick.password;
+            idProfileA = aList[pairIdx0] || idProfileA;
+            idProfileB = bList[pairIdx0] || idProfileB;
+
+            seatInfoA = chosen.seatA;
+            seatInfoB = chosen.seatB;
+            catBlockA = { ...(aPick.catBlock || { categoryText: '', blockText: '', blockVal: '' }) };
+            try {
+                const cbB = await readCatBlock(pageB).catch(() => null);
+                const lastSvgBlockIdB = await pageB.evaluate(() => {
+                    try { return window.__passobotLastSvgBlockId || null; } catch { return null; }
+                }).catch(() => null);
+                const derivedSvgBlockIdB = await pageB.evaluate((sid) => {
+                    try {
+                        const seatId = String(sid || '').trim();
+                        if (!seatId) return null;
+                        const sel = [
+                            `g.g${seatId}`,
+                            `g[id="g${seatId}"]`,
+                            `#g${seatId}`,
+                            `.g${seatId}`,
+                            `.block${seatId}`,
+                            `rect.block${seatId}`,
+                            `rect[id="block${seatId}"]`,
+                            `#block${seatId}`
+                        ].join(',');
+                        const el = document.querySelector(sel);
+                        if (!el) return null;
+                        const b = el.closest('[id^="block"]');
+                        const bid = b && b.id ? String(b.id) : null;
+                        return bid && bid.startsWith('block') ? bid : null;
+                    } catch {
+                        return null;
+                    }
+                }, seatInfoB?.seatId || null).catch(() => null);
+
+                if (cbB && (cbB.categoryText || cbB.blockText || cbB.blockVal)) {
+                    catBlockA = { ...cbB, svgBlockId: derivedSvgBlockIdB || lastSvgBlockIdB || cbB.svgBlockId || catBlockA?.svgBlockId };
+                } else if (lastSvgBlockIdB) {
+                    catBlockA = { ...(catBlockA || {}), svgBlockId: derivedSvgBlockIdB || lastSvgBlockIdB };
+                } else if (derivedSvgBlockIdB) {
+                    catBlockA = { ...(catBlockA || {}), svgBlockId: derivedSvgBlockIdB };
+                }
+                if (seatInfoB && (derivedSvgBlockIdB || (catBlockA && catBlockA.svgBlockId))) {
+                    seatInfoB.svgBlockId = String(derivedSvgBlockIdB || catBlockA.svgBlockId);
+                }
+            } catch {}
+
+            dashboardPairs = dashboardPairs.map((row) => {
+                if (row.unmatched) return row;
+                if (row.pairIndex === pairWant) {
+                    const base = String(row.phase || '').trim();
+                    const next = base.includes('C hedefi') ? base : (base ? `${base} · C hedefi` : 'C hedefi');
+                    return { ...row, phase: next };
+                }
+                return row;
             });
 
-            return res.json({
-                success: true,
-                mode: 'multi',
-                results,
-                holdingOnly
+            setHolder('B', seatInfoB, catBlockA);
+            basketTimer = new BasketTimer();
+            basketTimer.start();
+            try { ensureFinalizeWatcher(); } catch {}
+
+            audit('multi_bind_for_c', {
+                cTransferPairIndex: pairWant,
+                aEmail: emailA,
+                bEmail: emailB,
+                seatId: seatInfoB?.seatId || null
             });
+            logger.infoSafe('Çoklu mod: C/finalize için seçilen eşleşme bağlandı', {
+                cTransferPairIndex: pairWant,
+                aEmail: emailA,
+                bEmail: emailB,
+                seatId: seatInfoB?.seatId || null
+            });
+
+            multiPostTransferReady = true;
         }
 
+        if (!multiPostTransferReady) {
         // A: Launch + Login
         setStep('A.launchAndLogin.start', { email: emailA });
         audit('account_launch_start', { role: 'A', idx: 0, email: emailA });
@@ -3976,17 +5867,24 @@ async function startBot(req, res) {
         // Start finalize watcher after pages are ready.
         try { ensureFinalizeWatcher(); } catch {}
 
+        if (!dashboardPairs.length) {
+            dashboardMeta.cTargetPairIndex = 1;
+            dashboardPairs = [{
+                pairIndex: 1,
+                aEmail: emailA,
+                bEmail: emailB,
+                holder: null,
+                seatId: null,
+                seatLabel: '—',
+                phase: 'Başlatılıyor',
+                transferOk: null
+            }];
+            syncDashboardToRunStore();
+        }
+
         // A: go event -> BUY -> ticket type (if present) -> category/block -> random seat
         setStep('A.gotoEvent.start', { eventAddress });
         audit('account_goto_event_start', { role: 'A', idx: 0, email: emailA, eventAddress });
-        const eventPathIncludes = (() => {
-            try {
-                const u = new URL(String(eventAddress));
-                return u.pathname || null;
-            } catch {
-                return null;
-            }
-        })();
         const aGoto = await gotoWithRetry(pageA, String(eventAddress), {
             retries: 3,
             waitUntil: 'networkidle2',
@@ -3997,6 +5895,7 @@ async function startBot(req, res) {
         setStep('A.gotoEvent.done', { goto: aGoto, snap: await snapshotPage(pageA, 'A.afterEventGoto') });
         audit('account_goto_event_done', { role: 'A', idx: 0, email: emailA, url: (() => { try { return pageA.url(); } catch { return null; } })() });
 
+        await installRecaptchaCallbackInterceptor(pageA);
         setStep('A.clickBuy.start');
         audit('account_click_buy_start', { role: 'A', idx: 0, email: emailA });
         const clickedA = await clickBuy(pageA, eventAddress);
@@ -4035,9 +5934,21 @@ async function startBot(req, res) {
             try { await ensureUrlContains(pageA, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 }); } catch {}
         }
 
-        setStep('A.seatSelection.turnstile.ensure.start');
-        await ensureTurnstileTokenOnPage(pageA, emailA, 'A.seatSelection');
-        setStep('A.seatSelection.turnstile.ensure.done', { snap: await snapshotPage(pageA, 'A.afterTurnstileEnsure') });
+        setStep('A.seatSelection.captcha.ensure.start');
+        const captchaResultA = await ensureCaptchaOnPage(pageA, emailA, 'A.seatSelection');
+        // After reCAPTCHA solve, wait for page to unlock (dropdown or seatmap appearing)
+        if (captchaResultA?.attempted && captchaResultA?.type === 'recaptcha') {
+            try {
+                await pageA.waitForFunction(() => {
+                    return !!document.querySelector('.custom-select-box, select option, .dropdown-option') ||
+                           document.querySelectorAll('svg.seatmap-svg, .seatmap-container, [class*="seatmap"]').length > 0;
+                }, { timeout: 8000 });
+                logger.info('A.seatSelection.captcha.page_unlocked');
+            } catch {
+                logger.warn('A.seatSelection.captcha.page_unlock_timeout');
+            }
+        }
+        setStep('A.seatSelection.captcha.ensure.done', { snap: await snapshotPage(pageA, 'A.afterCaptchaEnsure') });
 
         // Hard guard: compute canonical seat selection URL and force navigation back to /koltuk-secim if we drifted.
         const canonicalSeatUrlA = (() => {
@@ -4156,7 +6067,107 @@ async function startBot(req, res) {
         }
 
         // Capture selected category & block for transfer to B. DOM can be late/placeholder, so retry a bit.
-        let catBlockA = { categoryText: '', blockText: '', blockVal: '' };
+        catBlockA = { categoryText: '', blockText: '', blockVal: '' };
+
+        // DOM diagnostic: capture exactly what category-related elements exist before selection
+        try {
+            const domDiag = await pageA.evaluate(() => {
+                const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim();
+                const isVis = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect?.();
+                    if (!r || r.width < 2 || r.height < 2) return false;
+                    const st = window.getComputedStyle(el);
+                    return st.display !== 'none' && st.visibility !== 'hidden';
+                };
+
+                // All <select> elements
+                const selects = Array.from(document.querySelectorAll('select')).map(s => ({
+                    id: s.id || null,
+                    name: s.getAttribute('name') || null,
+                    visible: isVis(s),
+                    optionCount: s.options?.length || 0,
+                    options: Array.from(s.options || []).slice(0, 8).map(o => norm(o.textContent).slice(0, 80)),
+                    disabled: s.disabled
+                }));
+
+                // .custom-select-box
+                const csb = document.querySelector('.custom-select-box');
+                const csbInfo = csb ? {
+                    visible: isVis(csb),
+                    text: norm(csb.innerText || csb.textContent || '').slice(0, 200),
+                    selectedOption: norm(csb.querySelector('.selected-option')?.textContent || ''),
+                    childTags: Array.from(csb.children || []).map(c => c.tagName + (c.className ? '.' + String(c.className).split(' ')[0] : '')).slice(0, 10)
+                } : null;
+
+                // .dropdown-option elements
+                const dropdownOpts = Array.from(document.querySelectorAll('.dropdown-option')).map(d => ({
+                    text: norm(d.textContent).slice(0, 80),
+                    visible: isVis(d),
+                    disabled: d.classList.contains('disabled')
+                }));
+
+                // Any element containing "Kategori" text
+                const kategoriEls = [];
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+                let node;
+                while ((node = walker.nextNode())) {
+                    if (node.textContent && /kategori/i.test(node.textContent) && node.parentElement) {
+                        const p = node.parentElement;
+                        kategoriEls.push({
+                            tag: p.tagName,
+                            id: p.id || null,
+                            className: (p.className || '').toString().slice(0, 100),
+                            text: norm(p.textContent).slice(0, 120),
+                            visible: isVis(p)
+                        });
+                        if (kategoriEls.length >= 10) break;
+                    }
+                }
+
+                // reCAPTCHA / Turnstile state
+                const recaptchaIframes = Array.from(document.querySelectorAll('iframe[src*="recaptcha"]')).map(f => f.src?.slice(0, 150) || '');
+                const gRecaptchaDiv = document.querySelector('.g-recaptcha');
+                const recaptchaResponse = document.querySelector('textarea[name="g-recaptcha-response"]');
+                const turnstileWidget = document.querySelector('.cf-turnstile');
+                const turnstileToken = document.querySelector('input[name="cf-turnstile-response"]');
+
+                // Overlays
+                const overlays = [];
+                const centerX = window.innerWidth / 2;
+                const centerY = window.innerHeight / 3;
+                const topEl = document.elementFromPoint(centerX, centerY);
+                if (topEl) {
+                    overlays.push({
+                        tag: topEl.tagName,
+                        id: topEl.id || null,
+                        className: (topEl.className || '').toString().slice(0, 100),
+                        text: norm(topEl.textContent).slice(0, 100)
+                    });
+                }
+
+                return {
+                    url: location.href,
+                    title: document.title,
+                    selects,
+                    customSelectBox: csbInfo,
+                    dropdownOptions: dropdownOpts,
+                    kategoriElements: kategoriEls,
+                    captcha: {
+                        recaptchaIframes: recaptchaIframes.length,
+                        hasGRecaptchaDiv: !!gRecaptchaDiv,
+                        recaptchaResponseLen: recaptchaResponse?.value?.length || 0,
+                        hasTurnstileWidget: !!turnstileWidget,
+                        turnstileTokenLen: turnstileToken?.value?.length || 0
+                    },
+                    topElementAtCenter: overlays[0] || null,
+                    bodyTextSnippet: norm(document.body?.innerText || '').slice(0, 500)
+                };
+            });
+            logger.info('A.categoryBlock.dom_diagnostic', domDiag);
+        } catch (e) {
+            logger.warn('A.categoryBlock.dom_diagnostic_failed', { error: e?.message });
+        }
 
         setStep('A.categoryBlock.select.start', { categoryType, alternativeCategory, categorySelectionMode });
         const cbResA = await chooseCategoryAndRandomBlock(pageA, categoryType, alternativeCategory, categorySelectionMode);
@@ -4180,18 +6191,18 @@ async function startBot(req, res) {
 
         setStep('A.seat.pickRandom.start');
         const seatSelectionUrlA = (() => { try { return pageA.url(); } catch { return null; } })();
-        const netSeatA = captureSeatIdFromNetwork(pageA, cfg.TIMEOUTS.NETWORK_CAPTURE_TIMEOUT);
+        const netSeatA = captureSeatIdFromNetwork(pageA, getCfg().TIMEOUTS.NETWORK_CAPTURE_TIMEOUT);
         const seatHelper = require('../helpers/seat');
 
-        let seatInfoA = null;
-        const maxCycle = Math.max(12, Number(cfg?.TIMEOUTS?.SEAT_SELECTION_CYCLES || 0) || 12);
-        const waitUntilFound = cfg?.TIMEOUTS?.SEAT_WAIT_UNTIL_FOUND === true;
-        const waitMaxMinutes = Math.max(1, Number(cfg?.TIMEOUTS?.SEAT_WAIT_MAX_MINUTES || 90) || 90);
+        seatInfoA = null;
+        const maxCycle = Math.max(12, Number(getCfg()?.TIMEOUTS?.SEAT_SELECTION_CYCLES || 0) || 12);
+        const waitUntilFound = getCfg()?.TIMEOUTS?.SEAT_WAIT_UNTIL_FOUND === true;
+        const waitMaxMinutes = Math.max(1, Number(getCfg()?.TIMEOUTS?.SEAT_WAIT_MAX_MINUTES || 90) || 90);
         const waitDeadlineAt = Date.now() + (waitMaxMinutes * 60 * 1000);
         let cycleStartedAt = Date.now();
         for (let cycle = 1; (waitUntilFound ? (Date.now() < waitDeadlineAt) : (cycle <= maxCycle)); cycle++) {
             try {
-                const remaining = Math.max(15000, Number(cfg.TIMEOUTS.SEAT_SELECTION_MAX) - (Date.now() - cycleStartedAt));
+                const remaining = Math.max(15000, Number(getCfg().TIMEOUTS.SEAT_SELECTION_MAX) - (Date.now() - cycleStartedAt));
                 seatInfoA = await seatHelper.pickRandomSeatWithVerify(
                     pageA,
                     remaining,
@@ -4203,7 +6214,9 @@ async function startBot(req, res) {
                         email: emailA,
                         password: passwordA,
                         reloginIfRedirected,
-                        ensureTurnstileFn: ensureTurnstileTokenOnPage
+                        ensureTurnstileFn: ensureCaptchaOnPage,
+                        chooseCategoryFn: chooseCategoryAndRandomBlock,
+                        categorySelectionMode
                     }
                 );
                 break;
@@ -4212,7 +6225,7 @@ async function startBot(req, res) {
                 if (/NO_SELECTABLE_SEATS/i.test(msg) || msg.includes('Seçilen blokta boş/aktif koltuk bulunamadı')) {
                     logger.warn('A.seat.noSelectable.retry_block', { cycle, msg });
                     setStep('A.categoryBlock.reselect.start', { cycle });
-                    const roamEvery = Math.max(0, Number(cfg?.TIMEOUTS?.CATEGORY_ROAM_EVERY_CYCLES || 0) || 0);
+                    const roamEvery = Math.max(0, Number(getCfg()?.TIMEOUTS?.CATEGORY_ROAM_EVERY_CYCLES || 0) || 0);
                     const baseMode = String(categorySelectionMode || 'legacy').toLowerCase();
                     const mode2 = (baseMode === 'svg') ? categorySelectionMode : ((roamEvery > 0 && (cycle % roamEvery) === 0) ? 'scan' : categorySelectionMode);
                     const cbResA2 = await chooseCategoryAndRandomBlock(pageA, categoryType, alternativeCategory, mode2);
@@ -4297,6 +6310,7 @@ async function startBot(req, res) {
         });
         setStep('B.gotoEvent.done', { goto: bGoto, snap: await snapshotPage(pageB, 'B.afterEventGoto') });
 
+        await installRecaptchaCallbackInterceptor(pageB);
         setStep('B.clickBuy.start');
         const clickedB = await clickBuy(pageB, eventAddress);
         if (!clickedB) throw new Error(formatError('BUY_BUTTON_FAILED_B'));
@@ -4332,9 +6346,20 @@ async function startBot(req, res) {
             try { await ensureUrlContains(pageB, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 }); } catch {}
         }
 
-        setStep('B.seatSelection.turnstile.ensure.start');
-        await ensureTurnstileTokenOnPage(pageB, emailB, 'B.seatSelection');
-        setStep('B.seatSelection.turnstile.ensure.done', { snap: await snapshotPage(pageB, 'B.afterTurnstileEnsure') });
+        setStep('B.seatSelection.captcha.ensure.start');
+        const captchaResultB = await ensureCaptchaOnPage(pageB, emailB, 'B.seatSelection');
+        if (captchaResultB?.attempted && captchaResultB?.type === 'recaptcha') {
+            try {
+                await pageB.waitForFunction(() => {
+                    return !!document.querySelector('.custom-select-box, select option, .dropdown-option') ||
+                           document.querySelectorAll('svg.seatmap-svg, .seatmap-container, [class*="seatmap"]').length > 0;
+                }, { timeout: 8000 });
+                logger.info('B.seatSelection.captcha.page_unlocked');
+            } catch {
+                logger.warn('B.seatSelection.captcha.page_unlock_timeout');
+            }
+        }
+        setStep('B.seatSelection.captcha.ensure.done', { snap: await snapshotPage(pageB, 'B.afterCaptchaEnsure') });
 
         // B catBlock seçimi A kaldırdıktan sonra yapılacak
         // setStep('B.catBlock.sync.start');
@@ -4351,7 +6376,7 @@ async function startBot(req, res) {
                 email: emailB,
                 password: passwordB,
                 reloginIfRedirected,
-                ensureTurnstileFn: ensureTurnstileTokenOnPage
+                ensureTurnstileFn: ensureCaptchaOnPage
             };
         } catch {}
 
@@ -4406,7 +6431,7 @@ async function startBot(req, res) {
             });
 
             // Öncelik: A'nın koltuğunu (aynı seatId) B hesabına aynen yakalat.
-            const exactMaxMs = Math.max(30000, Math.min(cfg.TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 120000));
+            const exactMaxMs = Math.max(30000, Math.min(getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 120000));
             logger.info('B hedef koltuğu zorluyor (aynı seatId)', { seatId: seatInfoA?.seatId || null, exactMaxMs });
             audit('b_exact_pick_start', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null, maxMs: exactMaxMs, seatSelectionUrlB });
             try {
@@ -4426,7 +6451,7 @@ async function startBot(req, res) {
             audit('b_random_fallback_start', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null });
             const randomGot = await pickRandomSeatWithVerify(
                 pageB,
-                cfg.TIMEOUTS.SEAT_SELECTION_MAX,
+                getCfg().TIMEOUTS.SEAT_SELECTION_MAX,
                 {
                     context: 'B',
                     expectedUrlIncludes: '/koltuk-secim',
@@ -4434,7 +6459,9 @@ async function startBot(req, res) {
                     email: emailB,
                     password: passwordB,
                     reloginIfRedirected,
-                    ensureTurnstileFn: ensureTurnstileTokenOnPage
+                    ensureTurnstileFn: ensureCaptchaOnPage,
+                    chooseCategoryFn: chooseCategoryAndRandomBlock,
+                    categorySelectionMode
                 }
             );
             logger.info('B rastgele koltuk yakaladı (fallback)', { seat: randomGot });
@@ -4475,9 +6502,18 @@ async function startBot(req, res) {
                 } catch (error) {
                     intervalError = error;
                     clearInterval(basketMonitor);
+                    clearPassiveSessionWatch();
                     reject(error);
                 }
             }, 5000); // Her 5 saniyede bir kontrol et
+        });
+
+        startPassiveSeatWatch({
+            page: pageB,
+            email: emailB,
+            password: passwordB,
+            recoveryUrl: seatSelectionUrlB,
+            label: 'b_while_a_holds_basket'
         });
 
         // Sepette tutma süresine göre dinamik zamanlama
@@ -4495,6 +6531,7 @@ async function startBot(req, res) {
                 // Default behavior: transfer to B by removing from A
                 shouldRemoveNow = true;
                 clearInterval(basketMonitor);
+                clearPassiveSessionWatch();
 
                 logger.info('Dinamik uzatma tetiklendi (B hesabına geçiş)', {
                     remainingSeconds: remaining,
@@ -4558,7 +6595,7 @@ async function startBot(req, res) {
 
                 for (let attempt = 1; attempt <= 3; attempt++) {
                     if (removed) break;
-                    removed = await clickRemoveFromCartAndConfirm(pageA, cfg.TIMEOUTS.REMOVE_FROM_CART_TIMEOUT);
+                    removed = await clickRemoveFromCartAndConfirm(pageA, getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT);
                     if (removed) break;
                     try {
                         logger.warn('A.removeFromCart.retry.reload', { attempt });
@@ -4680,13 +6717,13 @@ async function startBot(req, res) {
                     intervalError = error;
                     clearInterval(dynamicTimingCheck);
                     clearInterval(basketMonitor);
+                    clearPassiveSessionWatch();
                     reject(error);
                 }
             }, 2000);
         });
 
         // Transfer yakalama B tarafında hazır bekler; A kaldırma işlemi sadece dinamik eşik tetiklendiğinde yapılır.
-        let seatInfoB;
         try {
             const pickPromise = Promise.race([
                 waitPickB,
@@ -4698,14 +6735,16 @@ async function startBot(req, res) {
             setStep('B.target.grabLoop.done', { seatInfoB, snap: await snapshotPage(pageB, 'B.afterGrab') });
             clearInterval(dynamicTimingCheck);
             clearInterval(basketMonitor);
+            clearPassiveSessionWatch();
         } catch (error) {
             clearInterval(dynamicTimingCheck);
             clearInterval(basketMonitor);
+            clearPassiveSessionWatch();
 
             // Fallback: eski locked strateji ile bir kez daha dene (özellikle DOM farklıysa)
             try {
                 logger.warn('Transfer akışında hata, locked strateji ile fallback deneniyor', { error: error?.message || error });
-                const got = await pickExactSeatWithVerify_Locked(pageB, seatInfoA, cfg.TIMEOUTS.SEAT_PICK_EXACT_MAX);
+                const got = await pickExactSeatWithVerify_Locked(pageB, seatInfoA, getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX);
                 if (got) {
                     seatInfoB = got;
                     setStep('B.target.grabLoop.fallback.locked.done', { seatInfoB, snap: await snapshotPage(pageB, 'B.afterGrabFallback') });
@@ -4760,6 +6799,7 @@ async function startBot(req, res) {
             }
         } catch {}
         setHolder('B', seatInfoB, catBlockA);
+        }
 
         // If finalize completed during the race, stop here.
         if (finalizedToCResult) {
@@ -4771,16 +6811,16 @@ async function startBot(req, res) {
 
         setStep('B.clickContinue.start');
         await clickContinueInsidePage(pageB);
-        await delay(cfg.DELAYS.AFTER_CONTINUE);
+        await delay(getCfg().DELAYS.AFTER_CONTINUE);
         setStep('B.clickContinue.done', { snap: await snapshotPage(pageB, 'B.afterContinue') });
 
         // Optional: Basket loop (A<->B) to extend holding time by transferring before expiry.
-        if (cfg?.BASKET?.LOOP_ENABLED) {
+        if (getCfg()?.BASKET?.LOOP_ENABLED) {
             try {
                 const loopThreshold = Number.isFinite(extendWhenRemainingSecondsBelow)
                     ? extendWhenRemainingSecondsBelow
                     : 90;
-                const maxHops = Number.isFinite(cfg?.BASKET?.LOOP_MAX_HOPS) ? cfg.BASKET.LOOP_MAX_HOPS : 12;
+                const maxHops = Number.isFinite(getCfg()?.BASKET?.LOOP_MAX_HOPS) ? getCfg().BASKET.LOOP_MAX_HOPS : 12;
                 const safeMaxHops = Math.max(1, maxHops);
                 let hopCount = 1; // initial A->B transfer already happened
                 let loopSeatInfo = seatInfoB || seatInfoA;
@@ -4798,12 +6838,13 @@ async function startBot(req, res) {
                 try { basketTimer.start(); } catch {}
 
                 while (hopCount < safeMaxHops) {
-                    if (finalizeInFlight) {
-                        try { await finalizeInFlight; } catch {}
-                        if (finalizedToCResult) {
-                            try { runStore.upsert(runId, { status: 'completed', result: finalizedToCResult }); } catch {}
-                            return res.json(finalizedToCResult);
-                        }
+                    const finPause = await pauseForFinalizeIfRequested(`basket_loop_hop_${hopCount + 1}`);
+                    if (finPause === 'done') {
+                        try { runStore.upsert(runId, { status: 'completed', result: finalizedToCResult }); } catch {}
+                        return res.json(finalizedToCResult);
+                    }
+                    if (finPause === 'error') {
+                        try { audit('basket_loop_finalize_failed_continue', { hop: hopCount + 1 }); } catch {}
                     }
 
                     const fromRole = currentHolder || 'B';
@@ -4822,6 +6863,13 @@ async function startBot(req, res) {
                         let lastErr = null;
                         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                             try {
+                                const fp = await pauseForFinalizeIfRequested(`basket_recv_${ctxLabel}_${attempt}`);
+                                if (fp === 'done') {
+                                    const ex = new Error('FINALIZE_COMPLETED');
+                                    ex.code = 'FINALIZE_COMPLETED';
+                                    throw ex;
+                                }
+
                                 try { await reloginIfRedirected(toPage, toEmail, toPass); } catch {}
 
                                 setStep(`${toRole}.loop.${ctxLabel}.gotoEvent.start`, { attempt });
@@ -4838,8 +6886,8 @@ async function startBot(req, res) {
                                 await clickBuy(toPage, eventAddress);
                                 setStep(`${toRole}.loop.${ctxLabel}.clickBuy.done`, { attempt });
 
-                                const toIdentity = (toRole === 'A') ? (a0?.identity ?? identity) : (b0?.identity ?? identity);
-                                const toFan = (toRole === 'A') ? (a0?.fanCardCode ?? fanCardCode) : (b0?.fanCardCode ?? fanCardCode);
+                                const toIdentity = (toRole === 'A') ? (idProfileA?.identity ?? identity) : (idProfileB?.identity ?? identity);
+                                const toFan = (toRole === 'A') ? (idProfileA?.fanCardCode ?? fanCardCode) : (idProfileB?.fanCardCode ?? fanCardCode);
                                 await handlePrioritySaleModal(toPage, { prioritySale, fanCardCode: toFan, identity: toIdentity });
 
                                 await ensureUrlContains(toPage, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
@@ -4852,6 +6900,7 @@ async function startBot(req, res) {
                                 audit('basket_loop_receiver_ready', { hop: hopCount + 1, from: fromRole, to: toRole, attempt, url: u, seatId: loopSeatInfo?.seatId || null });
                                 return true;
                             } catch (e) {
+                                if (e && e.code === 'FINALIZE_COMPLETED') throw e;
                                 lastErr = e;
                                 audit('basket_loop_receiver_prepare_failed', {
                                     hop: hopCount + 1,
@@ -4870,7 +6919,15 @@ async function startBot(req, res) {
 
                     // Prepare receiver BEFORE release
                     // If receiver can't reach /koltuk-secim, do NOT release from holder.
-                    await prepareReceiverForExactPick('prepare');
+                    try {
+                        await prepareReceiverForExactPick('prepare');
+                    } catch (prepErr) {
+                        if (prepErr && prepErr.code === 'FINALIZE_COMPLETED' && finalizedToCResult) {
+                            try { runStore.upsert(runId, { status: 'completed', result: finalizedToCResult }); } catch {}
+                            return res.json(finalizedToCResult);
+                        }
+                        throw prepErr;
+                    }
 
                     let releasedResolve;
                     const releasedPromise = new Promise((resolve) => { releasedResolve = resolve; });
@@ -4885,7 +6942,7 @@ async function startBot(req, res) {
                         try { await applyCategoryBlockSelection(toPage, categorySelectionMode, (currentCatBlock || catBlockA), loopSeatInfo); } catch {}
                         try { await openSeatMapStrict(toPage); } catch {}
                         const seatSelectionUrl = (() => { try { return toPage.url(); } catch { return null; } })();
-                        const exactMaxMs = Math.max(30000, Math.min(cfg.TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 180000));
+                        const exactMaxMs = Math.max(30000, Math.min(getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 180000));
                         audit('basket_loop_exact_pick_start', { hop: hopCount + 1, from: fromRole, to: toRole, seatId: loopSeatInfo?.seatId || null, maxMs: exactMaxMs, seatSelectionUrl });
                         // Fix misleading error messages: context must reflect the receiver role.
                         try {
@@ -4897,25 +6954,43 @@ async function startBot(req, res) {
                         return got;
                     })();
 
-                    // Wait threshold on current holder
+                    // Wait threshold on current holder — alıcı (toRole) koltuk sayfasında beklerken oturum düşmesin
                     const loopStartMs = Date.now();
                     let triggered = false;
-                    while (Date.now() - loopStartMs < (cfg.BASKET.HOLDING_TIME_SECONDS * 1000)) {
-                        if (finalizeInFlight) {
-                            try { await finalizeInFlight; } catch {}
-                            if (finalizedToCResult) {
-                                try { runStore.upsert(runId, { status: 'completed', result: finalizedToCResult }); } catch {}
-                                return res.json(finalizedToCResult);
+                    const passiveRecvUrl = (() => {
+                        try {
+                            const u = String(toPage.url() || '');
+                            if (u.includes('/koltuk-secim')) return u;
+                        } catch {}
+                        return String(eventAddress || '');
+                    })();
+                    startPassiveSeatWatch({
+                        page: toPage,
+                        email: toEmail,
+                        password: toPass,
+                        recoveryUrl: passiveRecvUrl,
+                        label: `loop_recv_${toRole}_wait_release`
+                    });
+                    try {
+                        while (Date.now() - loopStartMs < (getCfg().BASKET.HOLDING_TIME_SECONDS * 1000)) {
+                            if (finalizeInFlight) {
+                                try { await finalizeInFlight; } catch {}
+                                if (finalizedToCResult) {
+                                    try { runStore.upsert(runId, { status: 'completed', result: finalizedToCResult }); } catch {}
+                                    return res.json(finalizedToCResult);
+                                }
                             }
+                            const st = basketTimer.getStatus();
+                            const rem = st.remainingSeconds;
+                            if (Number.isFinite(rem) && rem <= loopThreshold) {
+                                triggered = true;
+                                audit('basket_loop_hop_triggered', { hop: hopCount + 1, from: fromRole, to: toRole, seatId: loopSeatInfo?.seatId || null, remainingSeconds: rem, threshold: loopThreshold });
+                                break;
+                            }
+                            await delay(1500);
                         }
-                        const st = basketTimer.getStatus();
-                        const rem = st.remainingSeconds;
-                        if (Number.isFinite(rem) && rem <= loopThreshold) {
-                            triggered = true;
-                            audit('basket_loop_hop_triggered', { hop: hopCount + 1, from: fromRole, to: toRole, seatId: loopSeatInfo?.seatId || null, remainingSeconds: rem, threshold: loopThreshold });
-                            break;
-                        }
-                        await delay(1500);
+                    } finally {
+                        clearPassiveSessionWatch();
                     }
 
                     if (!triggered) {
@@ -4940,7 +7015,7 @@ async function startBot(req, res) {
                     let removed = false;
                     for (let attempt = 1; attempt <= 3; attempt++) {
                         if (removed) break;
-                        removed = await clickRemoveFromCartAndConfirm(fromPage, cfg.TIMEOUTS.REMOVE_FROM_CART_TIMEOUT);
+                        removed = await clickRemoveFromCartAndConfirm(fromPage, getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT);
                         if (removed) break;
                         try {
                             await gotoWithRetry(fromPage, 'https://www.passo.com.tr/tr/sepet', {
@@ -4958,10 +7033,18 @@ async function startBot(req, res) {
                     try { releasedResolve?.(); } catch {}
 
                     // Receiver should pick now
-                    loopSeatInfo = await waitPickTo;
+                    try {
+                        loopSeatInfo = await waitPickTo;
+                    } catch (wpErr) {
+                        if (wpErr && wpErr.code === 'FINALIZE_COMPLETED' && finalizedToCResult) {
+                            try { runStore.upsert(runId, { status: 'completed', result: finalizedToCResult }); } catch {}
+                            return res.json(finalizedToCResult);
+                        }
+                        throw wpErr;
+                    }
                     setStep(`${toRole}.loop.clickContinue.start`);
                     await clickContinueInsidePage(toPage);
-                    await delay(cfg.DELAYS.AFTER_CONTINUE);
+                    await delay(getCfg().DELAYS.AFTER_CONTINUE);
                     setStep(`${toRole}.loop.clickContinue.done`, { snap: await snapshotPage(toPage, `${toRole}.loop.afterContinue`) });
 
                     setHolder(toRole, loopSeatInfo, (currentCatBlock || catBlockA));
@@ -4975,17 +7058,21 @@ async function startBot(req, res) {
                 // For backward compatible response: put the latest seatInfo into seatInfoB variable
                 seatInfoB = loopSeatInfo;
             } catch (e) {
+                if (e && e.code === 'FINALIZE_COMPLETED' && finalizedToCResult) {
+                    try { runStore.upsert(runId, { status: 'completed', result: finalizedToCResult }); } catch {}
+                    return res.json(finalizedToCResult);
+                }
                 logger.warn('Basket loop failed, continuing without loop', { error: e?.message || String(e) });
                 audit('basket_loop_failed', { aEmail: emailA, bEmail: emailB, seatId: seatInfoB?.seatId || seatInfoA?.seatId || null, error: e?.message || String(e) }, 'warn');
             }
         }
 
         // Optional external log
-        if (cfg.ORDER_LOG_URL) {
+        if (getCfg().ORDER_LOG_URL) {
             try {
                 const finalBasketStatus = basketTimer.getStatus();
-                logger.debug('Harici log servisine istek gönderiliyor', { orderLogUrl: cfg.ORDER_LOG_URL });
-                await axios.post(cfg.ORDER_LOG_URL, {
+                logger.debug('Harici log servisine istek gönderiliyor', { orderLogUrl: getCfg().ORDER_LOG_URL });
+                await axios.post(getCfg().ORDER_LOG_URL, {
                     link: eventAddress,
                     seat: seatInfoB.combined,
                     name: cardHolder,
@@ -5002,7 +7089,7 @@ async function startBot(req, res) {
                         isNearExpiry: finalBasketStatus.isNearExpiry
                     },
                     status: "Wait For Payment (B)"
-                }, {headers: {'Content-Type': 'application/json'}, timeout: cfg.TIMEOUTS.ORDER_LOG_TIMEOUT});
+                }, {headers: {'Content-Type': 'application/json'}, timeout: getCfg().TIMEOUTS.ORDER_LOG_TIMEOUT});
                 logger.info('Harici log servisine istek gönderildi', {
                     basketStatus: finalBasketStatus
                 });
@@ -5064,13 +7151,14 @@ async function startBot(req, res) {
         });
     } finally {
         try { if (basketMonitor) clearInterval(basketMonitor); } catch {}
+        try { clearPassiveSessionWatch(); } catch {}
         try { if (dynamicTimingCheck) clearInterval(dynamicTimingCheck); } catch {}
         try { if (finalizeWatch) clearInterval(finalizeWatch); } catch {}
         // Cleanup: Tarayıcıları kapat (KEEP_BROWSERS_OPEN=true ise açık bırak)
-        const shouldKeepOpen = process.env.KEEP_BROWSERS_OPEN === 'true';
+        const shouldKeepOpen = getCfg().FLAGS.KEEP_BROWSERS_OPEN === true;
         
         if (!shouldKeepOpen) {
-            const cleanupDelay = cfg.DELAYS.CLEANUP_DELAY;
+            const cleanupDelay = getCfg().DELAYS.CLEANUP_DELAY;
             
             setTimeout(async () => {
                 // Multi browsers cleanup
