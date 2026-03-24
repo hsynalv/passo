@@ -4637,22 +4637,6 @@ async function startBotAfterValidation(req, res, validatedData) {
         try { syncDashboardToRunStore(); } catch {}
     };
 
-    /** Arayüz /status: aktif çiftin phase metnini güncelle (A ile aynı ayrıntı seviyesinde B adımları için). */
-    const setPairPhase = (phase) => {
-        try {
-            if (!dashboardPairs.length) return;
-            const cTarget = resolveDashboardCTarget();
-            let hit = false;
-            dashboardPairs = dashboardPairs.map((p) => {
-                if (Number(p.pairIndex) !== cTarget) return p;
-                hit = true;
-                const t = String(phase || '').trim();
-                return { ...p, phase: t || p.phase };
-            });
-            if (hit) syncDashboardToRunStore();
-        } catch {}
-    };
-
     const getFinalizeRequest = () => {
         try {
             const st = runStore.get(runId);
@@ -6438,7 +6422,6 @@ async function startBotAfterValidation(req, res, validatedData) {
         basketTimer.start();
 
         setHolder('A', seatInfoA, catBlockA);
-        setPairPhase(`A sepette — ${fmtSeatLabel(seatInfoA)} — B transfer bekleniyor`);
         
         // Sayfadan sepette tutma süresini okumaya çalış (opsiyonel)
         const pageBasketInfo = await checkBasketTimeoutFromPage(pageA);
@@ -6450,12 +6433,6 @@ async function startBotAfterValidation(req, res, validatedData) {
         logger.info('A hesabı koltuk seçti ve sepete eklendi', { 
             seatInfo: seatInfoA,
             basketStatus: basketStatus
-        });
-        logger.info('Durum: A sepette koltuk tutuyor; B koltuk sayfasında bekleyecek', {
-            aEmail: emailA,
-            bEmail: emailB,
-            seatId: seatInfoA?.seatId || null,
-            koltuk: fmtSeatLabel(seatInfoA)
         });
 
         // B: go event -> BUY -> same category & block -> target seat (locked strategy)
@@ -6527,41 +6504,6 @@ async function startBotAfterValidation(req, res, validatedData) {
         // logger.info('B hesabı kategori/blok ayarlandı', { catBlockA });
 
         const seatSelectionUrlB = (() => { try { return pageB.url(); } catch { return null; } })();
-        const reapplyBSeatContext = async () => {
-            try {
-                await applyCategoryBlockSelection(pageB, categorySelectionMode, catBlockA, seatInfoA);
-            } catch (e) {
-                logger.warn('B.reapplySeatContext.applyCategory', { error: e?.message || String(e) });
-            }
-            const svgBid = (catBlockA?.svgBlockId || seatInfoA?.svgBlockId || null);
-            for (let attempt = 1; attempt <= 3; attempt++) {
-                try {
-                    await openSeatMapStrict(pageB);
-                } catch {}
-                try {
-                    await pageB.waitForFunction(
-                        (sel) => {
-                            try {
-                                return document.querySelectorAll(sel).length > 0;
-                            } catch {
-                                return false;
-                            }
-                        },
-                        { timeout: 20000 },
-                        SEAT_NODE_SELECTOR
-                    );
-                    return;
-                } catch {}
-                if (svgBid) {
-                    try {
-                        await selectSvgBlockById(pageB, String(svgBid));
-                    } catch {}
-                }
-                try {
-                    await delay(350 + attempt * 300);
-                } catch {}
-            }
-        };
         try {
             seatInfoA.__recoveryOptions = {
                 context: 'B',
@@ -6570,8 +6512,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 email: emailB,
                 password: passwordB,
                 reloginIfRedirected,
-                ensureTurnstileFn: ensureCaptchaOnPage,
-                reapplySeatContextFn: reapplyBSeatContext
+                ensureTurnstileFn: ensureCaptchaOnPage
             };
         } catch {}
 
@@ -6579,12 +6520,6 @@ async function startBotAfterValidation(req, res, validatedData) {
         const ready = await waitForTargetSeatReady(pageB, seatInfoA, 15000);
         if (!ready) logger.warn('B hesabı hedef koltuk DOM\'da bulunamadı, yine de denenecek');
         setStep('B.target.ready.done', { ready, snap: await snapshotPage(pageB, 'B.afterReady') });
-        setPairPhase(`B /koltuk-secim — A sepetten kaldırana kadar bekleniyor (${fmtSeatLabel(seatInfoA)})`);
-        logger.info('B hesabı koltuk sayfasında; A\'nın sepetten kaldırması bekleniyor', {
-            bEmail: emailB,
-            seatId: seatInfoA?.seatId || null,
-            koltuk: fmtSeatLabel(seatInfoA)
-        });
 
         // B hazır ama blok seçimi yapmadan bekliyor - A kaldırdıktan sonra yapacak
         let aRemovedResolve;
@@ -6595,31 +6530,12 @@ async function startBotAfterValidation(req, res, validatedData) {
             // A kaldırmadan önce bekle
             logger.info('B koltuk seçiminde hazır, A kaldırması bekleniyor');
             audit('b_waiting_a_remove', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null });
-            setPairPhase(`B bekliyor — A sepetten kaldırsın (${fmtSeatLabel(seatInfoA)})`);
-            logger.info('Durum: B bekliyor (A sepetten düşürecek)', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null });
             await aRemovedPromise;
-            setStep('B.afterARemove.start', { seatId: seatInfoA?.seatId || null });
-            setPairPhase('B: A kaldırdı — kategori/blok ve harita hazırlanıyor');
-            logger.info('A hesabı sepetten kaldırdı — B kategori/blok uyguluyor', {
-                aEmail: emailA,
-                bEmail: emailB,
-                seatId: seatInfoA?.seatId || null,
-                koltuk: fmtSeatLabel(seatInfoA)
-            });
+            logger.info('A kaldırdı, B blok seçimi yapıyor');
             audit('b_a_remove_received', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null });
 
-            setStep('B.afterARemove.captcha.ensure.start');
-            try {
-                await ensureCaptchaOnPage(pageB, emailB, 'B.afterARemove');
-                setStep('B.afterARemove.captcha.ensure.done');
-            } catch (e) {
-                logger.warn('B.afterARemove.captcha.ensure', { error: e?.message || String(e) });
-            }
-
             // After release, select block & mount seatmap deterministically.
-            setStep('B.afterARemove.applyCategory.start');
             try { await applyCategoryBlockSelection(pageB, categorySelectionMode, catBlockA, seatInfoA); } catch {}
-            setStep('B.afterARemove.applyCategory.done');
             const ensureSeatmapMountedOnB = async () => {
                 const svgBid = (catBlockA?.svgBlockId || seatInfoA?.svgBlockId || null);
                 for (let attempt = 1; attempt <= 3; attempt++) {
@@ -6639,13 +6555,7 @@ async function startBotAfterValidation(req, res, validatedData) {
             };
             try { await ensureSeatmapMountedOnB(); } catch {}
 
-            logger.info('B hesabı kategori/blok seçimi bitti — hedef koltuğa geçiliyor', {
-                bEmail: emailB,
-                seatId: seatInfoA?.seatId || null,
-                categoryText: catBlockA?.categoryText || null,
-                blockText: catBlockA?.blockText || null
-            });
-            setPairPhase(`B hedef koltuk — ${fmtSeatLabel(seatInfoA)} (seatId ${seatInfoA?.seatId || '—'})`);
+            logger.info('B blok seçimi tamamlandı, koltuk seçiliyor');
             audit('b_cat_block_set', {
                 aEmail: emailA,
                 bEmail: emailB,
@@ -6658,13 +6568,12 @@ async function startBotAfterValidation(req, res, validatedData) {
 
             // Öncelik: A'nın koltuğunu (aynı seatId) B hesabına aynen yakalat.
             const exactMaxMs = Math.max(30000, Math.min(getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 120000));
-            logger.info('B hesabı hedef koltuğu deniyor (aynı seatId)', { seatId: seatInfoA?.seatId || null, exactMaxMs, bEmail: emailB });
+            logger.info('B hedef koltuğu zorluyor (aynı seatId)', { seatId: seatInfoA?.seatId || null, exactMaxMs });
             audit('b_exact_pick_start', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null, maxMs: exactMaxMs, seatSelectionUrlB });
             try {
                 const gotExact = await pickExactSeatWithVerify_ReleaseAware(pageB, seatInfoA, exactMaxMs);
                 if (gotExact) {
-                    logger.info('B hesabı hedef koltuğu sepete aldı (exact)', { seat: gotExact, bEmail: emailB });
-                    setPairPhase(`B sepette — ${fmtSeatLabel(gotExact) || fmtSeatLabel(seatInfoA)}`);
+                    logger.info('B hedef koltuğu yakaladı (exact)', { seat: gotExact });
                     audit('b_exact_pick_done', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null, pickedSeatId: gotExact?.seatId || null, row: gotExact?.row || null, seat: gotExact?.seat || null });
                     return gotExact;
                 }
@@ -6675,7 +6584,6 @@ async function startBotAfterValidation(req, res, validatedData) {
 
             // Fallback: Eğer exact koltuk alınamazsa (başkası aldı vs), random dene.
             logger.warn('B exact seat alınamadı, random fallback', { seatId: seatInfoA?.seatId || null });
-            setPairPhase('B exact başarısız — rastgele koltuk deneniyor');
             audit('b_random_fallback_start', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null });
             const randomGot = await pickRandomSeatWithVerify(
                 pageB,
@@ -6689,8 +6597,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     reloginIfRedirected,
                     ensureTurnstileFn: ensureCaptchaOnPage,
                     chooseCategoryFn: chooseCategoryAndRandomBlock,
-                    categorySelectionMode,
-                    reapplySeatContextFn: reapplyBSeatContext
+                    categorySelectionMode
                 }
             );
             logger.info('B rastgele koltuk yakaladı (fallback)', { seat: randomGot });
@@ -6768,13 +6675,6 @@ async function startBotAfterValidation(req, res, validatedData) {
                     message: `${remaining} saniye kala koltuk A sepetinden kaldırılıp B hesabına geçiriliyor`
                 });
                 audit('dynamic_transfer_triggered', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null, remainingSeconds: remaining, threshold });
-                setPairPhase(`A sepetten kaldırıyor — ${remaining}s kala (B hazır)`);
-                logger.info('Durum: dinamik transfer — A sepetten kaldırma başlıyor', {
-                    aEmail: emailA,
-                    bEmail: emailB,
-                    seatId: seatInfoA?.seatId || null,
-                    remainingSeconds: remaining
-                });
                 
                 // A hesabı koltuğu sepetten kaldır
                 logger.debug('A hesabı koltuğu sepetten kaldırıyor (dinamik zamanlama)');
@@ -6934,19 +6834,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                 }
                 logger.info('A hesabı koltuğu sepetten kaldırdı (dinamik zamanlama)', {
                     remainingSeconds: remaining,
-                    elapsedSeconds: status.elapsedSeconds,
-                    seatId: seatInfoA?.seatId || null,
-                    aEmail: emailA,
-                    bEmail: emailB,
-                    koltuk: fmtSeatLabel(seatInfoA)
+                    elapsedSeconds: status.elapsedSeconds
                 });
 
                 audit('a_remove_from_basket_done', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null, reason: 'dynamic_timing' });
-                setPairPhase(`A sepetten kaldırdı — B devralıyor (${fmtSeatLabel(seatInfoA)})`);
-                logger.info('Durum: Sepetten kaldırma bitti; B kategori/blok ve koltuk adımına geçecek', {
-                    seatId: seatInfoA?.seatId || null,
-                    bEmail: emailB
-                });
 
                 // B tarafı A'nın kaldırmasını bekliyor; sinyal gönder.
                 try { aRemovedResolve?.(); } catch {}
