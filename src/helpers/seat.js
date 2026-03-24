@@ -154,7 +154,7 @@ function isBasketLikeUrl(u) {
   }
 }
 
-async function recoverIfRedirected(page, context, label, expectedUrlIncludes, recoveryUrl, email, password, reloginIfRedirected, ensureTurnstileFn) {
+async function recoverIfRedirected(page, context, label, expectedUrlIncludes, recoveryUrl, email, password, reloginIfRedirected, ensureTurnstileFn, reapplySeatContextFn) {
   if (!page || !recoveryUrl) return false;
   const curUrl = (() => { try { return page.url(); } catch { return ''; } })();
   // If we already reached basket/cart/payment, do NOT try to recover back to seat page.
@@ -210,6 +210,15 @@ async function recoverIfRedirected(page, context, label, expectedUrlIncludes, re
       await ensureTurnstileFn(page, email, `seatPick:${context}:${label}:recover`, { background: false });
     } catch (e) {
       logger.warn(`seatPick:${context}:recover_captcha_failed`, { label, error: e?.message || String(e) });
+    }
+  }
+
+  if (typeof reapplySeatContextFn === 'function') {
+    try {
+      await reapplySeatContextFn();
+      logger.info(`seatPick:${context}:recover_reapply_seat_context`, { label });
+    } catch (e) {
+      logger.warn(`seatPick:${context}:recover_reapply_failed`, { label, error: e?.message || String(e) });
     }
   }
 
@@ -347,6 +356,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
   const password = options.password || null;
   const chooseCategoryFn = typeof options.chooseCategoryFn === 'function' ? options.chooseCategoryFn : null;
   const categorySelectionMode = options.categorySelectionMode || 'legacy';
+  const reapplySeatContextFn = typeof options.reapplySeatContextFn === 'function' ? options.reapplySeatContextFn : null;
 
   const extendDeadline = (ms, reason) => {
     try {
@@ -481,7 +491,8 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
         email,
         password,
         reloginIfRedirected,
-        ensureTurnstileFn
+        ensureTurnstileFn,
+        reapplySeatContextFn
       );
 
       const check = await ensureUrlContains(page, expectedUrlIncludes, {
@@ -1674,7 +1685,7 @@ async function pickExactSeatWithVerify_Locked(page, target, maxMs = null, option
   await page.evaluate(()=>{ window.__passobot = {clicked:false, done:false}; });
 
   while (Date.now() < end) {
-      await recoverIfRedirected(page, 'B', 'locked_loop', null, null, null, null, null, null);
+      await recoverIfRedirected(page, 'B', 'locked_loop', null, null, null, null, null, null, null);
       // 1) Önce zaten SEPette mi?
       const b = await readBasketData(page);
       if (b && b.row && b.seat){
@@ -1782,7 +1793,18 @@ async function waitForTargetSeatReady(page, target, maxMs = null) {
   while (Date.now() < end) {
     if (target && target.__recoveryOptions && typeof target.__recoveryOptions === 'object') {
       const o = target.__recoveryOptions;
-      await recoverIfRedirected(page, o.context || 'B', 'wait_ready', o.expectedUrlIncludes || null, o.recoveryUrl || null, o.email || null, o.password || null, o.reloginIfRedirected || null, o.ensureTurnstileFn || null);
+      await recoverIfRedirected(
+        page,
+        o.context || 'B',
+        'wait_ready',
+        o.expectedUrlIncludes || null,
+        o.recoveryUrl || null,
+        o.email || null,
+        o.password || null,
+        o.reloginIfRedirected || null,
+        o.ensureTurnstileFn || null,
+        typeof o.reapplySeatContextFn === 'function' ? o.reapplySeatContextFn : null
+      );
     }
     const found = await page.evaluate(({ wantSeatId, wantRow, wantSeat }) => {
       const norm = (s) => (s || '').toString().trim().toLowerCase();
@@ -1832,6 +1854,7 @@ async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) 
   const password = rec?.password || null;
   const reloginIfRedirected = typeof rec?.reloginIfRedirected === 'function' ? rec.reloginIfRedirected : null;
   const ensureTurnstileFn = typeof rec?.ensureTurnstileFn === 'function' ? rec.ensureTurnstileFn : null;
+  const reapplySeatCtx = typeof rec?.reapplySeatContextFn === 'function' ? rec.reapplySeatContextFn : null;
 
   const wantSeatId = (target.seatId || '').toString().trim();
   const wantRow = (target.row || '').toString().trim().toLowerCase();
@@ -1849,7 +1872,18 @@ async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) 
     const nw0 = basketWatcher.getLatest();
     if (nw0 && nw0.data) return nw0.data;
 
-    const recovered = await recoverIfRedirected(page, ctx, 'release_loop', expectedUrlIncludes, recoveryUrl, email, password, reloginIfRedirected, ensureTurnstileFn);
+    const recovered = await recoverIfRedirected(
+      page,
+      ctx,
+      'release_loop',
+      expectedUrlIncludes,
+      recoveryUrl,
+      email,
+      password,
+      reloginIfRedirected,
+      ensureTurnstileFn,
+      reapplySeatCtx
+    );
     if (recovered && recoveryBonusUsedMs < recoveryBonusCapMs) {
       const add = Math.min(45000, recoveryBonusCapMs - recoveryBonusUsedMs);
       end += add;
