@@ -5,6 +5,8 @@ const DEFAULTS = {
   PASSO_LOGIN: 'https://www.passo.com.tr/tr/giris',
   TICKETING_API_BASE: 'https://ticketingweb.passo.com.tr',
   PASSO_SITE_KEY: '0x4AAAAAAA4rK8-JCAhwWhV4',
+  /** 1 ise /koltuk-secim'de site key DOM'dan gelmezse PASSO_SITE_KEY ile Turnstile çözülür (anahtarı .env'de güncel tutun). */
+  PASSO_TURNSTILE_ALLOW_SEAT_FALLBACK: '0',
   ANTICAPTCHA_KEY: '889906595a44af06f21717a07edf34e9',
   ANTICAPTCHA_FIRST_POLL_SEC: '2',
   ANTICAPTCHA_POLL_SEC: '1',
@@ -52,9 +54,12 @@ const DEFAULTS = {
   BASKET_WARNING_BEFORE_TIMEOUT: '60',
   BASKET_REMOVE_BEFORE_TIMEOUT: '30',
   PASSIVE_SESSION_CHECK_MS: '45000',
+  /** 1 ise A sepetteyken B /koltuk-secim beklerken periyodik hafif scroll (idle algısı için deneysel). */
+  PASSIVE_SEAT_SCROLL_KEEPALIVE: '0',
   TURNSTILE_SOLVE_TIMEOUT_MS: '120000',
   TURNSTILE_SOLVE_CONCURRENCY: '2',
   TURNSTILE_MAX_ATTEMPTS: '2',
+  TURNSTILE_SEAT_SITEKEY_POLL_MS: '12000',
   SEAT_WAIT_UNTIL_FOUND: '0',
   SEAT_WAIT_MAX_MINUTES: '90',
   SVG_CATEGORY_ROAM_MS: '10000'
@@ -123,6 +128,8 @@ function buildConfigFromEnv(env = process.env) {
     PASSO_LOGIN: envOrDefault('PASSO_LOGIN'),
     TICKETING_API_BASE: ticketingBase.replace(/\/$/, ''),
     PASSO_SITE_KEY: envOrDefault('PASSO_SITE_KEY'),
+    PASSO_TURNSTILE_ALLOW_SEAT_FALLBACK:
+      String(envOrDefault('PASSO_TURNSTILE_ALLOW_SEAT_FALLBACK') || '0').trim() === '1',
     ANTICAPTCHA_KEY: envOrDefault('ANTICAPTCHA_KEY'),
     ANTICAPTCHA_FIRST_POLL_SEC: parseFloat(envOrDefault('ANTICAPTCHA_FIRST_POLL_SEC') || '2'),
     ANTICAPTCHA_POLL_SEC: parseFloat(envOrDefault('ANTICAPTCHA_POLL_SEC') || '1'),
@@ -150,7 +157,8 @@ function buildConfigFromEnv(env = process.env) {
       EXPERIMENTAL_A_READD_COOLDOWN_SECONDS: parseInt(env.EXPERIMENTAL_A_READD_COOLDOWN_SECONDS || '60', 10),
       LOOP_ENABLED: String(env.BASKET_LOOP_ENABLED || '').trim() === '1',
       LOOP_MAX_HOPS: parseInt(env.BASKET_LOOP_MAX_HOPS || '12', 10),
-      PASSIVE_SESSION_CHECK_MS: parseInt(env.PASSIVE_SESSION_CHECK_MS || '45000', 10)
+      PASSIVE_SESSION_CHECK_MS: parseInt(env.PASSIVE_SESSION_CHECK_MS || '45000', 10),
+      PASSIVE_SEAT_SCROLL_KEEPALIVE: String(env.PASSIVE_SEAT_SCROLL_KEEPALIVE || '0').trim() === '1'
     },
 
     MULTI: {
@@ -164,6 +172,7 @@ function buildConfigFromEnv(env = process.env) {
       TURNSTILE_SOLVE_TIMEOUT: parseInt(env.TURNSTILE_SOLVE_TIMEOUT_MS || '120000', 10),
       TURNSTILE_SOLVE_CONCURRENCY: parseInt(env.TURNSTILE_SOLVE_CONCURRENCY || '2', 10),
       TURNSTILE_MAX_ATTEMPTS: parseInt(env.TURNSTILE_MAX_ATTEMPTS || '2', 10),
+      TURNSTILE_SEAT_SITEKEY_POLL_MS: parseInt(env.TURNSTILE_SEAT_SITEKEY_POLL_MS || '12000', 10),
       CLICK_BUY_RETRIES: parseInt(env.CLICK_BUY_RETRIES || '12', 10),
       CLICK_BUY_DELAY: parseInt(env.CLICK_BUY_DELAY || '400', 10),
       SEAT_SELECTION_MAX: parseInt(env.SEAT_SELECTION_MAX_MS || '90000', 10),

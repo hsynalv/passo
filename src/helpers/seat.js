@@ -196,13 +196,44 @@ async function recoverIfRedirected(page, context, label, expectedUrlIncludes, re
     await page.goto(String(effectiveRecoveryUrl), { waitUntil: 'domcontentloaded', timeout: 45000 });
   } catch {}
 
+  try {
+    await ensureUrlContains(page, '/koltuk-secim', {
+      retries: 3,
+      waitMs: 14000,
+      recoveryUrl: effectiveRecoveryUrl,
+      backoffMs: 450
+    });
+  } catch {}
+
   if (ensureTurnstileFn && email) {
     try {
-      await ensureTurnstileFn(page, email, `seatPick:${context}:${label}`, { background: true });
-    } catch {}
+      await ensureTurnstileFn(page, email, `seatPick:${context}:${label}:recover`, { background: false });
+    } catch (e) {
+      logger.warn(`seatPick:${context}:recover_captcha_failed`, { label, error: e?.message || String(e) });
+    }
   }
 
-  try { await openSeatMapStrict(page); } catch {}
+  try {
+    await openSeatMapStrict(page);
+  } catch {}
+
+  try {
+    await page.waitForFunction(
+      (sel) => {
+        try {
+          return document.querySelectorAll(sel).length > 0;
+        } catch {
+          return false;
+        }
+      },
+      { timeout: 18000 },
+      SEAT_NODE_SELECTOR
+    );
+  } catch {
+    logger.warn(`seatPick:${context}:recover_seatmap_wait_timeout`, { label });
+  }
+
+  logger.info(`seatPick:${context}:redirect_recover_done`, { label, url: (() => { try { return page.url(); } catch { return ''; } })() });
   return true;
 }
 
@@ -1788,7 +1819,9 @@ async function waitForTargetSeatReady(page, target, maxMs = null) {
 
 async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) {
   maxMs = maxMs || getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX;
-  const end = Date.now() + maxMs;
+  let end = Date.now() + maxMs;
+  let recoveryBonusUsedMs = 0;
+  const recoveryBonusCapMs = 120000;
   await openSeatMapStrict(page);
 
   const rec = (target && target.__recoveryOptions && typeof target.__recoveryOptions === 'object') ? target.__recoveryOptions : null;
@@ -1816,7 +1849,13 @@ async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) 
     const nw0 = basketWatcher.getLatest();
     if (nw0 && nw0.data) return nw0.data;
 
-    await recoverIfRedirected(page, ctx, 'release_loop', expectedUrlIncludes, recoveryUrl, email, password, reloginIfRedirected, ensureTurnstileFn);
+    const recovered = await recoverIfRedirected(page, ctx, 'release_loop', expectedUrlIncludes, recoveryUrl, email, password, reloginIfRedirected, ensureTurnstileFn);
+    if (recovered && recoveryBonusUsedMs < recoveryBonusCapMs) {
+      const add = Math.min(45000, recoveryBonusCapMs - recoveryBonusUsedMs);
+      end += add;
+      recoveryBonusUsedMs += add;
+      logger.info(`seatPick:${ctx}:release_loop_deadline_extended`, { addMs: add, recoveryBonusUsedMs, seatId: wantSeatId || null });
+    }
 
     // Önce basket kontrolü - network üzerinden gelen seat bilgisi
     const b = await readBasketData(page);

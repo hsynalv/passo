@@ -480,101 +480,110 @@ async function evalOnTarget(target, scriptBody, args) {
     return evaluateSafe(target, script);
 }
 
+function turnstileExtractKeyFromUrlString(u) {
+    try {
+        const s = String(u || '');
+        if (s.indexOf('challenges.cloudflare.com') < 0) return null;
+        const mPath = s.match(/turnstile\/[^\s"'<>]*?\/(0x[0-9A-Za-z]+)(?:\/|\b)/i);
+        if (mPath && mPath[1]) return mPath[1];
+        const mAny = s.match(/\b(0x[0-9A-Za-z]{10,})\b/);
+        if (mAny && mAny[1] && s.indexOf('/turnstile/') >= 0) return mAny[1];
+        const mQuery = s.match(/[?&](?:k|sitekey|render)=((?:0x)?[0-9A-Za-z_-]+)/i);
+        if (mQuery && mQuery[1]) {
+            const v = String(mQuery[1]);
+            return v.startsWith('0x') ? v : ('0x' + v);
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
+
+async function getBrowserFromPage(page) {
+    try {
+        if (page && typeof page.browser === 'function') return await page.browser();
+    } catch {}
+    return null;
+}
+
+function readBrowserStoredTurnstileKey(browser) {
+    try {
+        const k = browser && browser.__passoTurnstileSiteKey;
+        if (k && /^0x[0-9A-Za-z]{10,}$/i.test(String(k))) return String(k);
+    } catch {}
+    return null;
+}
+
+function storeBrowserTurnstileKey(browser, key) {
+    try {
+        if (browser && key && /^0x[0-9A-Za-z]{10,}$/i.test(String(key))) browser.__passoTurnstileSiteKey = String(key);
+    } catch {}
+}
+
+/** İlk navigasyondan önce kurulmalı; koltuk sayfasındaki Turnstile istekleri kaçmasın. */
+async function installTurnstileSiteKeyNetworkWatcher(page) {
+    if (!page || page.__turnstileSiteKeyWatcherInstalled) return;
+    page.__turnstileSiteKeyWatcherInstalled = true;
+    const extractKey = turnstileExtractKeyFromUrlString;
+    const onReq = (req) => {
+        try {
+            const key = extractKey(req?.url?.());
+            if (key) page.__turnstileLastSiteKey = key;
+        } catch {}
+    };
+    const onResp = (resp) => {
+        try {
+            const key = extractKey(resp?.url?.());
+            if (key) page.__turnstileLastSiteKey = key;
+        } catch {}
+    };
+    try {
+        page.on('request', onReq);
+    } catch {}
+    try {
+        page.on('response', onResp);
+    } catch {}
+
+    try {
+        const t = page.target?.();
+        const create = t && typeof t.createCDPSession === 'function' ? t.createCDPSession.bind(t) : null;
+        if (create) {
+            const client = await create();
+            page.__turnstileCdpClient = client;
+            try {
+                await client.send('Network.enable');
+            } catch {}
+            try {
+                client.on('Network.requestWillBeSent', (ev) => {
+                    try {
+                        const key = extractKey(ev?.request?.url);
+                        if (key) page.__turnstileLastSiteKey = key;
+                    } catch {}
+                });
+            } catch {}
+            try {
+                client.on('Network.responseReceived', (ev) => {
+                    try {
+                        const key = extractKey(ev?.response?.url);
+                        if (key) page.__turnstileLastSiteKey = key;
+                    } catch {}
+                });
+            } catch {}
+        }
+    } catch {}
+    logger.debug('turnstile:sitekey_watcher_installed');
+}
+
 async function ensureTurnstileTokenOnPage(page, email, label, options) {
     if (!page) return { attempted: false };
 
-    const opts = (options && typeof options === 'object') ? options : {};
+    const opts = options && typeof options === 'object' ? options : {};
     const background = !!opts.background;
     const targetFrame = opts.targetFrame || null;
 
     const evalTarget = targetFrame || page;
 
-    // Install a one-time network watcher to capture Turnstile sitekey from CF challenge URLs.
-    // This works even when the widget iframe is inside a closed shadow root and cannot be queried from DOM.
-    try {
-        if (!page.__turnstileSiteKeyWatcherInstalled) {
-            page.__turnstileSiteKeyWatcherInstalled = true;
-            const extractKey = (u) => {
-                try {
-                    const s = String(u || '');
-                    if (s.indexOf('challenges.cloudflare.com') < 0) return null;
-                    // Key can appear in path or query params depending on integration.
-                    // Examples:
-                    // - .../turnstile/v0/api.js?render=0x...
-                    // - .../turnstile/0x.../...
-                    // - ...?k=0x... or ?sitekey=0x...
-                    const mPath = s.match(/turnstile\/[^\s"'<>]*?\/(0x[0-9A-Za-z]+)(?:\/|\b)/i);
-                    if (mPath && mPath[1]) return mPath[1];
-                    const mAny = s.match(/\b(0x[0-9A-Za-z]{10,})\b/);
-                    if (mAny && mAny[1] && s.indexOf('/turnstile/') >= 0) return mAny[1];
-                    const mQuery = s.match(/[?&](?:k|sitekey|render)=((?:0x)?[0-9A-Za-z_-]+)/i);
-                    if (mQuery && mQuery[1]) {
-                        const v = String(mQuery[1]);
-                        return v.startsWith('0x') ? v : ('0x' + v);
-                    }
-                    return null;
-                } catch { return null; }
-            };
-            const onReq = (req) => {
-                try {
-                    const key = extractKey(req?.url?.());
-                    if (key) page.__turnstileLastSiteKey = key;
-                } catch {}
-            };
-            const onResp = (resp) => {
-                try {
-                    const key = extractKey(resp?.url?.());
-                    if (key) page.__turnstileLastSiteKey = key;
-                } catch {}
-            };
-            try { page.on('request', onReq); } catch {}
-            try { page.on('response', onResp); } catch {}
-
-            try {
-                const t = page.target?.();
-                const create = t && typeof t.createCDPSession === 'function' ? t.createCDPSession.bind(t) : null;
-                if (create) {
-                    const client = await create();
-                    page.__turnstileCdpClient = client;
-                    try { await client.send('Network.enable'); } catch {}
-                    try {
-                        client.on('Network.requestWillBeSent', (ev) => {
-                            try {
-                                const key = extractKey(ev?.request?.url);
-                                if (key) page.__turnstileLastSiteKey = key;
-                            } catch {}
-                        });
-                    } catch {}
-                    try {
-                        client.on('Network.responseReceived', (ev) => {
-                            try {
-                                const key = extractKey(ev?.response?.url);
-                                if (key) page.__turnstileLastSiteKey = key;
-                            } catch {}
-                        });
-                    } catch {}
-                }
-            } catch {}
-            logger.debug('turnstile:sitekey_watcher_installed', { email });
-        }
-    } catch {}
-
-    const extractKeyFromUrl = (u) => {
-        try {
-            const s = String(u || '');
-            if (s.indexOf('challenges.cloudflare.com') < 0) return null;
-            const mPath = s.match(/turnstile\/[^\s"'<>]*?\/(0x[0-9A-Za-z]+)(?:\/|\b)/i);
-            if (mPath && mPath[1]) return mPath[1];
-            const mAny = s.match(/\b(0x[0-9A-Za-z]{10,})\b/);
-            if (mAny && mAny[1] && s.indexOf('/turnstile/') >= 0) return mAny[1];
-            const mQuery = s.match(/[?&](?:k|sitekey|render)=((?:0x)?[0-9A-Za-z_-]+)/i);
-            if (mQuery && mQuery[1]) {
-                const v = String(mQuery[1]);
-                return v.startsWith('0x') ? v : ('0x' + v);
-            }
-            return null;
-        } catch { return null; }
-    };
+    await installTurnstileSiteKeyNetworkWatcher(page);
 
     // Cache in-flight solves per Page to avoid starting multiple expensive captcha requests.
     const getCache = () => {
@@ -597,13 +606,11 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
                 const hasWidget = !!document.querySelector('.cf-turnstile');
                 const widget = document.querySelector('.cf-turnstile');
                 const siteKeyFromWidget = widget ? (widget.getAttribute('data-sitekey') || null) : null;
-                // Some integrations do not expose the key on the main widget node. Try any element with data-sitekey.
                 const allKeyNodes = Array.from(document.querySelectorAll('[data-sitekey]'));
                 const allSiteKeys = allKeyNodes
                     .map(n => (n.getAttribute('data-sitekey') || '').trim())
                     .filter(Boolean)
                     .slice(0, 6);
-                // Passo's Turnstile often uses a closed shadowroot; the sitekey is embedded in the iframe src.
                 let siteKeyFromIframe = null;
                 try {
                     const ifr = document.querySelector('#turnstile-container iframe, .cf-turnstile iframe');
@@ -612,8 +619,63 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
                     if (m && m[1]) siteKeyFromIframe = m[1];
                 } catch {}
 
-                // If iframe is in a closed shadow root, we cannot query it directly.
-                // In that case, parse sitekey from loaded resource URLs (Turnstile iframe src appears there).
+                function keyFromChallengeUrl(name) {
+                    if (!name || name.indexOf('challenges.cloudflare.com') < 0) return null;
+                    const m2 = name.match(/turnstile\/[^\s"'<>]*?\/(0x[0-9A-Za-z]+)(?:\/|\b)/i);
+                    if (m2 && m2[1]) return m2[1];
+                    const mq = name.match(/[?&](?:k|sitekey|render)=((?:0x)?[0-9A-Za-z_-]+)/i);
+                    if (mq && mq[1]) return String(mq[1]).startsWith('0x') ? mq[1] : ('0x' + mq[1]);
+                    const m0 = name.match(/\b(0x[0-9A-Za-z]{10,})\b/);
+                    if (m0 && m0[1] && name.indexOf('/turnstile/') >= 0) return m0[1];
+                    return null;
+                }
+                function walkShadowIframes(root, depth) {
+                    if (!root || depth > 12) return null;
+                    try {
+                        const iframes = root.querySelectorAll ? root.querySelectorAll('iframe') : [];
+                        for (let i = 0; i < iframes.length; i++) {
+                            const src = iframes[i].getAttribute('src') || '';
+                            const k = keyFromChallengeUrl(src);
+                            if (k) return k;
+                        }
+                        const nodes = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                        for (let j = 0; j < nodes.length; j++) {
+                            const el = nodes[j];
+                            if (el && el.shadowRoot) {
+                                const k2 = walkShadowIframes(el.shadowRoot, depth + 1);
+                                if (k2) return k2;
+                            }
+                        }
+                    } catch (e) {}
+                    return null;
+                }
+                const siteKeyFromShadow = walkShadowIframes(document, 0);
+                let siteKeyFromScriptSrc = null;
+                try {
+                    const sc = document.querySelectorAll('script[src*="cloudflare"], script[src*="turnstile"], script[src*="challenges"]');
+                    for (let s = 0; s < sc.length; s++) {
+                        const href = sc[s].getAttribute('src') || '';
+                        const ks = keyFromChallengeUrl(href);
+                        if (ks) {
+                            siteKeyFromScriptSrc = ks;
+                            break;
+                        }
+                    }
+                } catch (e) {}
+                let siteKeyFromInline = null;
+                try {
+                    const sx = document.querySelectorAll('script:not([src])');
+                    for (let z = 0; z < sx.length; z++) {
+                        const tx = sx[z].textContent || '';
+                        if (tx.indexOf('turnstile') < 0 && tx.indexOf('challenges') < 0 && tx.indexOf('0x') < 0) continue;
+                        const mi = tx.match(/\b(0x[0-9A-Za-z]{10,})\b/);
+                        if (mi && mi[1]) {
+                            siteKeyFromInline = mi[1];
+                            break;
+                        }
+                    }
+                } catch (e2) {}
+
                 let siteKeyFromPerf = null;
                 try {
                     const ents = (performance && typeof performance.getEntriesByType === 'function')
@@ -631,8 +693,6 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
                     }
                 } catch {}
 
-                // Last resort in page context: scan HTML source for embedded Turnstile URLs.
-                // Some browsers expose closed shadowroot contents in the DOM snapshot HTML.
                 let siteKeyFromHtml = null;
                 try {
                     const html = document.documentElement && document.documentElement.outerHTML
@@ -650,13 +710,34 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
                     }
                 } catch {}
 
-                const siteKey = siteKeyFromWidget || siteKeyFromIframe || siteKeyFromPerf || siteKeyFromHtml || (allSiteKeys.length ? allSiteKeys[0] : null);
+                const siteKey =
+                    siteKeyFromWidget ||
+                    siteKeyFromIframe ||
+                    siteKeyFromShadow ||
+                    siteKeyFromScriptSrc ||
+                    siteKeyFromInline ||
+                    siteKeyFromPerf ||
+                    siteKeyFromHtml ||
+                    (allSiteKeys.length ? allSiteKeys[0] : null);
                 const input = document.querySelector('input[name="cf-turnstile-response"]');
                 const hasTokenField = !!input;
                 const tokenLen = (input && input.value) ? String(input.value).length : 0;
                 let href = null;
                 try { href = location && location.href ? String(location.href) : null; } catch {}
-                return { hasVerifyHuman, hasWidget, hasTokenField, tokenLen, siteKey, href, allSiteKeys, siteKeyFromIframe, siteKeyFromPerf, siteKeyFromHtml };
+                return {
+                    hasVerifyHuman,
+                    hasWidget,
+                    hasTokenField,
+                    tokenLen,
+                    siteKey,
+                    href,
+                    allSiteKeys,
+                    siteKeyFromIframe,
+                    siteKeyFromShadow,
+                    siteKeyFromScriptSrc,
+                    siteKeyFromPerf,
+                    siteKeyFromHtml
+                };
             }).catch(() => ({ hasVerifyHuman: false, hasWidget: false, hasTokenField: false, tokenLen: 0 }));
 
             const shouldSolve = (state.hasVerifyHuman || state.hasWidget || state.hasTokenField) && state.tokenLen <= 0;
@@ -674,7 +755,12 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
                 const effectiveUrl0 = state?.href || (() => { try { return page.url(); } catch { return null; } })() || '';
                 const isSeatSel = /\/koltuk-secim(\b|\/|\?|#)/i.test(String(effectiveUrl0 || ''));
                 if (isSeatSel) {
-                    const until = Date.now() + 3500;
+                    const seatPollRaw = Number(getCfg()?.TIMEOUTS?.TURNSTILE_SEAT_SITEKEY_POLL_MS);
+                    const seatPollMs = Math.min(
+                        25000,
+                        Math.max(3500, Number.isFinite(seatPollRaw) && seatPollRaw > 0 ? seatPollRaw : 12000)
+                    );
+                    const until = Date.now() + seatPollMs;
                     while (Date.now() < until) {
                         try { cachedKey = page.__turnstileLastSiteKey || null; } catch {}
                         if (cachedKey) break;
@@ -725,7 +811,7 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
                     const frames = typeof page.frames === 'function' ? page.frames() : [];
                     for (const fr of frames) {
                         const u = (() => { try { return fr?.url?.() || ''; } catch { return ''; } })();
-                        const k = extractKeyFromUrl(u);
+                        const k = turnstileExtractKeyFromUrlString(u);
                         if (k) {
                             cachedKey = k;
                             try { page.__turnstileLastSiteKey = k; } catch {}
@@ -737,9 +823,26 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
             const effectiveUrl = state?.href || (() => { try { return page.url(); } catch { return null; } })() || getCfg().PASSO_LOGIN;
             const isSeatSel2 = /\/koltuk-secim(\b|\/|\?|#)/i.test(String(effectiveUrl || ''));
 
-            // IMPORTANT: Do not solve with the fallback env key on seat-selection pages.
-            // If we couldn't detect the real sitekey, a token from a wrong key will not unlock the page.
-            const effectiveSiteKey = state?.siteKey || cachedKey || (isSeatSel2 ? null : (getCfg().PASSO_SITE_KEY || null));
+            const browserForKey = await getBrowserFromPage(page);
+            const sessionTurnstileKey = readBrowserStoredTurnstileKey(browserForKey);
+            const cfgPassoKey = (getCfg().PASSO_SITE_KEY || '').trim() || null;
+            const allowSeatCfgFallback = !!getCfg().PASSO_TURNSTILE_ALLOW_SEAT_FALLBACK;
+            const effectiveSiteKey =
+                state?.siteKey ||
+                cachedKey ||
+                sessionTurnstileKey ||
+                (!isSeatSel2 && cfgPassoKey) ||
+                (isSeatSel2 && allowSeatCfgFallback && cfgPassoKey) ||
+                null;
+
+            if (effectiveSiteKey && !state?.siteKey && !cachedKey) {
+                logger.info('turnstile:sitekey_resolved_without_dom', {
+                    email,
+                    label,
+                    via: sessionTurnstileKey ? 'browser_session' : 'PASSO_SITE_KEY',
+                    isSeatSel: isSeatSel2
+                });
+            }
 
             if (!effectiveSiteKey || !getCfg().ANTICAPTCHA_KEY) {
                 logger.warn('turnstile:cannot_solve_missing_keys', {
@@ -781,6 +884,10 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
                 } finally {
                     getTurnstileSolveSem().release();
                 }
+                try {
+                    const br = await getBrowserFromPage(page);
+                    storeBrowserTurnstileKey(br, effectiveSiteKey);
+                } catch {}
                 logger.info('turnstile:solve_result', {
                     email,
                     label,
@@ -1620,6 +1727,7 @@ async function launchAndLogin(options) {
 
     logger.debug('launchAndLogin: login sayfasına gidiliyor', { email, url: getCfg().PASSO_LOGIN });
 
+    await installTurnstileSiteKeyNetworkWatcher(page);
     await installTurnstileCallbackInterceptor(page);
 
     // Capture main document response info for /giris
@@ -4956,6 +5064,34 @@ async function startBotAfterValidation(req, res, validatedData) {
                 const fr = getFinalizeRequest();
                 if (fr?.requested && fr?.cAccount?.email) return;
             } catch {}
+            if (getCfg()?.BASKET?.PASSIVE_SEAT_SCROLL_KEEPALIVE) {
+                try {
+                    const u0 = (() => {
+                        try {
+                            return String(page.url() || '');
+                        } catch {
+                            return '';
+                        }
+                    })();
+                    if (u0.includes('/koltuk-secim')) {
+                        await evaluateSafe(page, () => {
+                            try {
+                                const doc = document.documentElement;
+                                const body = document.body;
+                                const sh = Math.max(doc ? doc.scrollHeight : 0, body ? body.scrollHeight : 0, 0);
+                                const ch = window.innerHeight || (doc ? doc.clientHeight : 0) || 600;
+                                const maxScroll = Math.max(0, sh - ch);
+                                if (maxScroll < 100) return;
+                                const cur = window.scrollY || (doc ? doc.scrollTop : 0) || 0;
+                                const dir = Math.random() < 0.5 ? 1 : -1;
+                                const delta = Math.floor(50 + Math.random() * 100) * dir;
+                                const next = Math.max(0, Math.min(maxScroll, cur + delta));
+                                window.scrollTo(0, next);
+                            } catch (e) {}
+                        });
+                    }
+                } catch {}
+            }
             try {
                 await reloginIfRedirected(page, email, password);
             } catch {}
