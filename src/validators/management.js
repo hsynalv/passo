@@ -8,16 +8,17 @@ const teamPayloadSchema = z.object({
 });
 
 const categoryPayloadSchema = z.object({
-  label: z.string().min(1, 'Kategori etiketi zorunludur'),
-  selectionModeHint: z.enum(['legacy', 'scan', 'svg']).optional().nullable(),
-  categoryTypeValue: z.string().min(1, 'Kategori değeri zorunludur'),
-  alternativeCategoryValue: z.string().optional().nullable(),
-  sortOrder: z.union([z.number(), z.string()]).optional().transform((val) => {
-    if (val === undefined || val === null || val === '') return 0;
-    const n = typeof val === 'number' ? val : parseInt(String(val).trim(), 10);
-    return Number.isFinite(n) ? n : 0;
-  }),
+  label: z.string().optional(),
+  categoryTypeValue: z.string().min(1, 'Kategori zorunludur'),
   isActive: z.boolean().optional().default(true),
+}).transform((data) => {
+  const value = String(data.categoryTypeValue || '').trim();
+  const label = String(data.label || '').trim() || value;
+  return {
+    ...data,
+    label,
+    categoryTypeValue: value,
+  };
 });
 
 const credentialBaseSchema = z.object({

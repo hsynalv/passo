@@ -389,36 +389,15 @@
             <div class="managerGrid managerGridContent">
               <section class="managerSection">
                 <h3>Kategori Yönetimi</h3>
-                <div class="hint" style="margin-top:0">Aşağıdaki liste sadece seçili takıma aittir. Düzenle dediğinde form otomatik dolar.</div>
+                <div class="hint" style="margin-top:0">Takım için sadece kategori adını girmen yeterli. Liste giriş sırasına göre akar.</div>
                 <div id="manageCategoryList" class="itemList">
                   <div class="itemListEmpty">Takım seçildiğinde kategoriler burada görünür.</div>
                 </div>
                 <input id="categoryEditId" type="hidden" />
                 <div class="managerFormStack">
                 <div class="row">
-                  <label>Etiket</label>
-                  <input id="categoryLabelInput" type="text" placeholder="Maraton Alt" />
-                </div>
-                <div class="row">
-                  <label>Kategori Değeri</label>
-                  <input id="categoryValueInput" type="text" placeholder="Maraton" />
-                </div>
-                <div class="row">
-                  <label>Alternatif</label>
-                  <input id="categoryAltInput" type="text" placeholder="Kale Arkası" />
-                </div>
-                <div class="row">
-                  <label>Mod</label>
-                  <select id="categoryModeInput">
-                    <option value="">varsayılan</option>
-                    <option value="legacy">legacy</option>
-                    <option value="scan">scan</option>
-                    <option value="svg">svg</option>
-                  </select>
-                </div>
-                <div class="row">
-                  <label>Sıra</label>
-                  <input id="categorySortInput" type="number" value="0" />
+                  <label>Kategori</label>
+                  <input id="categoryValueInput" type="text" placeholder="Maraton Alt" />
                 </div>
                 </div>
                 <div class="actions">

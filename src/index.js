@@ -56,7 +56,18 @@ async function start() {
             return false;
         }
     });
-    if (publicDir) app.use(express.static(publicDir));
+    if (publicDir) {
+        app.use(express.static(publicDir, {
+            setHeaders(res, filePath) {
+                if (/\.(html|js|css)$/i.test(String(filePath || ''))) {
+                    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+                    res.setHeader('Pragma', 'no-cache');
+                    res.setHeader('Expires', '0');
+                    res.setHeader('Surrogate-Control', 'no-store');
+                }
+            }
+        }));
+    }
 
     app.get('/health', (req, res) => res.json({ ok: true }));
 

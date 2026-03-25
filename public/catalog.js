@@ -150,12 +150,7 @@
       const title = document.createElement('strong');
       title.textContent = item.label || item.categoryTypeValue || 'Kategori';
       const sub = document.createElement('span');
-      const bits = [
-        item.categoryTypeValue ? `değer: ${item.categoryTypeValue}` : '',
-        item.alternativeCategoryValue ? `alt: ${item.alternativeCategoryValue}` : '',
-        item.selectionModeHint ? `mod: ${item.selectionModeHint}` : '',
-      ].filter(Boolean);
-      sub.textContent = bits.join(' • ') || 'Tanım yok';
+      sub.textContent = 'Takıma kayıtlı kategori';
       meta.appendChild(title);
       meta.appendChild(sub);
       wrap.appendChild(input);
@@ -233,11 +228,7 @@
 
   function resetCategoryForm() {
     $('categoryEditId').value = '';
-    $('categoryLabelInput').value = '';
     $('categoryValueInput').value = '';
-    $('categoryAltInput').value = '';
-    $('categoryModeInput').value = '';
-    $('categorySortInput').value = '0';
   }
 
   function resetCredentialForm() {
@@ -256,7 +247,7 @@
       root.innerHTML = '<div class="itemListEmpty">Önce takım seç.</div>';
       return;
     }
-    const all = state.categories.slice().sort((a, b) => Number(a.sortOrder || 0) - Number(b.sortOrder || 0));
+    const all = state.categories.slice();
     if (!all.length) {
       root.innerHTML = '<div class="itemListEmpty">Kategori yok.</div>';
       return;
@@ -267,7 +258,7 @@
       row.className = 'itemCard' + (editingId === item.id ? ' active' : '');
       const meta = document.createElement('div');
       meta.innerHTML = `<strong>${escapeHtml(item.label || item.categoryTypeValue || 'Kategori')}</strong>
-        <div class="itemCardMeta">değer: ${escapeHtml(item.categoryTypeValue || '')}<br>alt: ${escapeHtml(item.alternativeCategoryValue || '—')}<br>mod: ${escapeHtml(item.selectionModeHint || 'varsayılan')} • sıra: ${escapeHtml(String(item.sortOrder ?? 0))}</div>`;
+        <div class="itemCardMeta">Takım kategori sıralamasında yer alır.</div>`;
       const actions = document.createElement('div');
       actions.className = 'itemCardActions';
       actions.innerHTML = `<button type="button" data-action="edit" data-category-id="${escapeHtml(item.id)}" class="btnMuted">Düzenle</button>
@@ -458,12 +449,10 @@
       notify('Kategori için önce takım seç');
       return;
     }
+    const categoryValue = String($('categoryValueInput').value || '').trim();
     const payload = {
-      label: String($('categoryLabelInput').value || '').trim(),
-      categoryTypeValue: String($('categoryValueInput').value || '').trim(),
-      alternativeCategoryValue: String($('categoryAltInput').value || '').trim(),
-      selectionModeHint: String($('categoryModeInput').value || '').trim() || null,
-      sortOrder: parseInt(String($('categorySortInput').value || '0').trim(), 10) || 0,
+      label: categoryValue,
+      categoryTypeValue: categoryValue,
       isActive: true,
     };
     const editId = String($('categoryEditId').value || '').trim();
@@ -539,11 +528,7 @@
     const item = state.categories.find((row) => row.id === categoryId);
     if (!item) return;
     $('categoryEditId').value = item.id;
-    $('categoryLabelInput').value = item.label || '';
     $('categoryValueInput').value = item.categoryTypeValue || '';
-    $('categoryAltInput').value = item.alternativeCategoryValue || '';
-    $('categoryModeInput').value = item.selectionModeHint || '';
-    $('categorySortInput').value = String(item.sortOrder ?? 0);
     renderManageCategoryList();
   }
 
