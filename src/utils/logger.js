@@ -19,6 +19,8 @@ const maskSensitive = (obj) => {
     if (masked.cvv) masked.cvv = '***';
     if (masked.proxyPassword) masked.proxyPassword = '***';
     if (masked.ANTICAPTCHA_KEY) masked.ANTICAPTCHA_KEY = '***';
+    if (masked.CREDENTIAL_SECRET_KEY) masked.CREDENTIAL_SECRET_KEY = '***';
+    if (masked.encryptedPassword) masked.encryptedPassword = '***';
     return masked;
 };
 

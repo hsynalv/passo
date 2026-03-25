@@ -8,8 +8,18 @@ const accountSchema = z.object({
   fanCardCode: z.string().nullable().optional()
 });
 
+const selectedCategorySchema = z.object({
+  id: z.string().optional(),
+  label: z.string().min(1, 'Kategori etiketi zorunludur').optional(),
+  categoryType: z.string().min(1, 'Kategori değeri zorunludur'),
+  alternativeCategory: z.string().optional().nullable(),
+  selectionModeHint: z.enum(['legacy', 'scan', 'svg']).optional().nullable(),
+  sortOrder: z.union([z.number(), z.string()]).optional(),
+});
+
 const botRequestSchema = z.object({
-  team: z.string().min(1, 'Team zorunludur'),
+  team: z.string().optional(),
+  teamId: z.string().optional(),
   ticketType: z.enum(['combined', 'regular'], {
     errorMap: () => ({ message: 'ticketType "combined" veya "regular" olmalıdır' })
   }),
@@ -50,6 +60,10 @@ const botRequestSchema = z.object({
   // New multi-account fields
   aAccounts: z.array(accountSchema).optional(),
   bAccounts: z.array(accountSchema).optional(),
+  aCredentialIds: z.array(z.string().min(1)).optional(),
+  bCredentialIds: z.array(z.string().min(1)).optional(),
+  selectedCategoryIds: z.array(z.string().min(1)).optional(),
+  selectedCategories: z.array(selectedCategorySchema).optional(),
 
   cardHolder: z.string().min(1, 'Kart sahibi adı zorunludur').optional(),
   cardNumber: z.string().regex(/^[\d\s]{13,19}$/, 'Geçerli bir kart numarası giriniz (13-19 haneli)').optional(),
@@ -77,9 +91,22 @@ const botRequestSchema = z.object({
       return Object.keys(out).length ? out : undefined;
     }),
 }).superRefine((data, ctx) => {
+  const hasTeam = !!String(data.team || '').trim();
+  const hasTeamId = !!String(data.teamId || '').trim();
+  if (!hasTeam && !hasTeamId) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['team'],
+      message: 'Takım seçimi zorunludur'
+    });
+  }
+
   const mode = String(data.categorySelectionMode || 'scan');
+  const selectedCategories = Array.isArray(data.selectedCategories) ? data.selectedCategories : [];
+  const selectedCategoryIds = Array.isArray(data.selectedCategoryIds) ? data.selectedCategoryIds : [];
   if (mode === 'legacy') {
-    if (!data.categoryType || String(data.categoryType).trim().length === 0) {
+    const hasSelectedCategory = selectedCategories.some((item) => String(item?.categoryType || '').trim());
+    if (!hasSelectedCategory && (!data.categoryType || String(data.categoryType).trim().length === 0)) {
       ctx.addIssue({
         code: 'custom',
         path: ['categoryType'],
@@ -90,21 +117,31 @@ const botRequestSchema = z.object({
 
   const aList = Array.isArray(data.aAccounts) ? data.aAccounts : [];
   const bList = Array.isArray(data.bAccounts) ? data.bAccounts : [];
+  const aCredentialIds = Array.isArray(data.aCredentialIds) ? data.aCredentialIds : [];
+  const bCredentialIds = Array.isArray(data.bCredentialIds) ? data.bCredentialIds : [];
   const hasLegacyA = !!(data.email && data.password);
   const hasLegacyB = !!(data.email2 && data.password2);
 
-  if (!aList.length && !hasLegacyA) {
+  if (!aList.length && !aCredentialIds.length && !hasLegacyA) {
     ctx.addIssue({
       code: 'custom',
       path: ['aAccounts'],
-      message: 'En az 1 A hesabı zorunludur (aAccounts veya email/password)'
+      message: 'En az 1 A hesabı zorunludur (aAccounts, aCredentialIds veya email/password)'
     });
   }
-  if (!bList.length && !hasLegacyB) {
+  if (!bList.length && !bCredentialIds.length && !hasLegacyB) {
     ctx.addIssue({
       code: 'custom',
       path: ['bAccounts'],
-      message: 'En az 1 B hesabı zorunludur (bAccounts veya email2/password2)'
+      message: 'En az 1 B hesabı zorunludur (bAccounts, bCredentialIds veya email2/password2)'
+    });
+  }
+
+  if (hasTeamId && !selectedCategories.length && !selectedCategoryIds.length && !String(data.categoryType || '').trim()) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['selectedCategoryIds'],
+      message: 'Takım seçildiğinde en az 1 kategori seçilmelidir'
     });
   }
 });

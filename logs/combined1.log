@@ -9235,3 +9235,19 @@
 {"email":"linemargs1@yaani.com","hasRec":false,"hasTsWidget":false,"iteration":1,"level":"warn","message":"finalize_c_challenge_still_waiting","recLen":0,"service":"passobot-pro","timestamp":"2026-03-24 12:46:00","tsFieldPresent":false,"tsLen":0}
 {"email":"linemargs1@yaani.com","isKoltukSecim":false,"label":"C.waitHumanTok.1","level":"info","message":"captcha:wrapper_try_recaptcha","service":"passobot-pro","timestamp":"2026-03-24 12:46:00","turnstileMissingKeys":false}
 {"attempted":false,"email":"linemargs1@yaani.com","label":"C.waitHumanTok.1","level":"info","message":"captcha:wrapper_recaptcha_result","reason":"no_sitekey","service":"passobot-pro","timestamp":"2026-03-24 12:46:00"}
+{"dbName":"passobot","level":"info","message":"MongoDB bağlantısı kuruldu","service":"passobot-pro","timestamp":"2026-03-25 17:49:11"}
+{"level":"info","message":"Bot sunucusu http://localhost:2222 üzerinde çalışıyor","service":"passobot-pro","timestamp":"2026-03-25 17:49:11"}
+{"dbName":"passobot","level":"info","message":"MongoDB bağlantısı kuruldu","service":"passobot-pro","timestamp":"2026-03-25 17:55:34"}
+{"level":"info","message":"Bot sunucusu http://localhost:2222 üzerinde çalışıyor","service":"passobot-pro","timestamp":"2026-03-25 17:55:34"}
+{"dbName":"passobot","level":"info","message":"MongoDB bağlantısı kuruldu","service":"passobot-pro","timestamp":"2026-03-25 18:01:26"}
+{"level":"info","message":"Bot sunucusu http://localhost:2222 üzerinde çalışıyor","service":"passobot-pro","timestamp":"2026-03-25 18:01:26"}
+{"dbName":"passobot","level":"info","message":"MongoDB bağlantısı kuruldu","service":"passobot-pro","timestamp":"2026-03-25 18:06:34"}
+{"level":"info","message":"Bot sunucusu http://localhost:2222 üzerinde çalışıyor","service":"passobot-pro","timestamp":"2026-03-25 18:06:34"}
+{"dbName":"passobot","level":"info","message":"MongoDB bağlantısı kuruldu","service":"passobot-pro","timestamp":"2026-03-25 18:22:46"}
+{"level":"info","message":"Bot sunucusu http://localhost:2222 üzerinde çalışıyor","service":"passobot-pro","timestamp":"2026-03-25 18:22:46"}
+{"dbName":"passobot","level":"info","message":"MongoDB bağlantısı kuruldu","service":"passobot-pro","timestamp":"2026-03-25 18:27:06"}
+{"level":"info","message":"Bot sunucusu http://localhost:2222 üzerinde çalışıyor","service":"passobot-pro","timestamp":"2026-03-25 18:27:06"}
+{"dbName":"passobot","level":"info","message":"MongoDB bağlantısı kuruldu","service":"passobot-pro","timestamp":"2026-03-25 18:38:48"}
+{"level":"info","message":"Bot sunucusu http://localhost:2222 üzerinde çalışıyor","service":"passobot-pro","timestamp":"2026-03-25 18:38:48"}
+{"dbName":"passobot","level":"info","message":"MongoDB bağlantısı kuruldu","service":"passobot-pro","timestamp":"2026-03-25 18:42:31"}
+{"level":"info","message":"Bot sunucusu http://localhost:2222 üzerinde çalışıyor","service":"passobot-pro","timestamp":"2026-03-25 18:42:31"}

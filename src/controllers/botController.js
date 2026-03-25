@@ -7,9 +7,13 @@ const fs = require('fs');
 const { botRequestSchema } = require('../validators/botRequest');
 
 const configRoot = require('../config');
+const categoryRepo = require('../repositories/categoryRepository');
+const credentialRepo = require('../repositories/credentialRepository');
+const teamRepo = require('../repositories/teamRepository');
 const { withRunCfg, getCfg } = require('../runCfg');
 const delay = require('../utils/delay');
 const { evaluateSafe, waitForFunctionSafe } = require('../utils/browserEval');
+const { decryptSecret } = require('../utils/credentialCrypto');
 const logger = require('../utils/logger');
 const { formatError, formatSuccess } = require('../utils/messages');
 const { BasketTimer, checkBasketTimeoutFromPage } = require('../utils/basketTimer');
@@ -29,6 +33,76 @@ function applyAnticaptchaFromCfg(c) {
     } catch {}
 }
 applyAnticaptchaFromCfg(configRoot);
+
+function normalizeSelectedCategory(item, fallbackMode = 'scan') {
+    if (!item || typeof item !== 'object') return null;
+    const categoryType = String(item.categoryType || item.categoryTypeValue || '').trim();
+    if (!categoryType) return null;
+    const alternativeCategory = String(item.alternativeCategory || item.alternativeCategoryValue || '').trim();
+    const selectionModeHint = String(item.selectionModeHint || fallbackMode || 'scan').trim().toLowerCase();
+    return {
+        id: item.id ? String(item.id) : null,
+        label: String(item.label || item.name || categoryType).trim(),
+        categoryType,
+        alternativeCategory,
+        selectionModeHint: ['legacy', 'scan', 'svg'].includes(selectionModeHint) ? selectionModeHint : String(fallbackMode || 'scan').trim().toLowerCase()
+    };
+}
+
+function buildCategoryRoamTexts(selectedCategories, fallbackCategoryType, fallbackAlternativeCategory) {
+    const values = [];
+    for (const item of Array.isArray(selectedCategories) ? selectedCategories : []) {
+        if (!item) continue;
+        if (item.label) values.push(String(item.label).trim());
+        if (item.categoryType) values.push(String(item.categoryType).trim());
+        if (item.alternativeCategory) values.push(String(item.alternativeCategory).trim());
+    }
+    if (fallbackCategoryType) values.push(String(fallbackCategoryType).trim());
+    if (fallbackAlternativeCategory) values.push(String(fallbackAlternativeCategory).trim());
+    return Array.from(new Set(values.filter(Boolean)));
+}
+
+function createCategoryChooser(selectedCategories, fallbackCategoryType, fallbackAlternativeCategory, defaultMode = 'scan') {
+    const normalized = (Array.isArray(selectedCategories) ? selectedCategories : [])
+        .map((item) => normalizeSelectedCategory(item, defaultMode))
+        .filter(Boolean);
+    let nextIndex = 0;
+
+    return {
+        list: normalized,
+        getRoamTexts: () => buildCategoryRoamTexts(normalized, fallbackCategoryType, fallbackAlternativeCategory),
+        async choose(page, categoryType, alternativeCategory, selectionMode) {
+            if (!normalized.length) {
+                return chooseCategoryAndRandomBlock(
+                    page,
+                    fallbackCategoryType || categoryType,
+                    fallbackAlternativeCategory || alternativeCategory,
+                    selectionMode || defaultMode
+                );
+            }
+            const chosen = normalized[nextIndex] || normalized[0];
+            nextIndex = normalized.length > 1 ? ((nextIndex + 1) % normalized.length) : 0;
+            const mode = String(selectionMode || chosen.selectionModeHint || defaultMode || 'scan').trim().toLowerCase();
+            logger.info('categoryBlock:selected_category_candidate', {
+                categoryId: chosen.id || null,
+                label: chosen.label || null,
+                categoryType: chosen.categoryType,
+                alternativeCategory: chosen.alternativeCategory || null,
+                mode,
+                nextIndex,
+                total: normalized.length
+            });
+            const result = await chooseCategoryAndRandomBlock(
+                page,
+                chosen.categoryType,
+                chosen.alternativeCategory,
+                mode
+            );
+            if (result && typeof result === 'object') result.chosenCategory = chosen;
+            return result;
+        }
+    };
+}
 
 async function selectSvgBlockById(page, blockId) {
     const safeId = String(blockId || '').trim();
@@ -4462,7 +4536,7 @@ async function startBot(req, res) {
 
 async function startBotAfterValidation(req, res, validatedData) {
     const {
-        team, ticketType, eventAddress, categoryType, alternativeCategory,
+        team: requestedTeam, teamId, ticketType, eventAddress, categoryType, alternativeCategory,
         categorySelectionMode,
         transferTargetEmail,
         extendWhenRemainingSecondsBelow,
@@ -4471,8 +4545,81 @@ async function startBotAfterValidation(req, res, validatedData) {
         cardHolder = null, cardNumber = null, expiryMonth = null, expiryYear = null, cvv = null,
         proxyHost, proxyPort, proxyUsername, proxyPassword,
         email2, password2,
-        aAccounts, bAccounts
+        aAccounts, bAccounts,
+        aCredentialIds, bCredentialIds,
+        selectedCategoryIds, selectedCategories: requestedSelectedCategories
     } = validatedData;
+
+    const selectedCategoriesFromBody = Array.isArray(requestedSelectedCategories)
+        ? requestedSelectedCategories.map((item) => normalizeSelectedCategory(item, categorySelectionMode)).filter(Boolean)
+        : [];
+    const selectedCategoryIdsSafe = Array.isArray(selectedCategoryIds) ? selectedCategoryIds.map((id) => String(id).trim()).filter(Boolean) : [];
+    const aCredentialIdsSafe = Array.isArray(aCredentialIds) ? aCredentialIds.map((id) => String(id).trim()).filter(Boolean) : [];
+    const bCredentialIdsSafe = Array.isArray(bCredentialIds) ? bCredentialIds.map((id) => String(id).trim()).filter(Boolean) : [];
+
+    const teamDoc = teamId ? await teamRepo.getTeamById(teamId).catch(() => null) : null;
+    if (teamId && !teamDoc) {
+        return res.status(400).json({ error: 'Seçilen takım bulunamadı' });
+    }
+    const team = String(teamDoc?.name || requestedTeam || '').trim();
+
+    let selectedCategories = selectedCategoriesFromBody;
+    if (!selectedCategories.length && teamId && selectedCategoryIdsSafe.length) {
+        const repoCategories = await categoryRepo.getCategoriesByIds(teamId, selectedCategoryIdsSafe);
+        if (repoCategories.length !== selectedCategoryIdsSafe.length) {
+            return res.status(400).json({ error: 'Seçilen kategorilerden biri bulunamadı veya aktif değil' });
+        }
+        selectedCategories = repoCategories
+            .map((item) => normalizeSelectedCategory({
+                id: item.id,
+                label: item.label,
+                categoryType: item.categoryTypeValue,
+                alternativeCategory: item.alternativeCategoryValue,
+                selectionModeHint: item.selectionModeHint,
+                sortOrder: item.sortOrder
+            }, categorySelectionMode))
+            .filter(Boolean);
+    }
+    if (!selectedCategories.length && String(categoryType || '').trim()) {
+        const fallbackCategory = normalizeSelectedCategory({
+            label: String(categoryType || '').trim(),
+            categoryType,
+            alternativeCategory,
+            selectionModeHint: categorySelectionMode
+        }, categorySelectionMode);
+        if (fallbackCategory) selectedCategories = [fallbackCategory];
+    }
+
+    const resolvedCategoryType = selectedCategories[0]?.categoryType || String(categoryType || '').trim();
+    const resolvedAlternativeCategory = selectedCategories[0]?.alternativeCategory || String(alternativeCategory || '').trim();
+
+    let aAccountsFromTeam = [];
+    if (teamId && aCredentialIdsSafe.length) {
+        const docs = await credentialRepo.getCredentialsByIds(teamId, aCredentialIdsSafe);
+        if (docs.length !== aCredentialIdsSafe.length) {
+            return res.status(400).json({ error: 'Seçilen A üyeliklerinden biri bulunamadı veya aktif değil' });
+        }
+        aAccountsFromTeam = docs.map((item) => ({
+            email: String(item.email || ''),
+            password: decryptSecret(item.encryptedPassword),
+            identity: item.identity || null,
+            fanCardCode: item.fanCardCode || null
+        }));
+    }
+
+    let bAccountsFromTeam = [];
+    if (teamId && bCredentialIdsSafe.length) {
+        const docs = await credentialRepo.getCredentialsByIds(teamId, bCredentialIdsSafe);
+        if (docs.length !== bCredentialIdsSafe.length) {
+            return res.status(400).json({ error: 'Seçilen B üyeliklerinden biri bulunamadı veya aktif değil' });
+        }
+        bAccountsFromTeam = docs.map((item) => ({
+            email: String(item.email || ''),
+            password: decryptSecret(item.encryptedPassword),
+            identity: item.identity || null,
+            fanCardCode: item.fanCardCode || null
+        }));
+    }
 
     const a0 = Array.isArray(aAccounts) && aAccounts.length ? aAccounts[0] : null;
     const b0 = Array.isArray(bAccounts) && bAccounts.length ? bAccounts[0] : null;
@@ -4490,7 +4637,9 @@ async function startBotAfterValidation(req, res, validatedData) {
             identity: (a && Object.prototype.hasOwnProperty.call(a, 'identity')) ? a.identity : null,
             fanCardCode: (a && Object.prototype.hasOwnProperty.call(a, 'fanCardCode')) ? a.fanCardCode : null
         }))
-        : [{ email: emailA, password: passwordA, identity: identity ?? null, fanCardCode: fanCardCode ?? null }];
+        : (aAccountsFromTeam.length
+            ? aAccountsFromTeam
+            : [{ email: emailA, password: passwordA, identity: identity ?? null, fanCardCode: fanCardCode ?? null }]);
     const bList = (Array.isArray(bAccounts) && bAccounts.length)
         ? bAccounts.map(b => ({
             email: String(b.email || ''),
@@ -4498,9 +4647,12 @@ async function startBotAfterValidation(req, res, validatedData) {
             identity: (b && Object.prototype.hasOwnProperty.call(b, 'identity')) ? b.identity : null,
             fanCardCode: (b && Object.prototype.hasOwnProperty.call(b, 'fanCardCode')) ? b.fanCardCode : null
         }))
-        : [{ email: emailB, password: passwordB, identity: identity ?? null, fanCardCode: fanCardCode ?? null }];
+        : (bAccountsFromTeam.length
+            ? bAccountsFromTeam
+            : [{ email: emailB, password: passwordB, identity: identity ?? null, fanCardCode: fanCardCode ?? null }]);
 
     const isMulti = (aList.length > 1) || (bList.length > 1);
+    const categoryRoamTexts = buildCategoryRoamTexts(selectedCategories, resolvedCategoryType, resolvedAlternativeCategory);
 
     const runId = (() => {
         try {
@@ -5159,7 +5311,8 @@ async function startBotAfterValidation(req, res, validatedData) {
         eventAddress,
         email: emailA,
         email2: emailB,
-        categoryType,
+        categoryType: resolvedCategoryType,
+        selectedCategories: selectedCategories.map((item) => item.label || item.categoryType),
         multi: isMulti,
         aCount: aList.length,
         bCount: bList.length
@@ -5169,8 +5322,15 @@ async function startBotAfterValidation(req, res, validatedData) {
         team,
         ticketType,
         eventAddress,
-        categoryType,
-        alternativeCategory,
+        categoryType: resolvedCategoryType,
+        alternativeCategory: resolvedAlternativeCategory,
+        selectedCategories: selectedCategories.map((item) => ({
+            id: item.id || null,
+            label: item.label || null,
+            categoryType: item.categoryType,
+            alternativeCategory: item.alternativeCategory || null,
+            selectionModeHint: item.selectionModeHint || null
+        })),
         categorySelectionMode,
         multi: isMulti,
         aCount: aList.length,
@@ -5461,11 +5621,24 @@ async function startBotAfterValidation(req, res, validatedData) {
                     setStep(`${label}.ticketType.select.done`, { snap: await snapshotPage(page, `${label}.afterTicketType`) });
                 }
 
+                const accountCategoryChooser = createCategoryChooser(
+                    selectedCategories,
+                    resolvedCategoryType,
+                    resolvedAlternativeCategory,
+                    categorySelectionMode
+                );
                 setStep(`${label}.categoryBlock.select.start`, { categorySelectionMode });
                 const cbStart = Date.now();
-                const cbRes = await chooseCategoryAndRandomBlock(page, categoryType, alternativeCategory, categorySelectionMode);
+                const cbRes = await accountCategoryChooser.choose(page, resolvedCategoryType, resolvedAlternativeCategory, categorySelectionMode);
                 setStep(`${label}.categoryBlock.select.done`, { snap: await snapshotPage(page, `${label}.afterCategoryBlock`) });
-                audit('a_category_block_selected', { idx: i, email: acc.email, mode: categorySelectionMode, ms: Date.now() - cbStart });
+                audit('a_category_block_selected', {
+                    idx: i,
+                    email: acc.email,
+                    mode: categorySelectionMode,
+                    ms: Date.now() - cbStart,
+                    categoryLabel: cbRes?.chosenCategory?.label || null,
+                    categoryType: cbRes?.chosenCategory?.categoryType || resolvedCategoryType || null
+                });
 
                 let catBlock = { categoryText: '', blockText: '', blockVal: '' };
                 if (cbRes && cbRes.svgBlockId) {
@@ -5501,12 +5674,12 @@ async function startBotAfterValidation(req, res, validatedData) {
                             context: label,
                             expectedUrlIncludes: '/koltuk-secim',
                             recoveryUrl: seatSelectionUrl,
-                            roamCategoryTexts: [categoryType, alternativeCategory].filter(Boolean),
+                            roamCategoryTexts: accountCategoryChooser.getRoamTexts(),
                             email: acc.email,
                             password: acc.password,
                             reloginIfRedirected,
                             ensureTurnstileFn: ensureCaptchaOnPage,
-                            chooseCategoryFn: chooseCategoryAndRandomBlock,
+                            chooseCategoryFn: accountCategoryChooser.choose,
                             categorySelectionMode
                         });
                         break;
@@ -5518,7 +5691,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                             const roamEvery = Math.max(0, Number(getCfg()?.TIMEOUTS?.CATEGORY_ROAM_EVERY_CYCLES || 0) || 0);
                             const baseMode = String(categorySelectionMode || 'legacy').toLowerCase();
                             const mode2 = (baseMode === 'svg') ? categorySelectionMode : ((roamEvery > 0 && (cycle % roamEvery) === 0) ? 'scan' : categorySelectionMode);
-                            const cbRes2 = await chooseCategoryAndRandomBlock(page, categoryType, alternativeCategory, mode2);
+                            const cbRes2 = await accountCategoryChooser.choose(page, resolvedCategoryType, resolvedAlternativeCategory, mode2);
                             if (cbRes2 && cbRes2.svgBlockId) {
                                 try { catBlockA = { ...(catBlockA || {}), svgBlockId: cbRes2.svgBlockId }; } catch {}
                             }
@@ -6305,8 +6478,20 @@ async function startBotAfterValidation(req, res, validatedData) {
             logger.warn('A.categoryBlock.dom_diagnostic_failed', { error: e?.message });
         }
 
-        setStep('A.categoryBlock.select.start', { categoryType, alternativeCategory, categorySelectionMode });
-        const cbResA = await chooseCategoryAndRandomBlock(pageA, categoryType, alternativeCategory, categorySelectionMode);
+        const singleCategoryChooserA = createCategoryChooser(
+            selectedCategories,
+            resolvedCategoryType,
+            resolvedAlternativeCategory,
+            categorySelectionMode
+        );
+        const singleCategoryChooserB = createCategoryChooser(
+            selectedCategories,
+            resolvedCategoryType,
+            resolvedAlternativeCategory,
+            categorySelectionMode
+        );
+        setStep('A.categoryBlock.select.start', { categoryType: resolvedCategoryType, alternativeCategory: resolvedAlternativeCategory, categorySelectionMode });
+        const cbResA = await singleCategoryChooserA.choose(pageA, resolvedCategoryType, resolvedAlternativeCategory, categorySelectionMode);
         if (cbResA && cbResA.svgBlockId) {
             try { catBlockA = { ...catBlockA, svgBlockId: cbResA.svgBlockId }; } catch {}
         }
@@ -6346,12 +6531,12 @@ async function startBotAfterValidation(req, res, validatedData) {
                         context: 'A',
                         expectedUrlIncludes: '/koltuk-secim',
                         recoveryUrl: seatSelectionUrlA,
-                        roamCategoryTexts: [categoryType, alternativeCategory].filter(Boolean),
+                        roamCategoryTexts: singleCategoryChooserA.getRoamTexts(),
                         email: emailA,
                         password: passwordA,
                         reloginIfRedirected,
                         ensureTurnstileFn: ensureCaptchaOnPage,
-                        chooseCategoryFn: chooseCategoryAndRandomBlock,
+                        chooseCategoryFn: singleCategoryChooserA.choose,
                         categorySelectionMode
                     }
                 );
@@ -6364,7 +6549,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     const roamEvery = Math.max(0, Number(getCfg()?.TIMEOUTS?.CATEGORY_ROAM_EVERY_CYCLES || 0) || 0);
                     const baseMode = String(categorySelectionMode || 'legacy').toLowerCase();
                     const mode2 = (baseMode === 'svg') ? categorySelectionMode : ((roamEvery > 0 && (cycle % roamEvery) === 0) ? 'scan' : categorySelectionMode);
-                    const cbResA2 = await chooseCategoryAndRandomBlock(pageA, categoryType, alternativeCategory, mode2);
+                    const cbResA2 = await singleCategoryChooserA.choose(pageA, resolvedCategoryType, resolvedAlternativeCategory, mode2);
                     if (cbResA2 && cbResA2.svgBlockId) {
                         try { catBlockA = { ...(catBlockA || {}), svgBlockId: cbResA2.svgBlockId }; } catch {}
                     }
@@ -6596,7 +6781,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     password: passwordB,
                     reloginIfRedirected,
                     ensureTurnstileFn: ensureCaptchaOnPage,
-                    chooseCategoryFn: chooseCategoryAndRandomBlock,
+                    chooseCategoryFn: singleCategoryChooserB.choose,
                     categorySelectionMode
                 }
             );

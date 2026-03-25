@@ -8,6 +8,9 @@ const runStatusEl = $('runStatus');
 const logFilterEl = $('logFilter');
 const autoScrollEl = $('autoScroll');
 const autoScrollStatusEl = $('autoScrollStatus');
+const cTransferPairInput = $('cTransferPairIndexInput');
+const stepperItems = Array.from(document.querySelectorAll('[data-step-target]'));
+const stepPanels = Array.from(document.querySelectorAll('[data-step-panel]'));
 
 let currentRunId = null;
 let es = null;
@@ -34,6 +37,9 @@ function renderPairDashboard(dash) {
   const extra = pairs.length - matched;
   const mode = dash.mode === 'multi' ? 'Çoklu' : 'Tek çift';
   const cT = Math.max(1, Number(dash.cTargetPairIndex) || 1);
+  if (cTransferPairInput && document.activeElement !== cTransferPairInput) {
+    cTransferPairInput.value = String(cT);
+  }
   const t = dash.updatedAt ? new Date(dash.updatedAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
   metaEl.textContent = `${mode} · ${pairs.length} satır (${matched} eşleşen${extra ? `, ${extra} ekstra A` : ''}) · C/finalize hedefi: #${cT}${t ? ` · ${t}` : ''}`;
 
@@ -66,125 +72,30 @@ function renderPairDashboard(dash) {
     .join('');
 }
 
-const aListEl = $('aAccounts');
-const bListEl = $('bAccounts');
-
-function accountRowEl(side, idx, initial = {}) {
-  const wrap = document.createElement('div');
-  wrap.className = 'accountRow';
-  wrap.dataset.side = side;
-
-  const tag = document.createElement('div');
-  tag.className = 'accountTag';
-  tag.dataset.tag = '1';
-  tag.textContent = `${side}1`;
-  wrap.appendChild(tag);
-
-  // Container for both input rows - this goes in the middle grid column
-  const rowsContainer = document.createElement('div');
-  rowsContainer.className = 'accountRowsWrap';
-
-  const row1 = document.createElement('div');
-  row1.className = 'accountRowInner';
-  
-  const row2 = document.createElement('div');
-  row2.className = 'accountRowInner';
-
-  const mk = (label, name, type, placeholder) => {
-    const d = document.createElement('div');
-    d.className = 'row';
-    const l = document.createElement('label');
-    l.className = 'smallLabel';
-    l.textContent = label;
-    const i = document.createElement('input');
-    i.type = type;
-    i.placeholder = placeholder || '';
-    i.dataset.field = name;
-    i.value = (initial && initial[name]) ? String(initial[name]) : '';
-    d.appendChild(l);
-    d.appendChild(i);
-    return d;
-  };
-
-  // Row 1: Email, Password
-  row1.appendChild(mk(`${side} Email`, 'email', 'email', `${side.toLowerCase()}@mail.com`));
-  row1.appendChild(mk(`${side} Password`, 'password', 'password', '******'));
-  
-  // Row 2: TCKN, FanCard
-  row2.appendChild(mk(`TCKN`, 'identity', 'text', '12345678901'));
-  row2.appendChild(mk(`Fan Card`, 'fanCardCode', 'text', ''));
-
-  rowsContainer.appendChild(row1);
-  rowsContainer.appendChild(row2);
-  wrap.appendChild(rowsContainer);
-
-  const btnWrap = document.createElement('div');
-  btnWrap.className = 'accountActions';
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.textContent = 'Sil';
-  btn.className = 'btnDanger';
-  btn.addEventListener('click', () => {
-    wrap.remove();
-    renumberAccounts(side);
-    ensureAtLeastOne(side);
-  });
-  btnWrap.appendChild(btn);
-  wrap.appendChild(btnWrap);
-  
-  return wrap;
-}
-
-function renumberAccounts(side) {
-  const root = side === 'A' ? aListEl : bListEl;
-  const rows = Array.from(root.querySelectorAll('.accountRow'));
-  rows.forEach((r, i) => {
-    const n = i + 1;
-    const tag = r.querySelector('.accountTag');
-    if (tag) tag.textContent = `${side}${n}`;
-  });
-}
-
-function ensureAtLeastOne(side) {
-  const root = side === 'A' ? aListEl : bListEl;
-  const rows = Array.from(root.querySelectorAll('.accountRow'));
-  if (rows.length === 0) addAccount(side);
-}
-
-function addAccount(side, initial = {}) {
-  const el = accountRowEl(side, 0, initial);
-  if (side === 'A') aListEl.appendChild(el);
-  else bListEl.appendChild(el);
-  renumberAccounts(side);
-}
-
-function readAccounts(side) {
-  const root = side === 'A' ? aListEl : bListEl;
-  const rows = Array.from(root.querySelectorAll('.accountRow'));
-  const list = [];
-  for (const r of rows) {
-    const get = (f) => {
-      const i = r.querySelector(`[data-field="${f}"]`);
-      return i ? String(i.value || '').trim() : '';
-    };
-    const email = get('email');
-    const password = get('password');
-    const identity = get('identity');
-    const fanCardCode = get('fanCardCode');
-    if (!email || !password) continue;
-    const item = { email, password };
-    if (identity) item.identity = identity;
-    if (fanCardCode) item.fanCardCode = fanCardCode;
-    list.push(item);
-  }
-  return list;
-}
-
 const state = {
   filter: '',
   autoScroll: true,
   autoScrollStatus: true,
+  activeStep: 'setup',
 };
+
+function setActiveStep(step) {
+  const next = step === 'run' ? 'run' : 'setup';
+  state.activeStep = next;
+
+  for (const item of stepperItems) {
+    const target = String(item.dataset.stepTarget || '').trim();
+    item.classList.toggle('active', target === next);
+    item.classList.toggle('done', !!currentRunId && target === 'setup');
+    item.setAttribute('aria-current', target === next ? 'step' : 'false');
+  }
+
+  for (const panel of stepPanels) {
+    const target = String(panel.dataset.stepPanel || '').trim();
+    panel.hidden = target !== next;
+    panel.classList.toggle('active', target === next);
+  }
+}
 
 /** Sunucudan gelen .env tabanlı varsayılanlar; modal açıldığında doldurulur. */
 let panelDefaultsFromServer = null;
@@ -633,6 +544,28 @@ $('botForm').addEventListener('submit', async (e) => {
 
   const fd = new FormData(e.target);
   const body = Object.fromEntries(fd.entries());
+  const catalogApi = window.passobotCatalog || null;
+  const selectedTeam = catalogApi && typeof catalogApi.getSelectedTeam === 'function'
+    ? catalogApi.getSelectedTeam()
+    : null;
+  const selectedCategoryIds = catalogApi && typeof catalogApi.getSelectedCategoryIds === 'function'
+    ? catalogApi.getSelectedCategoryIds()
+    : [];
+  const aCredentialIds = catalogApi && typeof catalogApi.getSelectedCredentialIds === 'function'
+    ? catalogApi.getSelectedCredentialIds('A')
+    : [];
+  const bCredentialIds = catalogApi && typeof catalogApi.getSelectedCredentialIds === 'function'
+    ? catalogApi.getSelectedCredentialIds('B')
+    : [];
+
+  if (!selectedTeam?.id || !selectedTeam?.name) {
+    infoLine('Bot başlatmak için önce takım seçmelisin.');
+    return;
+  }
+
+  body.teamId = selectedTeam.id;
+  body.team = selectedTeam.name;
+  if (selectedCategoryIds.length) body.selectedCategoryIds = selectedCategoryIds;
 
   // Normalize
   body.prioritySale = body.prioritySale === 'on';
@@ -643,10 +576,21 @@ $('botForm').addEventListener('submit', async (e) => {
     else delete body.cTransferPairIndex;
   }
 
-  const aAccounts = readAccounts('A');
-  const bAccounts = readAccounts('B');
-  if (aAccounts.length) body.aAccounts = aAccounts;
-  if (bAccounts.length) body.bAccounts = bAccounts;
+  if (aCredentialIds.length) body.aCredentialIds = aCredentialIds;
+  if (bCredentialIds.length) body.bCredentialIds = bCredentialIds;
+
+  if (!selectedCategoryIds.length && !String(body.categoryType || '').trim()) {
+    infoLine('En az 1 kayıtlı kategori seç veya fallback kategori gir.');
+    return;
+  }
+  if (!aCredentialIds.length) {
+    infoLine('En az 1 A üyeliği seçmelisin.');
+    return;
+  }
+  if (!bCredentialIds.length) {
+    infoLine('En az 1 B üyeliği seçmelisin.');
+    return;
+  }
 
   // If arrays are provided, drop legacy single-account fields to avoid confusion.
   delete body.email;
@@ -683,6 +627,7 @@ $('botForm').addEventListener('submit', async (e) => {
     runIdEl.textContent = currentRunId;
     runStatusEl.textContent = json.status || 'running';
     appendLogLine(`${new Date().toISOString()} [INFO]: run started ${currentRunId}`, { level: 'info', message: 'run started' });
+    setActiveStep('run');
 
     pollRunStatus(currentRunId);
   } catch (err) {
@@ -712,6 +657,12 @@ function requireRunId() {
 }
 
 try {
+  for (const item of stepperItems) {
+    item.addEventListener('click', () => {
+      setActiveStep(item.dataset.stepTarget);
+    });
+  }
+
   $('btnRegisterC').addEventListener('click', async () => {
     const runId = requireRunId();
     if (!runId) return;
@@ -773,9 +724,18 @@ autoScrollStatusEl.addEventListener('change', (e) => {
   state.autoScrollStatus = !!e.target.checked;
 });
 
+setActiveStep('setup');
 startSse();
 
 ensurePanelDefaultsFetched().catch(() => {});
+try {
+  if (window.passobotCatalog && typeof window.passobotCatalog.setNotifier === 'function') {
+    window.passobotCatalog.setNotifier(infoLine);
+  }
+  if (window.passobotCatalog && typeof window.passobotCatalog.init === 'function') {
+    window.passobotCatalog.init();
+  }
+} catch {}
 
 try {
   $('btnOpenSettings').addEventListener('click', () => openSettingsModalFresh());
@@ -803,10 +763,3 @@ try {
   });
 } catch {}
 
-// Init with 1 row each
-try {
-  $('btnAddA').addEventListener('click', () => addAccount('A'));
-  $('btnAddB').addEventListener('click', () => addAccount('B'));
-  addAccount('A');
-  addAccount('B');
-} catch {}

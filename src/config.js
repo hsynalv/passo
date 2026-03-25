@@ -2,6 +2,10 @@ require('dotenv').config();
 
 const DEFAULTS = {
   PORT: '2222',
+  MONGODB_URI: '',
+  MONGODB_DB_NAME: 'passobot',
+  MONGODB_CONNECT_TIMEOUT_MS: '10000',
+  CREDENTIAL_SECRET_KEY: 'passobot-local-dev-secret-change-me',
   PASSO_LOGIN: 'https://www.passo.com.tr/tr/giris',
   TICKETING_API_BASE: 'https://ticketingweb.passo.com.tr',
   PASSO_SITE_KEY: '0x4AAAAAAA4rK8-JCAhwWhV4',
@@ -125,6 +129,10 @@ function buildConfigFromEnv(env = process.env) {
 
   return {
     PORT: parseInt(envOrDefault('PORT'), 10),
+    MONGODB_URI: envOrDefault('MONGODB_URI'),
+    MONGODB_DB_NAME: envOrDefault('MONGODB_DB_NAME') || 'passobot',
+    MONGODB_CONNECT_TIMEOUT_MS: parseInt(envOrDefault('MONGODB_CONNECT_TIMEOUT_MS') || '10000', 10),
+    CREDENTIAL_SECRET_KEY: envOrDefault('CREDENTIAL_SECRET_KEY'),
     PASSO_LOGIN: envOrDefault('PASSO_LOGIN'),
     TICKETING_API_BASE: ticketingBase.replace(/\/$/, ''),
     PASSO_SITE_KEY: envOrDefault('PASSO_SITE_KEY'),

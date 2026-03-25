@@ -2,6 +2,7 @@ const express = require('express');
 const path = require('path');
 const readline = require('readline');
 const cfg = require('./config');
+const { connectMongo } = require('./db/mongo');
 const logger = require('./utils/logger');
 
 function waitForEnterInExe() {
@@ -29,10 +30,18 @@ process.on('uncaughtException', (err) => {
     waitForEnterInExe();
 });
 
-function start() {
+async function start() {
     const botRoutes = require('./routes/botRoutes');
     const app = express();
     app.use(express.json());
+
+    try {
+        await connectMongo();
+    } catch (error) {
+        logger.warnSafe('MongoDB bağlantısı başlatılırken hata oluştu; yönetim APIleri kısıtlı olabilir', {
+            error: error?.message || String(error)
+        });
+    }
 
     // Web UI: in .exe mode process.cwd() can be arbitrary; resolve robustly.
     const publicCandidates = [
@@ -65,4 +74,8 @@ if (process.stdin.isTTY) {
     process.stdin.resume();
 }
 
-start();
+start().catch((error) => {
+    logger.errorSafe('Sunucu başlatılamadı', error);
+    console.error('\n[StartupError]', error);
+    waitForEnterInExe();
+});

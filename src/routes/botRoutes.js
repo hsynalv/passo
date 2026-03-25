@@ -1,6 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const { startBot, startBotAsync, registerCAccount, requestFinalize, getRunStatus, killSessions } = require('../controllers/botController');
+const { createTeam, deleteTeam, listTeams, updateTeam } = require('../controllers/teamController');
+const { createCategory, deleteCategory, listCategories, updateCategory } = require('../controllers/categoryController');
+const { createCredential, deleteCredential, listCredentials, updateCredential } = require('../controllers/credentialController');
 const { botRateLimiter } = require('../middleware/rateLimiter');
 const logger = require('../utils/logger');
 const cfg = require('../config');
@@ -16,6 +19,19 @@ router.get('/api/panel-settings', (req, res) => {
 
 router.post('/start-bot', botRateLimiter, startBot);
 router.post('/start-bot-async', botRateLimiter, startBotAsync);
+
+router.get('/api/teams', listTeams);
+router.post('/api/teams', createTeam);
+router.put('/api/teams/:teamId', updateTeam);
+router.delete('/api/teams/:teamId', deleteTeam);
+router.get('/api/teams/:teamId/categories', listCategories);
+router.post('/api/teams/:teamId/categories', createCategory);
+router.put('/api/teams/:teamId/categories/:categoryId', updateCategory);
+router.delete('/api/teams/:teamId/categories/:categoryId', deleteCategory);
+router.get('/api/teams/:teamId/credentials', listCredentials);
+router.post('/api/teams/:teamId/credentials', createCredential);
+router.put('/api/teams/:teamId/credentials/:credentialId', updateCredential);
+router.delete('/api/teams/:teamId/credentials/:credentialId', deleteCredential);
 
 router.post('/kill-sessions', botRateLimiter, killSessions);
 
