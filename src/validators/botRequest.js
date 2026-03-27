@@ -5,7 +5,9 @@ const accountSchema = z.object({
   email: z.string().email('Geçerli bir email adresi giriniz'),
   password: z.string().min(1, 'Şifre zorunludur'),
   identity: z.string().nullable().optional(),
-  fanCardCode: z.string().nullable().optional()
+  fanCardCode: z.string().nullable().optional(),
+  sicilNo: z.string().nullable().optional(),
+  priorityTicketCode: z.string().nullable().optional(),
 });
 
 const selectedCategorySchema = z.object({
@@ -27,6 +29,14 @@ const botRequestSchema = z.object({
   categorySelectionMode: z.enum(['legacy', 'scan', 'svg']).optional().default('scan'),
   categoryType: z.string().optional(),
   alternativeCategory: z.string().optional(),
+  ticketCount: z.union([z.number(), z.string()])
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val === null || val === '') return 1;
+      const n = typeof val === 'number' ? val : parseInt(String(val).trim(), 10);
+      if (!Number.isFinite(n) || n < 1) return 1;
+      return Math.min(Math.floor(n), 10);
+    }),
   transferTargetEmail: z.string().email('Geçerli bir transfer email adresi giriniz').optional(),
   /** Çoklu A/B eşleşmelerinde C finalize hangi çifti kullansın (1 = A1↔B1, 2 = A2↔B2, …). */
   cTransferPairIndex: z
@@ -51,6 +61,8 @@ const botRequestSchema = z.object({
   }),
   fanCardCode: z.string().nullable().optional(),
   identity: z.string().nullable().optional(),
+  sicilNo: z.string().nullable().optional(),
+  priorityTicketCode: z.string().nullable().optional(),
   // Legacy single-account fields (backward compatible)
   email: z.string().email('Geçerli bir email adresi giriniz').optional(),
   password: z.string().min(1, 'Şifre zorunludur').optional(),
@@ -106,7 +118,7 @@ const botRequestSchema = z.object({
   const selectedCategoryIds = Array.isArray(data.selectedCategoryIds) ? data.selectedCategoryIds : [];
   if (mode === 'legacy') {
     const hasSelectedCategory = selectedCategories.some((item) => String(item?.categoryType || '').trim());
-    if (!hasSelectedCategory && (!data.categoryType || String(data.categoryType).trim().length === 0)) {
+    if (!hasSelectedCategory && !selectedCategoryIds.length && (!data.categoryType || String(data.categoryType).trim().length === 0)) {
       ctx.addIssue({
         code: 'custom',
         path: ['categoryType'],
@@ -129,13 +141,7 @@ const botRequestSchema = z.object({
       message: 'En az 1 A hesabı zorunludur (aAccounts, aCredentialIds veya email/password)'
     });
   }
-  if (!bList.length && !bCredentialIds.length && !hasLegacyB) {
-    ctx.addIssue({
-      code: 'custom',
-      path: ['bAccounts'],
-      message: 'En az 1 B hesabı zorunludur (bAccounts, bCredentialIds veya email2/password2)'
-    });
-  }
+  // B hesabı opsiyonel: yoksa A-only mod çalışır (ödeme veya sepette tutma)
 
   if (hasTeamId && !selectedCategories.length && !selectedCategoryIds.length && !String(data.categoryType || '').trim()) {
     ctx.addIssue({

@@ -15,6 +15,25 @@ const stepPanels = Array.from(document.querySelectorAll('[data-step-panel]'));
 let currentRunId = null;
 let es = null;
 
+function showToast(title, msg, type = 'success', durationMs = 4500) {
+  const container = $('toastContainer');
+  if (!container) return;
+  const icons = { success: '\u2713', error: '\u2717', info: 'i' };
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.innerHTML = `<span class="toastIcon">${icons[type] || icons.info}</span><div class="toastBody"><div class="toastTitle">${escapeHtml(title)}</div><div class="toastMsg">${escapeHtml(msg)}</div></div><button class="toastClose" aria-label="Kapat">&times;</button>`;
+  el.querySelector('.toastClose').addEventListener('click', () => removeToast(el));
+  container.appendChild(el);
+  setTimeout(() => removeToast(el), durationMs);
+}
+
+function removeToast(el) {
+  if (!el || !el.parentNode) return;
+  if (el.classList.contains('leaving')) return;
+  el.classList.add('leaving');
+  el.addEventListener('animationend', () => el.remove(), { once: true });
+}
+
 function escapeHtml(s) {
   return String(s ?? '')
     .replace(/&/g, '&amp;')
@@ -539,6 +558,27 @@ async function pollRunStatus(runId) {
   }
 }
 
+const DIVAN_PRIORITY_CATEGORY_VALUE = 'Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler';
+
+function syncPrioritySaleUi() {
+  const main = document.getElementById('prioritySaleSelect');
+  const row = document.getElementById('prioritySaleCategoryRow');
+  const divanDetails = document.getElementById('divanPriorityFieldsDetails');
+  const cat = document.getElementById('prioritySaleCategorySelect');
+  if (main && row) {
+    row.hidden = String(main.value || '') !== 'on';
+  }
+  if (divanDetails && main) {
+    const on = String(main.value || '') === 'on';
+    const divan = on && cat && String(cat.value || '') === DIVAN_PRIORITY_CATEGORY_VALUE;
+    divanDetails.hidden = !divan;
+  }
+}
+
+document.getElementById('prioritySaleSelect')?.addEventListener('change', syncPrioritySaleUi);
+document.getElementById('prioritySaleCategorySelect')?.addEventListener('change', syncPrioritySaleUi);
+syncPrioritySaleUi();
+
 $('botForm').addEventListener('submit', async (e) => {
   e.preventDefault();
 
@@ -567,13 +607,31 @@ $('botForm').addEventListener('submit', async (e) => {
   body.team = selectedTeam.name;
   if (selectedCategoryIds.length) body.selectedCategoryIds = selectedCategoryIds;
 
-  // Normalize
-  body.prioritySale = body.prioritySale === 'on';
+  // Öncelikli satış: kapalı → false; açık → seçilen kategori metni (Passo modal eşlemesi)
+  const psRaw = String(body.prioritySale || '').trim().toLowerCase();
+  if (psRaw === 'on') {
+    const cat = String(body.prioritySaleCategory || '').trim();
+    if (!cat) {
+      infoLine('Öncelikli satış açıkken öncelik kategorisi seçmelisin.');
+      showToast('Eksik seçim', 'Öncelik kategorisinden birini seç.', 'error', 5000);
+      return;
+    }
+    body.prioritySale = cat;
+    delete body.prioritySaleCategory;
+  } else {
+    body.prioritySale = false;
+    delete body.prioritySaleCategory;
+  }
 
   if (body.cTransferPairIndex != null && String(body.cTransferPairIndex).trim() !== '') {
     const n = parseInt(String(body.cTransferPairIndex).trim(), 10);
     if (Number.isFinite(n) && n >= 1) body.cTransferPairIndex = n;
     else delete body.cTransferPairIndex;
+  }
+
+  if (body.ticketCount != null && String(body.ticketCount).trim() !== '') {
+    const tc = parseInt(String(body.ticketCount).trim(), 10);
+    body.ticketCount = (Number.isFinite(tc) && tc >= 1) ? Math.min(tc, 10) : 1;
   }
 
   if (aCredentialIds.length) body.aCredentialIds = aCredentialIds;
@@ -587,10 +645,7 @@ $('botForm').addEventListener('submit', async (e) => {
     infoLine('En az 1 A üyeliği seçmelisin.');
     return;
   }
-  if (!bCredentialIds.length) {
-    infoLine('En az 1 B üyeliği seçmelisin.');
-    return;
-  }
+  // B üyeliği opsiyonel: seçilmezse A-only mod çalışır
 
   // If arrays are provided, drop legacy single-account fields to avoid confusion.
   delete body.email;
@@ -620,6 +675,7 @@ $('botForm').addEventListener('submit', async (e) => {
     const json = await resp.json();
     if (!resp.ok) {
       appendLogLine(`${new Date().toISOString()} [ERROR]: start failed ${JSON.stringify(json)}`, { level: 'error', message: 'start failed' });
+      showToast('Baslatma Hatasi', json?.error || 'Bot baslatilirken bir hata olustu.', 'error', 6000);
       return;
     }
 
@@ -627,6 +683,7 @@ $('botForm').addEventListener('submit', async (e) => {
     runIdEl.textContent = currentRunId;
     runStatusEl.textContent = json.status || 'running';
     appendLogLine(`${new Date().toISOString()} [INFO]: run started ${currentRunId}`, { level: 'info', message: 'run started' });
+    showToast('Bot Baslatildi', 'Islem basladi, canli takip ekranina yonlendiriliyorsunuz.', 'success', 5000);
     setActiveStep('run');
 
     pollRunStatus(currentRunId);

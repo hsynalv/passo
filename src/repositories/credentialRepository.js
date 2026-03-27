@@ -19,8 +19,11 @@ function mapCredential(doc) {
     email: String(doc.email || ''),
     identity: doc.identity ? String(doc.identity) : '',
     fanCardCode: doc.fanCardCode ? String(doc.fanCardCode) : '',
+    sicilNo: doc.sicilNo ? String(doc.sicilNo) : '',
+    priorityTicketCode: doc.priorityTicketCode ? String(doc.priorityTicketCode) : '',
     encryptedPassword: String(doc.encryptedPassword || ''),
     isActive: doc.isActive !== false,
+    categoryIds: Array.isArray(doc.categoryIds) ? doc.categoryIds.map(String) : [],
     createdAt: doc.createdAt || null,
     updatedAt: doc.updatedAt || null,
   };
@@ -61,7 +64,10 @@ async function createCredential(teamId, payload) {
     encryptedPassword: String(payload.encryptedPassword || ''),
     identity: payload.identity ? String(payload.identity).trim() : '',
     fanCardCode: payload.fanCardCode ? String(payload.fanCardCode).trim() : '',
+    sicilNo: payload.sicilNo ? String(payload.sicilNo).trim() : '',
+    priorityTicketCode: payload.priorityTicketCode ? String(payload.priorityTicketCode).trim() : '',
     isActive: payload.isActive !== false,
+    categoryIds: Array.isArray(payload.categoryIds) ? payload.categoryIds.map(String) : [],
     createdAt: now,
     updatedAt: now,
   };
@@ -79,7 +85,12 @@ async function updateCredential(teamId, credentialId, payload) {
     email: payload.email !== undefined ? String(payload.email || '').trim().toLowerCase() : String(existing.email || ''),
     identity: payload.identity !== undefined ? String(payload.identity || '').trim() : String(existing.identity || ''),
     fanCardCode: payload.fanCardCode !== undefined ? String(payload.fanCardCode || '').trim() : String(existing.fanCardCode || ''),
+    sicilNo: payload.sicilNo !== undefined ? String(payload.sicilNo || '').trim() : String(existing.sicilNo || ''),
+    priorityTicketCode: payload.priorityTicketCode !== undefined ? String(payload.priorityTicketCode || '').trim() : String(existing.priorityTicketCode || ''),
     isActive: payload.isActive !== undefined ? payload.isActive !== false : existing.isActive !== false,
+    categoryIds: payload.categoryIds !== undefined
+      ? (Array.isArray(payload.categoryIds) ? payload.categoryIds.map(String) : [])
+      : (Array.isArray(existing.categoryIds) ? existing.categoryIds.map(String) : []),
     updatedAt: new Date().toISOString(),
   };
   if (payload.encryptedPassword !== undefined) {

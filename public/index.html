@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
+  <div class="toastContainer" id="toastContainer"></div>
   <div class="app">
     <header class="header">
       <div>
@@ -78,6 +79,15 @@
 
               <div class="row2">
                 <div class="row">
+                  <label>Bilet Adedi (ticketCount)</label>
+                  <input name="ticketCount" type="number" min="1" max="10" value="1" />
+                  <div class="hint">Hesap başına sepete atılacak bilet sayısı. Varsayılan 1.</div>
+                </div>
+                <div class="row"></div>
+              </div>
+
+              <div class="row2">
+                <div class="row">
                   <label>Category Mode</label>
                   <select name="categorySelectionMode">
                     <option value="svg">svg</option>
@@ -87,13 +97,36 @@
                   <div class="hint">Kategori kaydında mod ipucu varsa o kategori seçilirken kullanılabilir.</div>
                 </div>
                 <div class="row">
-                  <label>Priority Sale</label>
-                  <select name="prioritySale">
-                    <option value="on">on</option>
-                    <option value="off">off</option>
+                  <label>Öncelikli satış</label>
+                  <select name="prioritySale" id="prioritySaleSelect">
+                    <option value="off" selected>Kapalı</option>
+                    <option value="on">Açık</option>
                   </select>
+                  <div class="hint">Açıkken Passo’daki öncelik satırı eşlemesi için seçim yapılır (diğer gruplar eklendikçe liste genişler).</div>
                 </div>
               </div>
+              <div class="row" id="prioritySaleCategoryRow" hidden style="margin-top:4px">
+                <label>Öncelik kategorisi</label>
+                <select name="prioritySaleCategory" id="prioritySaleCategorySelect">
+                  <option value="">Seçin…</option>
+                  <option value="Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler">Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler</option>
+                </select>
+              </div>
+
+              <details class="details divanPriorityFields" id="divanPriorityFieldsDetails" hidden style="margin-top:10px">
+                <summary class="detailsTitle" style="cursor:pointer;user-select:none">Divan: Sicil No / öncelikli bilet kodu (üyelikte yoksa)</summary>
+                <div class="hint" style="margin-top:8px">Bu öncelik seçiliyken bilgiler hesapta yoksa buradan girebilirsin; tüm seçili A/B hesapları için ortak yedek olarak kullanılır.</div>
+                <div class="row2" style="margin-top:8px">
+                  <div class="row">
+                    <label>Sicil No</label>
+                    <input name="sicilNo" type="text" autocomplete="off" placeholder="Temsilci: T ile (TXXXX)" />
+                  </div>
+                  <div class="row">
+                    <label>Öncelikli bilet kodu</label>
+                    <input name="priorityTicketCode" type="text" autocomplete="off" placeholder="" />
+                  </div>
+                </div>
+              </details>
 
               <div class="row2">
                 <div class="row">
@@ -399,6 +432,21 @@
                   <label>Kategori</label>
                   <input id="categoryValueInput" type="text" placeholder="Maraton Alt" />
                 </div>
+                <div class="row2">
+                  <div class="row">
+                    <label>Bilet Adedi</label>
+                    <input id="categoryTicketCount" type="number" min="1" max="10" value="1" />
+                    <div class="hint">Bu kategoride hesap başına kaç bilet alınacak.</div>
+                  </div>
+                  <div class="row">
+                    <label>Koltuk Kuralı</label>
+                    <select id="categoryAdjacentSeats">
+                      <option value="false">Yanyana olmak zorunda değil</option>
+                      <option value="true">Yanyana koltuk seç</option>
+                    </select>
+                    <div class="hint">Birden fazla bilette koltuklar yanyana mı olsun.</div>
+                  </div>
+                </div>
                 </div>
                 <div class="actions">
                   <button type="button" id="btnSaveCategory">Kategori Kaydet</button>
@@ -430,6 +478,19 @@
                 <div class="row">
                   <label>Fan Card</label>
                   <input id="credentialFanCardInput" type="text" placeholder="ABC123" />
+                </div>
+                <div class="row">
+                  <label>Sicil No</label>
+                  <input id="credentialSicilNoInput" type="text" placeholder="" />
+                </div>
+                <div class="row">
+                  <label>Öncelikli Bilet Kodu</label>
+                  <input id="credentialPriorityTicketCodeInput" type="text" placeholder="" />
+                </div>
+                <div class="row">
+                  <label>Atanmış Kategoriler</label>
+                  <div class="hint">Boş bırakılırsa tüm kategorilerden alır. Seçilirse sadece o kategorilerden alır.</div>
+                  <div id="credentialCategoryPicker" class="checkList" style="max-height:120px;overflow-y:auto"></div>
                 </div>
                 </div>
                 <div class="actions">

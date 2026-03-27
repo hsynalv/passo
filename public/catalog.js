@@ -150,7 +150,9 @@
       const title = document.createElement('strong');
       title.textContent = item.label || item.categoryTypeValue || 'Kategori';
       const sub = document.createElement('span');
-      sub.textContent = 'Takıma kayıtlı kategori';
+      const tc = item.ticketCount || 1;
+      const adj = item.adjacentSeats ? 'Yanyana' : 'Serbest';
+      sub.textContent = tc > 1 ? `${tc} bilet · ${adj}` : '1 bilet';
       meta.appendChild(title);
       meta.appendChild(sub);
       wrap.appendChild(input);
@@ -184,7 +186,7 @@
       const meta = document.createElement('div');
       meta.className = 'credentialPickMeta';
       meta.innerHTML = `<strong>${escapeHtml(item.email || `${roleLabel} üyeliği`)}</strong>
-        <span>TCKN: ${escapeHtml(item.identity || '—')} • Fan Card: ${escapeHtml(item.fanCardCode || '—')}</span>`;
+        <span>TCKN: ${escapeHtml(item.identity || '—')} • Fan Card: ${escapeHtml(item.fanCardCode || '—')} • Sicil: ${escapeHtml(item.sicilNo || '—')} • Önc. kod: ${escapeHtml(item.priorityTicketCode || '—')}</span>`;
 
       wrap.appendChild(input);
       wrap.appendChild(meta);
@@ -229,6 +231,8 @@
   function resetCategoryForm() {
     $('categoryEditId').value = '';
     $('categoryValueInput').value = '';
+    if ($('categoryTicketCount')) $('categoryTicketCount').value = '1';
+    if ($('categoryAdjacentSeats')) $('categoryAdjacentSeats').value = 'false';
   }
 
   function resetCredentialForm() {
@@ -237,6 +241,44 @@
     $('credentialPasswordInput').value = '';
     $('credentialIdentityInput').value = '';
     $('credentialFanCardInput').value = '';
+    if ($('credentialSicilNoInput')) $('credentialSicilNoInput').value = '';
+    if ($('credentialPriorityTicketCodeInput')) $('credentialPriorityTicketCodeInput').value = '';
+    renderCredentialCategoryPicker([]);
+  }
+
+  function renderCredentialCategoryPicker(selectedCatIds) {
+    const root = $('credentialCategoryPicker');
+    if (!root) return;
+    root.textContent = '';
+    const cats = state.categories.filter((c) => c.isActive !== false);
+    if (!cats.length) {
+      root.innerHTML = '<div class="checkListEmpty">Kategori yok.</div>';
+      return;
+    }
+    const sel = Array.isArray(selectedCatIds) ? selectedCatIds.map(String) : [];
+    for (const cat of cats) {
+      const wrap = document.createElement('label');
+      wrap.className = 'checkItem';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.value = cat.id;
+      input.dataset.credCatId = cat.id;
+      input.checked = sel.includes(cat.id);
+      const meta = document.createElement('div');
+      meta.className = 'checkItemMeta';
+      meta.innerHTML = `<strong>${escapeHtml(cat.label || cat.categoryTypeValue || '')}</strong>`;
+      wrap.appendChild(input);
+      wrap.appendChild(meta);
+      root.appendChild(wrap);
+    }
+  }
+
+  function getCredentialCategoryIdsFromPicker() {
+    const root = $('credentialCategoryPicker');
+    if (!root) return [];
+    return Array.from(root.querySelectorAll('input[data-cred-cat-id]:checked'))
+      .map((el) => String(el.value || '').trim())
+      .filter(Boolean);
   }
 
   function renderManageCategoryList() {
@@ -257,8 +299,11 @@
       const row = document.createElement('div');
       row.className = 'itemCard' + (editingId === item.id ? ' active' : '');
       const meta = document.createElement('div');
+      const tc = item.ticketCount || 1;
+      const adj = item.adjacentSeats ? 'Yanyana' : 'Serbest';
+      const ruleText = tc > 1 ? `${tc} bilet · ${adj}` : '1 bilet';
       meta.innerHTML = `<strong>${escapeHtml(item.label || item.categoryTypeValue || 'Kategori')}</strong>
-        <div class="itemCardMeta">Takım kategori sıralamasında yer alır.</div>`;
+        <div class="itemCardMeta">${escapeHtml(ruleText)}</div>`;
       const actions = document.createElement('div');
       actions.className = 'itemCardActions';
       actions.innerHTML = `<button type="button" data-action="edit" data-category-id="${escapeHtml(item.id)}" class="btnMuted">Düzenle</button>
@@ -286,8 +331,13 @@
       const row = document.createElement('div');
       row.className = 'itemCard' + (editingId === item.id ? ' active' : '');
       const meta = document.createElement('div');
+      const catNames = (item.categoryIds || []).map((cid) => {
+        const cat = state.categories.find((c) => c.id === cid);
+        return cat ? (cat.label || cat.categoryTypeValue || cid) : cid;
+      });
+      const catLabel = catNames.length ? catNames.map(escapeHtml).join(', ') : 'Tüm kategoriler';
       meta.innerHTML = `<strong>${escapeHtml(item.email || '')}</strong>
-        <div class="itemCardMeta">TCKN: ${escapeHtml(item.identity || '—')}<br>Fan Card: ${escapeHtml(item.fanCardCode || '—')}</div>`;
+        <div class="itemCardMeta">TCKN: ${escapeHtml(item.identity || '—')} · Fan Card: ${escapeHtml(item.fanCardCode || '—')} · Sicil: ${escapeHtml(item.sicilNo || '—')} · Önc. kod: ${escapeHtml(item.priorityTicketCode || '—')}<br>Kategoriler: ${catLabel}</div>`;
       const actions = document.createElement('div');
       actions.className = 'itemCardActions';
       actions.innerHTML = `<button type="button" data-action="edit" data-credential-id="${escapeHtml(item.id)}" class="btnMuted">Düzenle</button>
@@ -362,6 +412,14 @@
     renderCredentialPickers();
     renderManageCategoryList();
     renderManageCredentialList();
+    // Credential düzenleniyorsa picker'ı koru, değilse temizle
+    const editingCredId = String($('credentialEditId').value || '').trim();
+    if (editingCredId) {
+      const editingCred = state.credentials.find((c) => c.id === editingCredId);
+      renderCredentialCategoryPicker(editingCred?.categoryIds || []);
+    } else {
+      renderCredentialCategoryPicker([]);
+    }
   }
 
   function selectedCategoryIds() {
@@ -450,10 +508,15 @@
       return;
     }
     const categoryValue = String($('categoryValueInput').value || '').trim();
+    const tcRaw = $('categoryTicketCount') ? parseInt($('categoryTicketCount').value, 10) : 1;
+    const ticketCount = Number.isFinite(tcRaw) && tcRaw >= 1 ? Math.min(tcRaw, 10) : 1;
+    const adjacentSeats = $('categoryAdjacentSeats') ? $('categoryAdjacentSeats').value === 'true' : false;
     const payload = {
       label: categoryValue,
       categoryTypeValue: categoryValue,
       isActive: true,
+      ticketCount,
+      adjacentSeats,
     };
     const editId = String($('categoryEditId').value || '').trim();
     if (editId) {
@@ -493,7 +556,10 @@
       password: String($('credentialPasswordInput').value || '').trim(),
       identity: String($('credentialIdentityInput').value || '').trim(),
       fanCardCode: String($('credentialFanCardInput').value || '').trim(),
+      sicilNo: String($('credentialSicilNoInput')?.value || '').trim(),
+      priorityTicketCode: String($('credentialPriorityTicketCodeInput')?.value || '').trim(),
       isActive: true,
+      categoryIds: getCredentialCategoryIdsFromPicker(),
     };
     const editId = String($('credentialEditId').value || '').trim();
     if (editId) {
@@ -529,6 +595,8 @@
     if (!item) return;
     $('categoryEditId').value = item.id;
     $('categoryValueInput').value = item.categoryTypeValue || '';
+    if ($('categoryTicketCount')) $('categoryTicketCount').value = String(item.ticketCount || 1);
+    if ($('categoryAdjacentSeats')) $('categoryAdjacentSeats').value = item.adjacentSeats ? 'true' : 'false';
     renderManageCategoryList();
   }
 
@@ -540,6 +608,9 @@
     $('credentialPasswordInput').value = '';
     $('credentialIdentityInput').value = item.identity || '';
     $('credentialFanCardInput').value = item.fanCardCode || '';
+    if ($('credentialSicilNoInput')) $('credentialSicilNoInput').value = item.sicilNo || '';
+    if ($('credentialPriorityTicketCodeInput')) $('credentialPriorityTicketCodeInput').value = item.priorityTicketCode || '';
+    renderCredentialCategoryPicker(item.categoryIds || []);
     renderManageCredentialList();
   }
 

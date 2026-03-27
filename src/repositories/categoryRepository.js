@@ -24,6 +24,8 @@ function mapCategory(doc) {
     alternativeCategoryValue: '',
     sortOrder: 0,
     isActive: doc.isActive !== false,
+    ticketCount: Number.isFinite(doc.ticketCount) && doc.ticketCount >= 1 ? doc.ticketCount : 1,
+    adjacentSeats: doc.adjacentSeats === true,
     createdAt: doc.createdAt || null,
     updatedAt: doc.updatedAt || null,
   };
@@ -67,6 +69,8 @@ async function createCategory(teamId, payload) {
     alternativeCategoryValue: '',
     sortOrder: 0,
     isActive: payload.isActive !== false,
+    ticketCount: Number.isFinite(payload.ticketCount) && payload.ticketCount >= 1 ? payload.ticketCount : 1,
+    adjacentSeats: payload.adjacentSeats === true,
     createdAt: now,
     updatedAt: now,
   };
@@ -93,6 +97,12 @@ async function updateCategory(teamId, categoryId, payload) {
     alternativeCategoryValue: '',
     sortOrder: 0,
     isActive: payload.isActive !== undefined ? payload.isActive !== false : existing.isActive !== false,
+    ticketCount: payload.ticketCount !== undefined
+      ? (Number.isFinite(payload.ticketCount) && payload.ticketCount >= 1 ? payload.ticketCount : 1)
+      : (Number.isFinite(existing.ticketCount) && existing.ticketCount >= 1 ? existing.ticketCount : 1),
+    adjacentSeats: payload.adjacentSeats !== undefined
+      ? payload.adjacentSeats === true
+      : existing.adjacentSeats === true,
     updatedAt: new Date().toISOString(),
   };
   await categories().updateOne({ _id: existing._id }, { $set: next });

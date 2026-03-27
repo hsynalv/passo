@@ -68,6 +68,9 @@ html,body{margin:0;padding:0;height:100%;overflow:auto;font-family:ui-sans-serif
 .card{background:linear-gradient(180deg, rgba(16,26,47,0.92), rgba(12,18,33,0.82));border:1px solid rgba(27,42,75,0.85);border-radius:12px;padding:12px;box-shadow:var(--shadow)}
 .card h2{margin:0 0 8px 0;font-size:13px;color:#dbeafe}
 .form .row{display:flex;flex-direction:column;gap:4px;margin-bottom:8px}
+/* [hidden] alone loses to .form .row { display:flex } — force hide */
+.form .row[hidden]{display:none!important}
+.form details[hidden]{display:none!important}
 .row2{display:grid;grid-template-columns:1fr 1fr; gap:8px}
 .inlineActions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .inlineActions select,.inlineActions input{flex:1 1 220px}
@@ -88,9 +91,9 @@ button:active{transform:translateY(1px)}
 .details summary{cursor:pointer;color:#dbeafe;font-size:11px}
 .checkList{display:flex;flex-direction:column;gap:6px;min-height:90px;max-height:190px;overflow:auto;padding:8px;border:1px solid rgba(27,42,75,0.75);border-radius:10px;background:rgba(0,0,0,0.12)}
 .checkListEmpty{font-size:11px;color:var(--muted)}
-.checkItem{display:flex;align-items:flex-start;gap:8px;padding:6px 8px;border:1px solid rgba(27,42,75,0.55);border-radius:8px;background:rgba(255,255,255,0.02)}
-.checkItem input{width:auto;min-height:auto;margin-top:2px}
-.checkItemMeta{display:flex;flex-direction:column;gap:2px}
+.checkItem{display:flex;flex-direction:row;align-items:flex-start;justify-content:space-between;gap:10px;padding:6px 8px;border:1px solid rgba(27,42,75,0.55);border-radius:8px;background:rgba(255,255,255,0.02)}
+.checkItem input{width:auto;min-height:auto;margin-top:2px;order:2;flex-shrink:0}
+.checkItemMeta{display:flex;flex-direction:column;gap:2px;order:1;flex:1;min-width:0}
 .checkItemMeta strong{font-size:11px;color:#dbeafe}
 .checkItemMeta span{font-size:10px;color:var(--muted)}
 .subcard{margin-top:10px;border:1px solid rgba(27,42,75,0.9);border-radius:10px;padding:10px;background:rgba(255,255,255,0.02)}
@@ -175,6 +178,20 @@ select[multiple]{min-height:140px;line-height:1.35;padding:8px}
 .credentialPickMeta strong{font-size:12px;color:#dbeafe;word-break:break-all}
 .credentialPickMeta span{font-size:10px;color:var(--muted);line-height:1.45}
 input#teamSearchInput{min-height:38px}
+.toastContainer{position:fixed;top:16px;right:16px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none;max-width:380px}
+.toast{pointer-events:auto;display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border-radius:12px;border:1px solid rgba(27,42,75,0.85);background:linear-gradient(180deg,rgba(16,26,47,0.96),rgba(12,18,33,0.94));box-shadow:0 12px 40px rgba(0,0,0,0.45);color:var(--text);font-size:12px;line-height:1.45;animation:toastIn .35s ease;backdrop-filter:blur(8px)}
+.toast.leaving{animation:toastOut .3s ease forwards}
+.toastIcon{flex-shrink:0;width:22px;height:22px;border-radius:999px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700}
+.toast.success .toastIcon{background:rgba(94,234,212,0.15);color:var(--accent)}
+.toast.error .toastIcon{background:rgba(251,113,133,0.15);color:var(--danger)}
+.toast.info .toastIcon{background:rgba(96,165,250,0.15);color:var(--accent2)}
+.toastBody{flex:1;min-width:0}
+.toastTitle{font-weight:700;font-size:12px;color:#dbeafe;margin-bottom:2px}
+.toastMsg{font-size:11px;color:var(--muted);line-height:1.4}
+.toastClose{flex-shrink:0;border:none;background:transparent;color:var(--muted);font-size:16px;cursor:pointer;padding:0 2px;line-height:1}
+.toastClose:hover{color:var(--text)}
+@keyframes toastIn{from{opacity:0;transform:translateX(40px) scale(0.95)}to{opacity:1;transform:translateX(0) scale(1)}}
+@keyframes toastOut{from{opacity:1;transform:translateX(0) scale(1)}to{opacity:0;transform:translateX(40px) scale(0.95)}}
 @media (min-width:900px){
   .managerSection .row2{gap:12px}
   .managerSection .row{margin-bottom:10px}

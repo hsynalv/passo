@@ -40,13 +40,46 @@ function normalizeSelectedCategory(item, fallbackMode = 'scan') {
     if (!categoryType) return null;
     const alternativeCategory = String(item.alternativeCategory || item.alternativeCategoryValue || '').trim();
     const selectionModeHint = String(item.selectionModeHint || fallbackMode || 'scan').trim().toLowerCase();
+    const tc = Number(item.ticketCount);
+    const ticketCount = Number.isFinite(tc) && tc >= 1 ? Math.min(Math.floor(tc), 10) : 1;
     return {
         id: item.id ? String(item.id) : null,
         label: String(item.label || item.name || categoryType).trim(),
         categoryType,
         alternativeCategory,
-        selectionModeHint: ['legacy', 'scan', 'svg'].includes(selectionModeHint) ? selectionModeHint : String(fallbackMode || 'scan').trim().toLowerCase()
+        selectionModeHint: ['legacy', 'scan', 'svg'].includes(selectionModeHint) ? selectionModeHint : String(fallbackMode || 'scan').trim().toLowerCase(),
+        ticketCount,
+        adjacentSeats: item.adjacentSeats === true
     };
+}
+
+/**
+ * Üyeliğe kategori atanmışsa yalnızca o kategoriler (DB) kullanılır; atanmamışsa arayüz seçimi geçerlidir.
+ * Arayüz seçimi üyeliği kısıtlamaz — öncelik üyelikte.
+ */
+async function resolveCategoriesForCredential(teamId, selectedCategories, credentialCategoryIds, categorySelectionMode) {
+  const ids = Array.isArray(credentialCategoryIds)
+    ? credentialCategoryIds.map((id) => String(id).trim()).filter(Boolean)
+    : [];
+  if (!ids.length || !teamId) {
+    return selectedCategories;
+  }
+  const repoCategories = await categoryRepo.getCategoriesByIds(teamId, ids);
+  if (!repoCategories.length) {
+    return selectedCategories;
+  }
+  return repoCategories
+    .map((item) => normalizeSelectedCategory({
+      id: item.id,
+      label: item.label,
+      categoryType: item.categoryTypeValue,
+      alternativeCategory: item.alternativeCategoryValue,
+      selectionModeHint: item.selectionModeHint,
+      sortOrder: item.sortOrder,
+      ticketCount: item.ticketCount,
+      adjacentSeats: item.adjacentSeats
+    }, categorySelectionMode))
+    .filter(Boolean);
 }
 
 function buildCategoryRoamTexts(selectedCategories, fallbackCategoryType, fallbackAlternativeCategory) {
@@ -360,6 +393,111 @@ const runStore = (() => {
     return { get, upsert, remove, safeRunId, list, listRunning, killAllRunning };
 })();
 
+/** start-bot-async ön kontrolünde çekilen listeler; startBotAfterValidation aynı body referansıyla tekrar DB çağırmasın */
+const accountListsWarmCache = new WeakMap();
+
+async function buildCredentialBackedAccountLists(validatedData) {
+    const {
+        teamId,
+        aCredentialIds, bCredentialIds,
+        aAccounts, bAccounts,
+        email, password, email2, password2,
+        identity, fanCardCode, sicilNo, priorityTicketCode,
+    } = validatedData;
+
+    const aCredentialIdsSafe = Array.isArray(aCredentialIds) ? aCredentialIds.map((id) => String(id).trim()).filter(Boolean) : [];
+    const bCredentialIdsSafe = Array.isArray(bCredentialIds) ? bCredentialIds.map((id) => String(id).trim()).filter(Boolean) : [];
+
+    let aAccountsFromTeam = [];
+    if (teamId && aCredentialIdsSafe.length) {
+        const docs = await credentialRepo.getCredentialsByIds(teamId, aCredentialIdsSafe);
+        if (docs.length !== aCredentialIdsSafe.length) {
+            return { ok: false, error: 'Seçilen A üyeliklerinden biri bulunamadı veya aktif değil' };
+        }
+        aAccountsFromTeam = docs.map((item) => ({
+            email: String(item.email || ''),
+            password: decryptSecret(item.encryptedPassword),
+            identity: item.identity || null,
+            fanCardCode: item.fanCardCode || null,
+            sicilNo: item.sicilNo || null,
+            priorityTicketCode: item.priorityTicketCode || null,
+            categoryIds: Array.isArray(item.categoryIds) ? item.categoryIds.map(String) : []
+        }));
+    }
+
+    let bAccountsFromTeam = [];
+    if (teamId && bCredentialIdsSafe.length) {
+        const docs = await credentialRepo.getCredentialsByIds(teamId, bCredentialIdsSafe);
+        if (docs.length !== bCredentialIdsSafe.length) {
+            return { ok: false, error: 'Seçilen B üyeliklerinden biri bulunamadı veya aktif değil' };
+        }
+        bAccountsFromTeam = docs.map((item) => ({
+            email: String(item.email || ''),
+            password: decryptSecret(item.encryptedPassword),
+            identity: item.identity || null,
+            fanCardCode: item.fanCardCode || null,
+            sicilNo: item.sicilNo || null,
+            priorityTicketCode: item.priorityTicketCode || null,
+            categoryIds: Array.isArray(item.categoryIds) ? item.categoryIds.map(String) : []
+        }));
+    }
+
+    const a0Raw = Array.isArray(aAccounts) && aAccounts.length ? aAccounts[0] : null;
+    const b0Raw = Array.isArray(bAccounts) && bAccounts.length ? bAccounts[0] : null;
+
+    const aList = (Array.isArray(aAccounts) && aAccounts.length)
+        ? aAccounts.map(a => ({
+            email: String(a.email || ''),
+            password: String(a.password || ''),
+            identity: (a && Object.prototype.hasOwnProperty.call(a, 'identity')) ? a.identity : null,
+            fanCardCode: (a && Object.prototype.hasOwnProperty.call(a, 'fanCardCode')) ? a.fanCardCode : null,
+            sicilNo: (a && Object.prototype.hasOwnProperty.call(a, 'sicilNo')) ? a.sicilNo : null,
+            priorityTicketCode: (a && Object.prototype.hasOwnProperty.call(a, 'priorityTicketCode')) ? a.priorityTicketCode : null
+        }))
+        : (aAccountsFromTeam.length
+            ? aAccountsFromTeam
+            : [{ email: (a0Raw?.email || email || '').toString(), password: (a0Raw?.password || password || '').toString(), identity: identity ?? null, fanCardCode: fanCardCode ?? null, sicilNo: sicilNo ?? null, priorityTicketCode: priorityTicketCode ?? null }]);
+    const bList = (Array.isArray(bAccounts) && bAccounts.length)
+        ? bAccounts.map(b => ({
+            email: String(b.email || ''),
+            password: String(b.password || ''),
+            identity: (b && Object.prototype.hasOwnProperty.call(b, 'identity')) ? b.identity : null,
+            fanCardCode: (b && Object.prototype.hasOwnProperty.call(b, 'fanCardCode')) ? b.fanCardCode : null,
+            sicilNo: (b && Object.prototype.hasOwnProperty.call(b, 'sicilNo')) ? b.sicilNo : null,
+            priorityTicketCode: (b && Object.prototype.hasOwnProperty.call(b, 'priorityTicketCode')) ? b.priorityTicketCode : null
+        }))
+        : (bAccountsFromTeam.length
+            ? bAccountsFromTeam
+            : [{ email: (b0Raw?.email || email2 || '').toString(), password: (b0Raw?.password || password2 || '').toString(), identity: identity ?? null, fanCardCode: fanCardCode ?? null, sicilNo: sicilNo ?? null, priorityTicketCode: priorityTicketCode ?? null }]);
+
+    const hasRealB = bList.some(b => (b.email || '').trim() && (b.password || '').trim());
+    return { ok: true, aList, bList, hasRealB };
+}
+
+function validateDivanPriorityAccounts(aList, bList, hasRealB, prioritySale, sicilNo, priorityTicketCode) {
+    if (typeof prioritySale !== 'string' || !isDivanPrioritySaleCategory(prioritySale)) return null;
+    const reqS = String(sicilNo || '').trim();
+    const reqP = String(priorityTicketCode || '').trim();
+    for (const acc of aList) {
+        const s = String(acc.sicilNo || '').trim() || reqS;
+        const p = String(acc.priorityTicketCode || '').trim() || reqP;
+        if (!s || !p) {
+            return 'Divan önceliği: her A hesabı için üyelikte veya başlatma formunda Sicil No ve Öncelikli Bilet Kodu gerekir.';
+        }
+    }
+    if (hasRealB) {
+        for (const acc of bList) {
+            if (!(String(acc.email || '').trim() && String(acc.password || '').trim())) continue;
+            const s = String(acc.sicilNo || '').trim() || reqS;
+            const p = String(acc.priorityTicketCode || '').trim() || reqP;
+            if (!s || !p) {
+                return 'Divan önceliği: her B hesabı için üyelikte veya başlatma formunda Sicil No ve Öncelikli Bilet Kodu gerekir.';
+            }
+        }
+    }
+    return null;
+}
+
 async function startBotAsync(req, res) {
     let validatedData;
     try {
@@ -375,6 +513,27 @@ async function startBotAsync(req, res) {
         logger.errorSafe('Validation hatası (beklenmeyen format)', error, { body: req.body });
         return res.status(400).json({ error: formatError('INVALID_REQUEST_DATA') });
     }
+
+    const builtLists = await buildCredentialBackedAccountLists(validatedData);
+    if (!builtLists.ok) {
+        return res.status(400).json({ error: builtLists.error });
+    }
+    const divanPreflightErr = validateDivanPriorityAccounts(
+        builtLists.aList,
+        builtLists.bList,
+        builtLists.hasRealB,
+        validatedData.prioritySale,
+        validatedData.sicilNo,
+        validatedData.priorityTicketCode
+    );
+    if (divanPreflightErr) {
+        return res.status(400).json({ error: divanPreflightErr });
+    }
+    accountListsWarmCache.set(validatedData, {
+        aList: builtLists.aList,
+        bList: builtLists.bList,
+        hasRealB: builtLists.hasRealB,
+    });
 
     const runId = (() => {
         try { return randomUUID(); } catch { return `${Date.now()}_${Math.random().toString(16).slice(2)}`; }
@@ -2759,11 +2918,115 @@ async function clickBuy(page, eventAddress = null) {
     return false;
 }
 
+/** Passo öncelik modalındaki tek divan satırı (panel seçimi ile aynı metin). */
+const DIVAN_PRIORITY_SALE_TITLE = 'Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler';
+
+function normKeyPrioritySaleTitle(s) {
+    const norm2 = (x) => (x || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+    return norm2(s)
+        .replace(/[ıİ]/g, 'i')
+        .replace(/[şŞ]/g, 's')
+        .replace(/[ğĞ]/g, 'g')
+        .replace(/[üÜ]/g, 'u')
+        .replace(/[öÖ]/g, 'o')
+        .replace(/[çÇ]/g, 'c')
+        .replace(/[^a-z0-9]+/g, '');
+}
+
+function isDivanPrioritySaleCategory(desired) {
+    const a = normKeyPrioritySaleTitle(DIVAN_PRIORITY_SALE_TITLE);
+    const b = normKeyPrioritySaleTitle(desired);
+    if (!b) return false;
+    return a === b || a.includes(b) || b.includes(a);
+}
+
+/**
+ * Divan öncelik modalı: label "Sicil No:" / "Öncelikli Bilet Kodu:" (docs/fenerbahçe divan.md).
+ * Yalnızca isDivanPrioritySaleCategory true iken çağrılmalı.
+ */
+async function fillDivanPrioritySaleModalFields(page, sicilVal, priorityCodeVal) {
+    const sicil = String(sicilVal || '').trim();
+    const prio = String(priorityCodeVal || '').trim();
+    if (!sicil || !prio) return false;
+    try {
+        return await page.evaluate((sicilStr, prioStr) => {
+            const isVisible = (el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || '1') === 0)) return false;
+                const r = el.getBoundingClientRect?.();
+                if (!r) return true;
+                return r.width > 4 && r.height > 4;
+            };
+
+            const pickRoot = () => {
+                const byClass = document.querySelector('.modal.priority-sale-modal.show')
+                    || document.querySelector('.modal.show.priority-sale-modal');
+                if (byClass && isVisible(byClass)) return byClass;
+                const shown = Array.from(document.querySelectorAll('.modal.show, .modal.fade.show')).filter(isVisible);
+                return shown.find((m) => m.classList.contains('priority-sale-modal') || !!m.querySelector('.priority-sale-select-item')) || shown[0] || null;
+            };
+
+            const root = pickRoot();
+            if (!root) return false;
+
+            const setNativeValue = (input, v) => {
+                try {
+                    const proto = window.HTMLInputElement.prototype;
+                    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (desc && desc.set) desc.set.call(input, String(v || ''));
+                    else input.value = String(v || '');
+                } catch {
+                    try { input.value = String(v || ''); } catch {}
+                }
+                try { input.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
+                try { input.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+                try { input.dispatchEvent(new Event('blur', { bubbles: true })); } catch {}
+            };
+
+            const labels = Array.from(root.querySelectorAll('label'));
+            const inputByLabel = (needles) => {
+                const n = needles.map((x) => String(x).toLowerCase());
+                for (const lbl of labels) {
+                    const t = String(lbl.innerText || lbl.textContent || '').toLowerCase().replace(/\s+/g, ' ');
+                    if (!n.every((needle) => t.includes(needle))) continue;
+                    const fg = lbl.closest('.form-group') || lbl.parentElement;
+                    const inp = fg?.querySelector('input:not([type="hidden"])');
+                    if (inp && isVisible(inp)) return inp;
+                }
+                return null;
+            };
+
+            let sicilInp = inputByLabel(['sicil']);
+            let prioInp = inputByLabel(['öncelik', 'bilet']) || inputByLabel(['oncelik', 'bilet']) || inputByLabel(['bilet', 'kod']);
+
+            if (!sicilInp || !prioInp) {
+                const inputs = Array.from(root.querySelectorAll('input.form-control, input[type="text"]')).filter(isVisible);
+                for (const inp of inputs) {
+                    const ph = String(inp.getAttribute('placeholder') || '').toLowerCase();
+                    if (!sicilInp && ph.includes('sicil')) sicilInp = inp;
+                    if (!prioInp && (ph.includes('öncelik') || ph.includes('oncelik') || ph.includes('oncelikli'))) prioInp = inp;
+                }
+            }
+
+            if (!sicilInp || !prioInp || sicilInp === prioInp) return false;
+
+            setNativeValue(sicilInp, sicilStr);
+            setNativeValue(prioInp, prioStr);
+            return true;
+        }, sicil, prio);
+    } catch {
+        return false;
+    }
+}
+
 async function handlePrioritySaleModal(page, opts = null) {
     const o = opts && typeof opts === 'object' ? opts : {};
     const prioritySale = o.prioritySale;
     const fanCardCode = o.fanCardCode;
     const identity = o.identity;
+    const sicilNo = o.sicilNo;
+    const priorityTicketCode = o.priorityTicketCode;
 
     const desired = (typeof prioritySale === 'string' ? String(prioritySale).trim() : '');
     const shouldTry = prioritySale === true || desired.length > 0;
@@ -2955,7 +3218,10 @@ async function handlePrioritySaleModal(page, opts = null) {
         const hint = norm(`${placeholder} ${labelText} ${name} ${id}`);
         let value = '';
         if (hint.includes('t.c') || hint.includes('tc') || hint.includes('tckn') || hint.includes('kimlik')) value = String(identity || '').trim();
-        else value = String(fanCardCode || identity || '').trim();
+        else if (hint.includes('sicil') || hint.includes('kayıt') || hint.includes('kayit')) value = String(sicilNo || '').trim();
+        else if ((hint.includes('öncelik') || hint.includes('oncelik')) && (hint.includes('bilet') || hint.includes('kod'))) value = String(priorityTicketCode || '').trim();
+        else if (hint.includes('fan') && hint.includes('card')) value = String(fanCardCode || '').trim();
+        else value = String(fanCardCode || priorityTicketCode || sicilNo || identity || '').trim();
         if (!value) return false;
 
         const modalSel = '.modal.show, .modal.fade.show, .swal2-container.swal2-shown, [role="dialog"][aria-modal="true"], [aria-modal="true"]';
@@ -3327,7 +3593,28 @@ async function handlePrioritySaleModal(page, opts = null) {
                 try { logger.info('prioritySale.option.selected', { desired: desired || null, selectedTitle: selInfo?.selectedTitle || null, hasInput: !!selInfo?.hasInput }); } catch {}
             }
             if (selInfo?.ok) {
-                if (selInfo?.hasInput) {
+                const divan = isDivanPrioritySaleCategory(desired);
+                if (divan) {
+                    const s = String(sicilNo || '').trim();
+                    const p = String(priorityTicketCode || '').trim();
+                    if (!s || !p) {
+                        try {
+                            logger.warn('prioritySale.divan.missing_credential_fields', {
+                                desired,
+                                hasSicilNo: !!s,
+                                hasPriorityTicketCode: !!p,
+                            });
+                        } catch {}
+                        return false;
+                    }
+                    const filled = await fillDivanPrioritySaleModalFields(page, s, p);
+                    if (!filled) {
+                        try { logger.warn('prioritySale.divan.fill_failed', { desired }); } catch {}
+                        return false;
+                    }
+                    try { logger.info('prioritySale.divan.filled', { desired }); } catch {}
+                    try { await delay(250); } catch {}
+                } else if (selInfo?.hasInput) {
                     await fillInputIfNeeded(selInfo);
                 }
             }
@@ -4539,8 +4826,9 @@ async function startBotAfterValidation(req, res, validatedData) {
         team: requestedTeam, teamId, ticketType, eventAddress, categoryType, alternativeCategory,
         categorySelectionMode,
         transferTargetEmail,
+        ticketCount = 1,
         extendWhenRemainingSecondsBelow,
-        prioritySale, fanCardCode, identity,
+        prioritySale, fanCardCode, identity, sicilNo, priorityTicketCode,
         email, password,
         cardHolder = null, cardNumber = null, expiryMonth = null, expiryYear = null, cvv = null,
         proxyHost, proxyPort, proxyUsername, proxyPassword,
@@ -4576,7 +4864,9 @@ async function startBotAfterValidation(req, res, validatedData) {
                 categoryType: item.categoryTypeValue,
                 alternativeCategory: item.alternativeCategoryValue,
                 selectionModeHint: item.selectionModeHint,
-                sortOrder: item.sortOrder
+                sortOrder: item.sortOrder,
+                ticketCount: item.ticketCount,
+                adjacentSeats: item.adjacentSeats
             }, categorySelectionMode))
             .filter(Boolean);
     }
@@ -4593,65 +4883,40 @@ async function startBotAfterValidation(req, res, validatedData) {
     const resolvedCategoryType = selectedCategories[0]?.categoryType || String(categoryType || '').trim();
     const resolvedAlternativeCategory = selectedCategories[0]?.alternativeCategory || String(alternativeCategory || '').trim();
 
-    let aAccountsFromTeam = [];
-    if (teamId && aCredentialIdsSafe.length) {
-        const docs = await credentialRepo.getCredentialsByIds(teamId, aCredentialIdsSafe);
-        if (docs.length !== aCredentialIdsSafe.length) {
-            return res.status(400).json({ error: 'Seçilen A üyeliklerinden biri bulunamadı veya aktif değil' });
+    let aList;
+    let bList;
+    let hasRealB;
+    const warmLists = accountListsWarmCache.get(validatedData);
+    if (warmLists) {
+        try { accountListsWarmCache.delete(validatedData); } catch {}
+        aList = warmLists.aList;
+        bList = warmLists.bList;
+        hasRealB = warmLists.hasRealB;
+    } else {
+        const built = await buildCredentialBackedAccountLists(validatedData);
+        if (!built.ok) {
+            return res.status(400).json({ error: built.error });
         }
-        aAccountsFromTeam = docs.map((item) => ({
-            email: String(item.email || ''),
-            password: decryptSecret(item.encryptedPassword),
-            identity: item.identity || null,
-            fanCardCode: item.fanCardCode || null
-        }));
+        aList = built.aList;
+        bList = built.bList;
+        hasRealB = built.hasRealB;
+        const divanMess = validateDivanPriorityAccounts(aList, bList, hasRealB, validatedData.prioritySale, validatedData.sicilNo, validatedData.priorityTicketCode);
+        if (divanMess) {
+            return res.status(400).json({ error: divanMess });
+        }
     }
 
-    let bAccountsFromTeam = [];
-    if (teamId && bCredentialIdsSafe.length) {
-        const docs = await credentialRepo.getCredentialsByIds(teamId, bCredentialIdsSafe);
-        if (docs.length !== bCredentialIdsSafe.length) {
-            return res.status(400).json({ error: 'Seçilen B üyeliklerinden biri bulunamadı veya aktif değil' });
-        }
-        bAccountsFromTeam = docs.map((item) => ({
-            email: String(item.email || ''),
-            password: decryptSecret(item.encryptedPassword),
-            identity: item.identity || null,
-            fanCardCode: item.fanCardCode || null
-        }));
-    }
-
-    const a0 = Array.isArray(aAccounts) && aAccounts.length ? aAccounts[0] : null;
-    const b0 = Array.isArray(bAccounts) && bAccounts.length ? bAccounts[0] : null;
-
-    // Backward compatible mapping: if multi-account arrays provided, use their first entries
-    const emailA = (a0?.email || email || '').toString();
-    const passwordA = (a0?.password || password || '').toString();
-    const emailB = (b0?.email || email2 || '').toString();
-    const passwordB = (b0?.password || password2 || '').toString();
-
-    const aList = (Array.isArray(aAccounts) && aAccounts.length)
-        ? aAccounts.map(a => ({
-            email: String(a.email || ''),
-            password: String(a.password || ''),
-            identity: (a && Object.prototype.hasOwnProperty.call(a, 'identity')) ? a.identity : null,
-            fanCardCode: (a && Object.prototype.hasOwnProperty.call(a, 'fanCardCode')) ? a.fanCardCode : null
-        }))
-        : (aAccountsFromTeam.length
-            ? aAccountsFromTeam
-            : [{ email: emailA, password: passwordA, identity: identity ?? null, fanCardCode: fanCardCode ?? null }]);
-    const bList = (Array.isArray(bAccounts) && bAccounts.length)
-        ? bAccounts.map(b => ({
-            email: String(b.email || ''),
-            password: String(b.password || ''),
-            identity: (b && Object.prototype.hasOwnProperty.call(b, 'identity')) ? b.identity : null,
-            fanCardCode: (b && Object.prototype.hasOwnProperty.call(b, 'fanCardCode')) ? b.fanCardCode : null
-        }))
-        : (bAccountsFromTeam.length
-            ? bAccountsFromTeam
-            : [{ email: emailB, password: passwordB, identity: identity ?? null, fanCardCode: fanCardCode ?? null }]);
+    // emailA/passwordA her zaman aList'ten al — DB credentialIds de dahil
+    // let: multi-mode C finalize pair seciminde yeniden ataniyorlar
+    const a0 = aList[0] || null;
+    const b0 = bList[0] || null;
+    let emailA = (a0?.email || '').toString();
+    let passwordA = (a0?.password || '').toString();
+    let emailB = (b0?.email || '').toString();
+    let passwordB = (b0?.password || '').toString();
 
     const isMulti = (aList.length > 1) || (bList.length > 1);
+    const hasCardInfo = !!(cardHolder && cardNumber && expiryMonth && expiryYear && cvv);
     const categoryRoamTexts = buildCategoryRoamTexts(selectedCategories, resolvedCategoryType, resolvedAlternativeCategory);
 
     const runId = (() => {
@@ -4865,7 +5130,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         await clickBuy(pageC, eventAddress);
         setStep('C.clickBuy.done');
 
-        await handlePrioritySaleModal(pageC, { prioritySale, fanCardCode, identity });
+        await handlePrioritySaleModal(pageC, { prioritySale, fanCardCode, identity, sicilNo, priorityTicketCode });
 
         await ensureUrlContains(pageC, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
         try { await reloginIfRedirected(pageC, cAcc.email, cAcc.password); } catch {}
@@ -5377,14 +5642,16 @@ async function startBotAfterValidation(req, res, validatedData) {
             const multiBConcurrency = Math.max(1, Number(getCfg()?.MULTI?.B_CONCURRENCY || 2));
             const multiStaggerMs = Math.max(0, Number(getCfg()?.MULTI?.STAGGER_MS || 0));
 
-            // Prepare B accounts and A holds concurrently (optionally staggered)
-            setStep('MULTI.parallel.start', { aCount: aList.length, bCount: bList.length, multiAConcurrency, multiBConcurrency, multiStaggerMs });
+            // A hesapları önce koltuk kapsın (öncelik), sonra B hesapları hazırlansın
+            setStep('MULTI.aFirst.start', { aCount: aList.length, bCount: bList.length, multiAConcurrency, multiBConcurrency, multiStaggerMs });
 
-            const bCtxPromise = (async () => {
+            const bCtxFn = async () => {
                 setStep('MULTI.B.prepare.start', { bCount: bList.length, concurrency: multiBConcurrency, multiStaggerMs });
                 audit('multi_b_prepare_start', { bCount: bList.length, concurrency: multiBConcurrency, multiStaggerMs });
                 const bCtxList = await poolMap(bList, multiBConcurrency, async (acc, i) => {
                 const label = `B${i}`;
+                let bBrowser = null;
+                try {
                 if (multiStaggerMs > 0) {
                     try { await delay(i * multiStaggerMs); } catch {}
                 }
@@ -5400,6 +5667,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     proxyUsername,
                     proxyPassword
                 });
+                bBrowser = browser;
                 try { multiBrowsers.push(browser); } catch {}
                 setStep(`${label}.launchAndLogin.done`, { email: acc.email, snap: await snapshotPage(page, `${label}.afterLogin`) });
                 audit('account_launch_done', { role: 'B', idx: i, email: acc.email, url: (() => { try { return page.url(); } catch { return null; } })() });
@@ -5424,7 +5692,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.clickBuy.done`);
                 audit('account_click_buy_done', { role: 'B', idx: i, email: acc.email, url: (() => { try { return page.url(); } catch { return null; } })() });
 
-                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity });
+                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode });
 
                 setStep(`${label}.postBuy.ensureUrl.start`);
                 await ensureUrlContains(page, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
@@ -5436,7 +5704,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.postBuy.reloginCheck.done`, { snap: await snapshotPage(page, `${label}.afterReloginCheck`) });
 
                 // Priority sale modal can appear after redirect/login on /koltuk-secim as well.
-                const ps2 = await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity });
+                const ps2 = await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode });
                 if (ps2) {
                     try { await ensureUrlContains(page, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 }); } catch {}
                 }
@@ -5516,18 +5784,35 @@ async function startBotAfterValidation(req, res, validatedData) {
                     seatSelectionUrl,
                     seatmapReady
                 };
+                } catch (e) {
+                    audit('b_prepare_failed', { idx: i, email: acc.email, error: e?.message || String(e) }, 'warn');
+                    logger.warn(`${label} başarısız — tarayıcı kapatılıyor`, { email: acc.email, error: e?.message });
+                    try { if (bBrowser) { await bBrowser.close().catch(() => {}); const bIdx = multiBrowsers.indexOf(bBrowser); if (bIdx >= 0) multiBrowsers.splice(bIdx, 1); } } catch {}
+                    return null;
+                }
                 });
-                setStep('MULTI.B.prepare.done', { bCount: bCtxList.length });
-                audit('multi_b_prepare_done', { bCount: bCtxList.length, bEmails: bCtxList.map(x => x?.email).filter(Boolean) });
-                return bCtxList;
-            })();
+                const bCtxOk = bCtxList.filter(x => x !== null);
+                const bFailedCount = bCtxList.length - bCtxOk.length;
+                if (bCtxOk.length === 0) {
+                    throw new Error('Tüm B hesapları başarısız oldu — devam edilemiyor');
+                }
+                if (bFailedCount > 0) {
+                    audit('multi_b_partial_failure', { total: bList.length, ok: bCtxOk.length, failed: bFailedCount });
+                    logger.warn(`${bFailedCount}/${bList.length} B hesabı başarısız, ${bCtxOk.length} hesapla devam ediliyor`);
+                }
+                setStep('MULTI.B.prepare.done', { bCount: bCtxOk.length, failedCount: bFailedCount });
+                audit('multi_b_prepare_done', { bCount: bCtxOk.length, failedCount: bFailedCount, bEmails: bCtxOk.map(x => x?.email).filter(Boolean) });
+                return bCtxOk;
+            };
 
-            const aCtxPromise = (async () => {
+            const aCtxList = await (async () => {
                 // Run A accounts in parallel pool to add seats to basket and park on /sepet
                 setStep('MULTI.A.hold.start', { aCount: aList.length, concurrency: multiAConcurrency, multiStaggerMs });
                 audit('multi_a_hold_start', { aCount: aList.length, concurrency: multiAConcurrency, multiStaggerMs });
                 const aCtxList = await poolMap(aList, multiAConcurrency, async (acc, i) => {
                 const label = `A${i}`;
+                let aBrowser = null;
+                try {
                 const userDataDir = buildRunUserDataDir(getCfg().USER_DATA_DIR_A, `A${i}`);
 
                 if (multiStaggerMs > 0) {
@@ -5545,6 +5830,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     proxyUsername,
                     proxyPassword
                 });
+                aBrowser = browser;
                 try { multiBrowsers.push(browser); } catch {}
                 setStep(`${label}.launchAndLogin.done`, { email: acc.email, snap: await snapshotPage(page, `${label}.afterLogin`) });
                 audit('account_launch_done', { role: 'A', idx: i, email: acc.email, url: (() => { try { return page.url(); } catch { return null; } })() });
@@ -5569,7 +5855,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.clickBuy.done`);
                 audit('account_click_buy_done', { role: 'A', idx: i, email: acc.email, url: (() => { try { return page.url(); } catch { return null; } })() });
 
-                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity });
+                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode });
 
                 setStep(`${label}.postBuy.ensureUrl.start`);
                 await ensureUrlContains(page, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
@@ -5581,7 +5867,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.postBuy.reloginCheck.done`, { snap: await snapshotPage(page, `${label}.afterReloginCheck`) });
 
                 // Priority sale modal can appear after redirect/login on /koltuk-secim as well.
-                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity });
+                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode });
 
                 // Guard: session drift may leave us on / or /giris; ensure we are back on seat selection.
                 try {
@@ -5621,8 +5907,9 @@ async function startBotAfterValidation(req, res, validatedData) {
                     setStep(`${label}.ticketType.select.done`, { snap: await snapshotPage(page, `${label}.afterTicketType`) });
                 }
 
+                const accountAllowedCategories = await resolveCategoriesForCredential(teamId, selectedCategories, acc.categoryIds || [], categorySelectionMode);
                 const accountCategoryChooser = createCategoryChooser(
-                    selectedCategories,
+                    accountAllowedCategories,
                     resolvedCategoryType,
                     resolvedAlternativeCategory,
                     categorySelectionMode
@@ -5670,6 +5957,9 @@ async function startBotAfterValidation(req, res, validatedData) {
                 for (let cycle = 1; (waitUntilFound ? (Date.now() < waitDeadlineAt) : (cycle <= maxCycle)); cycle++) {
                     try {
                         const remaining = Math.max(15000, Number(getCfg().TIMEOUTS.SEAT_SELECTION_MAX) - (Date.now() - cycleStartedAt));
+                        const catRule = cbRes?.chosenCategory || {};
+                        const effectiveTicketCount = (catRule.ticketCount && catRule.ticketCount > 1) ? catRule.ticketCount : ticketCount;
+                        const adjacentSeats = catRule.adjacentSeats === true;
                         seatInfo = await seatHelper.pickRandomSeatWithVerify(page, remaining, {
                             context: label,
                             expectedUrlIncludes: '/koltuk-secim',
@@ -5680,7 +5970,9 @@ async function startBotAfterValidation(req, res, validatedData) {
                             reloginIfRedirected,
                             ensureTurnstileFn: ensureCaptchaOnPage,
                             chooseCategoryFn: accountCategoryChooser.choose,
-                            categorySelectionMode
+                            categorySelectionMode,
+                            ticketCount: effectiveTicketCount,
+                            adjacentSeats
                         });
                         break;
                     } catch (e) {
@@ -5757,14 +6049,108 @@ async function startBotAfterValidation(req, res, validatedData) {
                     seatSelectionUrl,
                     basketArrivedAtMs
                 };
+                } catch (e) {
+                    audit('a_hold_failed', { idx: i, email: acc.email, error: e?.message || String(e) }, 'warn');
+                    logger.warn(`${label} başarısız — tarayıcı kapatılıyor`, { email: acc.email, error: e?.message });
+                    try { if (aBrowser) { await aBrowser.close().catch(() => {}); const bIdx = multiBrowsers.indexOf(aBrowser); if (bIdx >= 0) multiBrowsers.splice(bIdx, 1); } } catch {}
+                    return null;
+                }
                 });
-                setStep('MULTI.A.hold.done', { aCount: aCtxList.length });
-                audit('multi_a_hold_done', { aCount: aCtxList.length, aEmails: aCtxList.map(x => x?.email).filter(Boolean) });
-                return aCtxList;
+                const aCtxOk = aCtxList.filter(x => x !== null);
+                const aFailedCount = aCtxList.length - aCtxOk.length;
+                if (aCtxOk.length === 0) {
+                    throw new Error('Tüm A hesapları başarısız oldu — devam edilemiyor');
+                }
+                if (aFailedCount > 0) {
+                    audit('multi_a_partial_failure', { total: aList.length, ok: aCtxOk.length, failed: aFailedCount });
+                    logger.warn(`${aFailedCount}/${aList.length} A hesabı başarısız, ${aCtxOk.length} hesapla devam ediliyor`);
+                }
+                setStep('MULTI.A.hold.done', { aCount: aCtxOk.length, failedCount: aFailedCount });
+                audit('multi_a_hold_done', { aCount: aCtxOk.length, failedCount: aFailedCount, aEmails: aCtxOk.map(x => x?.email).filter(Boolean) });
+                return aCtxOk;
             })();
 
-            const [bCtxList, aCtxList] = await Promise.all([bCtxPromise, aCtxPromise]);
-            setStep('MULTI.parallel.done', { aCount: aCtxList.length, bCount: bCtxList.length });
+            // B hesabı yoksa: transfer loop yok, direkt ödeme veya hold
+            if (!hasRealB) {
+                audit('multi_a_only_mode', { aCount: aCtxList.length, hasCardInfo });
+                logger.info('A-only mod: B hesabi tanimli degil, transfer yapilmayacak');
+
+                dashboardPairs = aCtxList.map((ctx, i) => ({
+                    pairIndex: i + 1,
+                    aEmail: ctx.email || '',
+                    bEmail: '\u2014',
+                    holder: ctx?.seatInfo?.seatId ? 'A' : null,
+                    seatId: ctx?.seatInfo?.seatId ? String(ctx.seatInfo.seatId) : null,
+                    seatLabel: fmtSeatLabel(ctx?.seatInfo),
+                    phase: hasCardInfo ? '\u00d6demeye gidiliyor' : 'Sepette tutuluyor',
+                    transferOk: null,
+                    unmatched: true
+                }));
+                syncDashboardToRunStore();
+
+                const primaryA = aCtxList[0];
+                browserA = primaryA.browser;
+                pageA = primaryA.page;
+                emailA = primaryA.email;
+                passwordA = primaryA.password;
+                seatInfoA = primaryA.seatInfo;
+                catBlockA = primaryA.catBlock || catBlockA;
+
+                basketTimer = new BasketTimer();
+                basketTimer.start();
+                setHolder('A', seatInfoA, catBlockA);
+
+                if (hasCardInfo) {
+                    setStep('A.payment.start');
+                    audit('a_only_payment_start', { email: emailA, seatId: seatInfoA?.seatId });
+
+                    try {
+                        if (identity && String(identity).trim().length === 11) {
+                            setStep('A.payment.tcAssign.start');
+                            await ensureTcAssignedOnBasket(pageA, String(identity).trim(), { preferAssignToMyId: true, maxAttempts: 3 });
+                            setStep('A.payment.tcAssign.done');
+                        }
+                    } catch {}
+
+                    try {
+                        setStep('A.payment.devamToOdeme.start');
+                        await clickBasketDevamToOdeme(pageA);
+                        await pageA.waitForFunction(() => /\/odeme(\b|\/|\?|#)/i.test(String(location.href || '')), { timeout: 30000 }).catch(() => {});
+                        setStep('A.payment.devamToOdeme.done', { url: (() => { try { return pageA.url(); } catch { return null; } })() });
+                    } catch {}
+
+                    try { await dismissPaymentInfoModalIfPresent(pageA); } catch {}
+
+                    try {
+                        if (identity && String(identity).trim().length === 11) {
+                            await fillInvoiceTcAndContinue(pageA, String(identity).trim());
+                        }
+                    } catch {}
+
+                    try { await acceptAgreementsAndContinue(pageA); } catch {}
+
+                    try {
+                        const cardData = { cardHolder, cardNumber, expiryMonth, expiryYear, cvv };
+                        setStep('A.payment.iframeFill.start');
+                        await fillNkolayPaymentIframe(pageA, cardData, { clickPay: false });
+                        setStep('A.payment.iframeFill.done');
+                        audit('a_only_payment_ready', { email: emailA, seatId: seatInfoA?.seatId });
+                    } catch {}
+
+                    logger.info('A-only mod: Odeme sayfasi hazir, onay bekleniyor');
+                } else {
+                    logger.info('A-only mod: Kart bilgisi yok, sepette tutuluyor');
+                    audit('a_only_holding', { email: emailA, seatId: seatInfoA?.seatId });
+                }
+
+                const finalStatus = basketTimer.getStatus();
+                try { runStore.upsert(runId, { status: 'completed', result: { success: true, mode: 'a_only', aEmail: emailA, seatInfo: seatInfoA, basketStatus: finalStatus, payment: hasCardInfo ? 'ready' : 'no_card' } }); } catch {}
+                return res.json({ success: true, mode: 'a_only', aEmail: emailA, seatInfo: seatInfoA, basketStatus: finalStatus, payment: hasCardInfo ? 'ready' : 'no_card' });
+            }
+
+            // A koltukları kapıldı, şimdi B hesaplarını hazırla (A sepette beklerken)
+            const bCtxList = await bCtxFn();
+            setStep('MULTI.aFirst.done', { aCount: aCtxList.length, bCount: bCtxList.length });
 
             const pairCount = Math.min(aCtxList.length, bCtxList.length);
             const stDash = runStore.get(runId) || {};
@@ -6157,23 +6543,9 @@ async function startBotAfterValidation(req, res, validatedData) {
         audit('account_launch_done', { role: 'A', idx: 0, email: emailA, url: (() => { try { return pageA.url(); } catch { return null; } })() });
         logger.info('A hesabı giriş yaptı');
 
-        // B: Launch + Login
-        setStep('B.launchAndLogin.start', { email: emailB });
-        audit('account_launch_start', { role: 'B', idx: 0, email: emailB });
-        ({browser: browserB, page: pageB} = await launchAndLogin({
-            email: emailB,
-            password: passwordB,
-            userDataDir: userDataDirB,
-            proxyHost,
-            proxyPort,
-            proxyUsername,
-            proxyPassword
-        }));
-        setStep('B.launchAndLogin.done', { email: emailB, snap: await snapshotPage(pageB, 'B.afterLogin') });
-        audit('account_launch_done', { role: 'B', idx: 0, email: emailB, url: (() => { try { return pageB.url(); } catch { return null; } })() });
-        logger.info('B hesabı giriş yaptı');
+        // B login, A koltuk kapıp sepete girdikten sonra yapılacak (A öncelikli)
 
-        // Start finalize watcher after pages are ready.
+        // Start finalize watcher (A sayfası hazır, C finalize A holder üzerinden çalışır).
         try { ensureFinalizeWatcher(); } catch {}
 
         if (!dashboardPairs.length) {
@@ -6212,7 +6584,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         setStep('A.clickBuy.done');
         audit('account_click_buy_done', { role: 'A', idx: 0, email: emailA, url: (() => { try { return pageA.url(); } catch { return null; } })() });
 
-        await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity });
+        await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity, sicilNo: a0?.sicilNo ?? sicilNo, priorityTicketCode: a0?.priorityTicketCode ?? priorityTicketCode });
         logger.info('A hesabı SATIN AL butonuna tıkladı');
 
         setStep('A.waitNavAfterBuy.start');
@@ -6238,7 +6610,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         const aRelog = await reloginIfRedirected(pageA, emailA, passwordA);
         setStep('A.postBuy.reloginCheck.done', { relogged: aRelog, snap: await snapshotPage(pageA, 'A.afterReloginCheck') });
 
-        const psA2 = await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity });
+        const psA2 = await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity, sicilNo: a0?.sicilNo ?? sicilNo, priorityTicketCode: a0?.priorityTicketCode ?? priorityTicketCode });
         if (psA2) {
             try { await ensureUrlContains(pageA, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 }); } catch {}
         }
@@ -6478,14 +6850,18 @@ async function startBotAfterValidation(req, res, validatedData) {
             logger.warn('A.categoryBlock.dom_diagnostic_failed', { error: e?.message });
         }
 
+        const aCredential = aList[pairIdx0] || null;
+        const bCredential = bList[pairIdx0] || null;
+        const aAllowedCategories = await resolveCategoriesForCredential(teamId, selectedCategories, aCredential?.categoryIds || [], categorySelectionMode);
+        const bAllowedCategories = await resolveCategoriesForCredential(teamId, selectedCategories, bCredential?.categoryIds || [], categorySelectionMode);
         const singleCategoryChooserA = createCategoryChooser(
-            selectedCategories,
+            aAllowedCategories,
             resolvedCategoryType,
             resolvedAlternativeCategory,
             categorySelectionMode
         );
         const singleCategoryChooserB = createCategoryChooser(
-            selectedCategories,
+            bAllowedCategories,
             resolvedCategoryType,
             resolvedAlternativeCategory,
             categorySelectionMode
@@ -6524,6 +6900,9 @@ async function startBotAfterValidation(req, res, validatedData) {
         for (let cycle = 1; (waitUntilFound ? (Date.now() < waitDeadlineAt) : (cycle <= maxCycle)); cycle++) {
             try {
                 const remaining = Math.max(15000, Number(getCfg().TIMEOUTS.SEAT_SELECTION_MAX) - (Date.now() - cycleStartedAt));
+                const catRuleA = cbResA?.chosenCategory || {};
+                const effectiveTicketCountA = (catRuleA.ticketCount && catRuleA.ticketCount > 1) ? catRuleA.ticketCount : ticketCount;
+                const adjacentSeatsA = catRuleA.adjacentSeats === true;
                 seatInfoA = await seatHelper.pickRandomSeatWithVerify(
                     pageA,
                     remaining,
@@ -6537,7 +6916,9 @@ async function startBotAfterValidation(req, res, validatedData) {
                         reloginIfRedirected,
                         ensureTurnstileFn: ensureCaptchaOnPage,
                         chooseCategoryFn: singleCategoryChooserA.choose,
-                        categorySelectionMode
+                        categorySelectionMode,
+                        ticketCount: effectiveTicketCountA,
+                        adjacentSeats: adjacentSeatsA
                     }
                 );
                 break;
@@ -6620,6 +7001,90 @@ async function startBotAfterValidation(req, res, validatedData) {
             basketStatus: basketStatus
         });
 
+        // B hesabı yoksa: transfer yok, direkt ödeme veya hold
+        if (!hasRealB) {
+            audit('single_a_only_mode', { email: emailA, seatId: seatInfoA?.seatId, hasCardInfo });
+            logger.info('A-only mod (tekli): B hesabi yok, transfer yapilmayacak');
+
+            if (!dashboardPairs.length) {
+                dashboardPairs = [{
+                    pairIndex: 1,
+                    aEmail: emailA,
+                    bEmail: '\u2014',
+                    holder: 'A',
+                    seatId: seatInfoA?.seatId ? String(seatInfoA.seatId) : null,
+                    seatLabel: fmtSeatLabel(seatInfoA),
+                    phase: hasCardInfo ? '\u00d6demeye gidiliyor' : 'Sepette tutuluyor',
+                    transferOk: null,
+                    unmatched: true
+                }];
+                syncDashboardToRunStore();
+            }
+
+            if (hasCardInfo) {
+                setStep('A.payment.start');
+                audit('a_only_payment_start', { email: emailA, seatId: seatInfoA?.seatId });
+
+                try {
+                    if (identity && String(identity).trim().length === 11) {
+                        setStep('A.payment.tcAssign.start');
+                        await ensureTcAssignedOnBasket(pageA, String(identity).trim(), { preferAssignToMyId: true, maxAttempts: 3 });
+                        setStep('A.payment.tcAssign.done');
+                    }
+                } catch {}
+
+                try {
+                    setStep('A.payment.devamToOdeme.start');
+                    await clickBasketDevamToOdeme(pageA);
+                    await pageA.waitForFunction(() => /\/odeme(\b|\/|\?|#)/i.test(String(location.href || '')), { timeout: 30000 }).catch(() => {});
+                    setStep('A.payment.devamToOdeme.done', { url: (() => { try { return pageA.url(); } catch { return null; } })() });
+                } catch {}
+
+                try { await dismissPaymentInfoModalIfPresent(pageA); } catch {}
+
+                try {
+                    if (identity && String(identity).trim().length === 11) {
+                        await fillInvoiceTcAndContinue(pageA, String(identity).trim());
+                    }
+                } catch {}
+
+                try { await acceptAgreementsAndContinue(pageA); } catch {}
+
+                try {
+                    const cardData = { cardHolder, cardNumber, expiryMonth, expiryYear, cvv };
+                    setStep('A.payment.iframeFill.start');
+                    await fillNkolayPaymentIframe(pageA, cardData, { clickPay: false });
+                    setStep('A.payment.iframeFill.done');
+                    audit('a_only_payment_ready', { email: emailA, seatId: seatInfoA?.seatId });
+                } catch {}
+
+                logger.info('A-only mod: Odeme sayfasi hazir, onay bekleniyor');
+            } else {
+                logger.info('A-only mod: Kart bilgisi yok, sepette tutuluyor');
+                audit('a_only_holding', { email: emailA, seatId: seatInfoA?.seatId });
+            }
+
+            const finalStatus = basketTimer.getStatus();
+            try { runStore.upsert(runId, { status: 'completed', result: { success: true, mode: 'a_only', aEmail: emailA, seatInfo: seatInfoA, basketStatus: finalStatus, payment: hasCardInfo ? 'ready' : 'no_card' } }); } catch {}
+            return res.json({ success: true, mode: 'a_only', aEmail: emailA, seatInfo: seatInfoA, basketStatus: finalStatus, payment: hasCardInfo ? 'ready' : 'no_card' });
+        }
+
+        // B: Launch + Login (A koltuk sepette beklerken)
+        setStep('B.launchAndLogin.start', { email: emailB });
+        audit('account_launch_start', { role: 'B', idx: 0, email: emailB });
+        ({browser: browserB, page: pageB} = await launchAndLogin({
+            email: emailB,
+            password: passwordB,
+            userDataDir: userDataDirB,
+            proxyHost,
+            proxyPort,
+            proxyUsername,
+            proxyPassword
+        }));
+        setStep('B.launchAndLogin.done', { email: emailB, snap: await snapshotPage(pageB, 'B.afterLogin') });
+        audit('account_launch_done', { role: 'B', idx: 0, email: emailB, url: (() => { try { return pageB.url(); } catch { return null; } })() });
+        logger.info('B hesabı giriş yaptı (A koltuk sepette beklerken)');
+
         // B: go event -> BUY -> same category & block -> target seat (locked strategy)
         setStep('B.gotoEvent.start', { eventAddress });
         const bGoto = await gotoWithRetry(pageB, String(eventAddress), {
@@ -6638,7 +7103,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         setStep('B.clickBuy.done');
         logger.info('B hesabı SATIN AL butonuna tıkladı');
 
-        await handlePrioritySaleModal(pageB, { prioritySale, fanCardCode: b0?.fanCardCode ?? fanCardCode, identity: b0?.identity ?? identity });
+        await handlePrioritySaleModal(pageB, { prioritySale, fanCardCode: b0?.fanCardCode ?? fanCardCode, identity: b0?.identity ?? identity, sicilNo: b0?.sicilNo ?? sicilNo, priorityTicketCode: b0?.priorityTicketCode ?? priorityTicketCode });
 
         setStep('B.waitNavAfterBuy.start');
         const bPreUrl = (() => { try { return pageB.url(); } catch { return null; } })();
@@ -6662,7 +7127,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         const bRelog = await reloginIfRedirected(pageB, emailB, passwordB);
         setStep('B.postBuy.reloginCheck.done', { relogged: bRelog, snap: await snapshotPage(pageB, 'B.afterReloginCheck') });
 
-        const psB2 = await handlePrioritySaleModal(pageB, { prioritySale, fanCardCode: b0?.fanCardCode ?? fanCardCode, identity: b0?.identity ?? identity });
+        const psB2 = await handlePrioritySaleModal(pageB, { prioritySale, fanCardCode: b0?.fanCardCode ?? fanCardCode, identity: b0?.identity ?? identity, sicilNo: b0?.sicilNo ?? sicilNo, priorityTicketCode: b0?.priorityTicketCode ?? priorityTicketCode });
         if (psB2) {
             try { await ensureUrlContains(pageB, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 }); } catch {}
         }
@@ -7209,7 +7674,9 @@ async function startBotAfterValidation(req, res, validatedData) {
 
                                 const toIdentity = (toRole === 'A') ? (idProfileA?.identity ?? identity) : (idProfileB?.identity ?? identity);
                                 const toFan = (toRole === 'A') ? (idProfileA?.fanCardCode ?? fanCardCode) : (idProfileB?.fanCardCode ?? fanCardCode);
-                                await handlePrioritySaleModal(toPage, { prioritySale, fanCardCode: toFan, identity: toIdentity });
+                                const toSicil = (toRole === 'A') ? (idProfileA?.sicilNo ?? sicilNo) : (idProfileB?.sicilNo ?? sicilNo);
+                                const toPriorityTicket = (toRole === 'A') ? (idProfileA?.priorityTicketCode ?? priorityTicketCode) : (idProfileB?.priorityTicketCode ?? priorityTicketCode);
+                                await handlePrioritySaleModal(toPage, { prioritySale, fanCardCode: toFan, identity: toIdentity, sicilNo: toSicil, priorityTicketCode: toPriorityTicket });
 
                                 await ensureUrlContains(toPage, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
                                 const u = (() => { try { return String(toPage.url()); } catch { return ''; } })();

@@ -347,6 +347,8 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
   const password = options.password || null;
   const chooseCategoryFn = typeof options.chooseCategoryFn === 'function' ? options.chooseCategoryFn : null;
   const categorySelectionMode = options.categorySelectionMode || 'legacy';
+  const ticketCount = Math.max(1, Math.min(10, Number(options.ticketCount) || 1));
+  const adjacentSeats = options.adjacentSeats === true;
 
   const extendDeadline = (ms, reason) => {
     try {
@@ -602,6 +604,115 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
       const clicked = await robustSeatClick(page, info.x, info.y);
       if (!clicked) return false;
       logger.info(`seatPick:${context}:additional_seat_click`, { selectedCountBefore: info.selectedCount, x: info.x, y: info.y });
+      await delay(250);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const tryPickAdjacentSeat = async () => {
+    try {
+      const info = await page.evaluate(() => {
+        const normFill = (r) => {
+          const attr = (r.getAttribute('fill') || '').toLowerCase();
+          if (attr) return attr;
+          const st = (r.getAttribute('style') || '').toLowerCase();
+          const m = st.match(/fill\s*:\s*([^;]+)/i);
+          return (m && m[1] ? m[1].trim() : '');
+        };
+        const isAvailable = (r) => {
+          const pe = (r.getAttribute('pointer-events') || '').toLowerCase();
+          if (pe === 'none') return false;
+          const fill = normFill(r);
+          if (fill === '#89a0a3') return false;
+          const opacity = (r.getAttribute('opacity') || '').toLowerCase();
+          const style = (r.getAttribute('style') || '').toLowerCase();
+          if (opacity === '0' || /opacity\s*:\s*0/.test(style)) return false;
+          const cls = (r.getAttribute('class') || '').toLowerCase();
+          if (/(occupied|disabled|unavailable|dolu|sold|reserved)/i.test(cls)) return false;
+          const g = r.closest('g');
+          if (g && (g.classList.contains('seatActive') || g.classList.contains('selected'))) return false;
+          if (r.classList.contains('selected')) return false;
+          return true;
+        };
+
+        // Seçili koltukların g elementlerini bul
+        const selectedGs = Array.from(document.querySelectorAll(
+          'svg.seatmap-svg g.seatActive, svg.seatmap-svg g.selected'
+        ));
+        if (!selectedGs.length) return null;
+
+        // Seçili koltukların pozisyonlarını topla (seatId ve bbox)
+        const selectedPositions = [];
+        for (const g of selectedGs) {
+          const gid = g.getAttribute('id') || '';
+          const seatNum = parseInt((gid.match(/seat(\d+)/i) || [])[1] || '0', 10);
+          const rect = g.querySelector('rect');
+          if (!rect) continue;
+          const bb = rect.getBoundingClientRect();
+          selectedPositions.push({ seatNum, cx: bb.left + bb.width / 2, cy: bb.top + bb.height / 2, w: bb.width, h: bb.height });
+        }
+        if (!selectedPositions.length) return null;
+
+        // Tüm available koltukları topla
+        const allRects = Array.from(document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect'));
+        const available = [];
+        for (const r of allRects) {
+          if (!isAvailable(r)) continue;
+          const g = r.closest('g');
+          if (!g) continue;
+          const gid = g.getAttribute('id') || '';
+          const seatNum = parseInt((gid.match(/seat(\d+)/i) || [])[1] || '0', 10);
+          const bb = r.getBoundingClientRect();
+          available.push({ seatNum, cx: bb.left + bb.width / 2, cy: bb.top + bb.height / 2, w: bb.width, h: bb.height, rect: r });
+        }
+        if (!available.length) return null;
+
+        // Her available koltuk için, seçili koltukların en yakınına olan mesafeyi hesapla
+        // Yanyana = aynı satır (y yaklaşık eşit) ve x farkı ~1 koltuk genişliği
+        let best = null;
+        let bestDist = Infinity;
+        for (const av of available) {
+          for (const sel of selectedPositions) {
+            const dy = Math.abs(av.cy - sel.cy);
+            const dx = Math.abs(av.cx - sel.cx);
+            // Aynı satır kontrolü: y farkı koltuk yüksekliğinin yarısından az olmalı
+            const sameRow = dy < (sel.h * 0.7);
+            if (!sameRow) continue;
+            // Yanyana kontrolü: x farkı makul aralıkta (1-2 koltuk genişliği)
+            if (dx < bestDist && dx < sel.w * 2.5) {
+              bestDist = dx;
+              best = av;
+            }
+          }
+        }
+
+        // Eğer yanyana bulunamadıysa, seatId bazlı ardışık kontrolü de dene
+        if (!best) {
+          const selNums = selectedPositions.map(s => s.seatNum).filter(n => n > 0);
+          if (selNums.length) {
+            const minNum = Math.min(...selNums);
+            const maxNum = Math.max(...selNums);
+            // seatId-1 veya seatId+1 ara
+            const adjacent = available.filter(a => a.seatNum === minNum - 1 || a.seatNum === maxNum + 1);
+            if (adjacent.length) best = adjacent[0];
+          }
+        }
+
+        if (!best) return null;
+        best.rect.scrollIntoView({ block: 'center', inline: 'center' });
+        const bb = best.rect.getBoundingClientRect();
+        const cx = bb.left + (bb.width / 2);
+        const cy = bb.top + (bb.height / 2);
+        if (cy <= 10 || cx <= 10 || cy >= window.innerHeight - 10 || cx >= window.innerWidth - 10) return null;
+        return { x: cx, y: cy, seatNum: best.seatNum, distance: bestDist };
+      });
+
+      if (!info) return false;
+      const clicked = await robustSeatClick(page, info.x, info.y);
+      if (!clicked) return false;
+      logger.info(`seatPick:${context}:adjacent_seat_click`, { seatNum: info.seatNum, x: info.x, y: info.y, distance: info.distance });
       await delay(250);
       return true;
     } catch {
@@ -1411,7 +1522,46 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
 
       if (selectedNow || lockedSelected) {
         const selState = await getSelectionState();
-        logger.info(`seatPick:${context}:selection_before_continue`, { selectedNow, lockedSelected, selState });
+        logger.info(`seatPick:${context}:selection_before_continue`, { selectedNow, lockedSelected, selState, ticketCount });
+
+        // ticketCount > 1 ise ek koltuklar seç (Continue'a basmadan önce)
+        if (ticketCount > 1) {
+          const currentSelected = selState?.selectedCount || 1;
+          const needed = ticketCount - currentSelected;
+          if (needed > 0) {
+            logger.info(`seatPick:${context}:multi_ticket_picking`, { ticketCount, currentSelected, needed, adjacentSeats });
+            let addedCount = 0;
+            for (let s = 0; s < needed; s++) {
+              // adjacentSeats modunda önce yanyana dene, bulamazsa serbest fallback
+              let added = false;
+              if (adjacentSeats) {
+                added = await tryPickAdjacentSeat();
+                if (!added) {
+                  logger.warn(`seatPick:${context}:adjacent_not_found_fallback_random`, { attempt: s + 1 });
+                  added = await tryPickAdditionalSeat();
+                }
+              } else {
+                added = await tryPickAdditionalSeat();
+              }
+              if (added) {
+                addedCount++;
+                await delay(300);
+              } else {
+                logger.warn(`seatPick:${context}:additional_seat_failed`, { attempt: s + 1, needed, addedSoFar: addedCount, adjacentSeats });
+                await delay(200);
+                // Retry once more for this slot
+                const retry = adjacentSeats ? await tryPickAdjacentSeat() : await tryPickAdditionalSeat();
+                if (!retry && adjacentSeats) {
+                  const retryRandom = await tryPickAdditionalSeat();
+                  if (retryRandom) { addedCount++; await delay(300); continue; }
+                }
+                if (retry) { addedCount++; await delay(300); }
+              }
+            }
+            const finalSelected = await getSelectionState();
+            logger.info(`seatPick:${context}:multi_ticket_result`, { ticketCount, addedCount, finalSelectedCount: finalSelected?.selectedCount || 0, adjacentSeats });
+          }
+        }
       }
 
       // seçiliyse DEVAM - önce turnstile token kontrolü
