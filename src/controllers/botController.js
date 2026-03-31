@@ -4,6 +4,7 @@ const axios = require('axios');
 const ac = require('@antiadmin/anticaptchaofficial');
 const { randomUUID } = require('crypto');
 const fs = require('fs');
+const { PNG } = require('pngjs');
 const { botRequestSchema } = require('../validators/botRequest');
 
 const configRoot = require('../config');
@@ -19,7 +20,7 @@ const { formatError, formatSuccess } = require('../utils/messages');
 const { BasketTimer, checkBasketTimeoutFromPage } = require('../utils/basketTimer');
 const {confirmSwalYes, clickRemoveFromCartAndConfirm} = require('../helpers/swal');
 const { captureSeatIdFromNetwork, readBasketData, readCatBlock, setCatBlockOnB, openSeatMapStrict, clickContinueInsidePage, gotoWithRetry, ensureUrlContains, isHomeUrl, SEAT_NODE_SELECTOR, ensureTcAssignedOnBasket, clickBasketDevamToOdeme, dismissPaymentInfoModalIfPresent, fillInvoiceTcAndContinue, acceptAgreementsAndContinue, fillNkolayPaymentIframe } = require('../helpers/page');
-const { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware } = require('../helpers/seat');
+const { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware, applyTicketQuantityDropdown } = require('../helpers/seat');
 
 function applyAnticaptchaFromCfg(c) {
     ac.setAPIKey(c.ANTICAPTCHA_KEY || '');
@@ -93,6 +94,501 @@ function buildCategoryRoamTexts(selectedCategories, fallbackCategoryType, fallba
     if (fallbackCategoryType) values.push(String(fallbackCategoryType).trim());
     if (fallbackAlternativeCategory) values.push(String(fallbackAlternativeCategory).trim());
     return Array.from(new Set(values.filter(Boolean)));
+}
+
+function normalizeSvgMatchText(value) {
+    const map = {
+        'c': 'c', 'ç': 'c',
+        'g': 'g', 'ğ': 'g',
+        'i': 'i', 'ı': 'i', 'İ': 'i',
+        'o': 'o', 'ö': 'o',
+        's': 's', 'ş': 's',
+        'u': 'u', 'ü': 'u'
+    };
+    return String(value || '')
+        .split('')
+        .map((ch) => {
+            const low = ch.toLowerCase();
+            return Object.prototype.hasOwnProperty.call(map, low) ? map[low] : low;
+        })
+        .join('')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim();
+}
+
+function buildSvgCategorySegments(label) {
+    const normalized = normalizeSvgMatchText(label);
+    if (!normalized) return [];
+    const pieces = normalized.split('/').map((part) => part.trim()).filter(Boolean);
+    const parsed = pieces.map((piece) => {
+        let base = piece;
+        let from = '';
+        let to = '';
+        let m = piece.match(/\s([a-z])\s*-\s*([a-z])$/i);
+        if (m) {
+            base = piece.slice(0, m.index).trim();
+            from = m[1];
+            to = m[2];
+        } else {
+            m = piece.match(/\s([a-z])$/i);
+            if (m) {
+                base = piece.slice(0, m.index).trim();
+                from = m[1];
+                to = m[1];
+            }
+        }
+        return { raw: piece, base: base || piece, from, to };
+    });
+    const inherited = parsed.slice().reverse().find((item) => item.base && item.from);
+    if (inherited && parsed.length > 1) {
+        for (const item of parsed) {
+            if (item.base && !item.from) {
+                item.from = inherited.from;
+                item.to = inherited.to;
+            }
+        }
+    }
+    return parsed.filter((item) => item.base);
+}
+
+function getSvgMeaningfulTokens(value) {
+    const stop = new Set([
+        'tribun', 'tribunu', 'tribunleri', 'blok', 'bloklari', 'blogu',
+        'kategori', 'kati'
+    ]);
+    return Array.from(new Set(
+        normalizeSvgMatchText(value)
+            .split(/\s+/)
+            .map((token) => token.trim())
+            .filter((token) => token && token.length >= 2 && !stop.has(token))
+    ));
+}
+
+function isSvgLetterWithinRange(letter, from, to) {
+    const cur = String(letter || '').trim().toLowerCase();
+    const start = String(from || '').trim().toLowerCase();
+    const end = String(to || '').trim().toLowerCase();
+    if (!cur || !start || !end) return false;
+    const code = cur.charCodeAt(0);
+    const a = start.charCodeAt(0);
+    const b = end.charCodeAt(0);
+    if (!Number.isFinite(code) || !Number.isFinite(a) || !Number.isFinite(b)) return false;
+    return code >= Math.min(a, b) && code <= Math.max(a, b);
+}
+
+function getSvgCategoryMatchScore(tooltipText, categoryTexts = []) {
+    const tooltipNorm = normalizeSvgMatchText(tooltipText);
+    if (!tooltipNorm) return 0;
+    const tooltipTokens = getSvgMeaningfulTokens(tooltipNorm);
+    const tooltipBlockMatch = tooltipNorm.match(/\b([a-z])\s*blok\b/i);
+    const tooltipBlockLetter = tooltipBlockMatch ? String(tooltipBlockMatch[1] || '').toLowerCase() : '';
+    let best = 0;
+    for (const text of Array.isArray(categoryTexts) ? categoryTexts : []) {
+        const want = normalizeSvgMatchText(text);
+        if (!want) continue;
+        if (tooltipNorm === want) best = Math.max(best, 120);
+        else if (tooltipNorm.includes(want) || want.includes(tooltipNorm)) best = Math.max(best, 100);
+        const wantTokens = getSvgMeaningfulTokens(want);
+        if (wantTokens.length) {
+            const hits = wantTokens.filter((token) => tooltipNorm.includes(token) || tooltipTokens.includes(token));
+            const coverage = hits.length / wantTokens.length;
+            if (coverage >= 1) best = Math.max(best, 98);
+            else if (coverage >= 0.75) best = Math.max(best, 88);
+            else if (coverage >= 0.5 && hits.length >= 2) best = Math.max(best, 72);
+            else if (hits.length >= 1) best = Math.max(best, 45);
+        }
+        const segments = buildSvgCategorySegments(text);
+        for (const segment of segments) {
+            if (!segment?.base || !tooltipNorm.includes(segment.base)) continue;
+            if (segment.from) {
+                if (tooltipBlockLetter && isSvgLetterWithinRange(tooltipBlockLetter, segment.from, segment.to)) {
+                    best = Math.max(best, 95);
+                } else {
+                    best = Math.max(best, 55);
+                }
+            } else {
+                best = Math.max(best, 70);
+            }
+        }
+    }
+    return best;
+}
+
+function parseRgbColorString(value) {
+    const m = String(value || '').match(/rgba?\(\s*(\d{1,3})\s*[, ]\s*(\d{1,3})\s*[, ]\s*(\d{1,3})(?:\s*[,/]\s*([0-9.]+))?\s*\)/i);
+    if (!m) return null;
+    const r = Number(m[1]);
+    const g = Number(m[2]);
+    const b = Number(m[3]);
+    const a = m[4] == null ? 1 : Number(m[4]);
+    if (![r, g, b].every(Number.isFinite)) return null;
+    return { r, g, b, a: Number.isFinite(a) ? a : 1 };
+}
+
+function colorDistance(a, b) {
+    if (!a || !b) return Number.POSITIVE_INFINITY;
+    const dr = Number(a.r || 0) - Number(b.r || 0);
+    const dg = Number(a.g || 0) - Number(b.g || 0);
+    const db = Number(a.b || 0) - Number(b.b || 0);
+    return Math.sqrt((dr * dr) + (dg * dg) + (db * db));
+}
+
+function samplePngPatchColor(png, x, y, radius = 3) {
+    if (!png || !Number.isFinite(x) || !Number.isFinite(y)) return null;
+    const w = Number(png.width || 0);
+    const h = Number(png.height || 0);
+    if (!w || !h) return null;
+    let sr = 0;
+    let sg = 0;
+    let sb = 0;
+    let count = 0;
+    const rx = Math.max(0, Math.floor(Number(radius) || 0));
+    const cx = Math.max(0, Math.min(w - 1, Math.round(x)));
+    const cy = Math.max(0, Math.min(h - 1, Math.round(y)));
+    for (let yy = Math.max(0, cy - rx); yy <= Math.min(h - 1, cy + rx); yy++) {
+        for (let xx = Math.max(0, cx - rx); xx <= Math.min(w - 1, cx + rx); xx++) {
+            const idx = ((yy * w) + xx) << 2;
+            const alpha = Number(png.data[idx + 3] ?? 255) / 255;
+            if (alpha <= 0) continue;
+            sr += Number(png.data[idx] || 0) * alpha;
+            sg += Number(png.data[idx + 1] || 0) * alpha;
+            sb += Number(png.data[idx + 2] || 0) * alpha;
+            count += alpha;
+        }
+    }
+    if (!count) return null;
+    return {
+        r: Math.round(sr / count),
+        g: Math.round(sg / count),
+        b: Math.round(sb / count)
+    };
+}
+
+function sanitizeStartRequestForLog(value) {
+    const secretKeyRe = /^(password|password2|cvv|proxyPassword|fanCardCode|identity|sicilNo|priorityTicketCode|cardNumber|encryptedPassword)$/i;
+
+    const visit = (input, keyName = '') => {
+        if (input == null) return input;
+        if (Array.isArray(input)) return input.map((item) => visit(item));
+        if (typeof input !== 'object') {
+            if (secretKeyRe.test(String(keyName || ''))) {
+                if (/cardNumber/i.test(String(keyName || ''))) {
+                    const raw = String(input);
+                    return raw.replace(/\d(?=\d{4})/g, '*');
+                }
+                return '***';
+            }
+            return input;
+        }
+
+        const out = {};
+        for (const [k, v] of Object.entries(input)) {
+            if (secretKeyRe.test(String(k || ''))) {
+                if (/cardNumber/i.test(String(k || ''))) {
+                    const raw = v == null ? '' : String(v);
+                    out[k] = raw.replace(/\d(?=\d{4})/g, '*');
+                } else {
+                    out[k] = '***';
+                }
+                continue;
+            }
+            out[k] = visit(v, k);
+        }
+        return out;
+    };
+
+    return visit(value);
+}
+
+const BASKET_ROOT_SELECTOR = '.basket-list-detail, .basket-list, .basket, [data-testid*="basket" i], [data-testid*="sepet" i]';
+
+async function getBasketItemCountSafe(page) {
+    if (!page) return 0;
+    try {
+        const data = await readBasketData(page);
+        const count = Number(data?.itemCount);
+        if (Number.isFinite(count) && count >= 0) return Math.max(0, count);
+    } catch {}
+
+    try {
+        const count = await page.evaluate(() => {
+            const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+            const countExactLabels = (label) => {
+                const want = String(label || '').trim().toLowerCase();
+                if (!want) return 0;
+                const nodes = Array.from(document.querySelectorAll('.basket-span, div, span, li, p, dt'));
+                let total = 0;
+                for (const n of nodes) {
+                    if (norm(n.textContent) === want) total++;
+                }
+                return total;
+            };
+            return Math.max(
+                countExactLabels('koltuk'),
+                countExactLabels('sıra'),
+                countExactLabels('blok'),
+                countExactLabels('tribün')
+            );
+        }).catch(() => 0);
+        return Math.max(0, Number(count) || 0);
+    } catch {}
+
+    return 0;
+}
+
+async function clearBasketFully(page, options = null) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT;
+    const maxRounds = Number.isFinite(opts.maxRounds) ? Math.max(1, opts.maxRounds) : 8;
+    const settlePollMs = Number.isFinite(opts.settlePollMs) ? Math.max(100, opts.settlePollMs) : 250;
+
+    let initialCount = await getBasketItemCountSafe(page);
+    let remainingCount = initialCount;
+    let removedClicks = 0;
+
+    for (let round = 1; round <= maxRounds; round++) {
+        remainingCount = await getBasketItemCountSafe(page);
+        if (remainingCount <= 0) {
+            return { ok: true, initialCount, remainingCount: 0, removedClicks, rounds: round - 1 };
+        }
+
+        const removed = await clickRemoveFromCartAndConfirm(page, timeoutMs);
+        if (!removed) {
+            remainingCount = await getBasketItemCountSafe(page);
+            return { ok: remainingCount <= 0, initialCount, remainingCount, removedClicks, rounds: round, reason: 'remove_click_failed' };
+        }
+
+        removedClicks++;
+        const beforeCount = remainingCount;
+        const settleUntil = Date.now() + Math.max(2000, Number(timeoutMs) || 0);
+        while (Date.now() < settleUntil) {
+            await delay(settlePollMs);
+            remainingCount = await getBasketItemCountSafe(page);
+            if (remainingCount <= 0 || remainingCount < beforeCount) break;
+        }
+    }
+
+    remainingCount = await getBasketItemCountSafe(page);
+    return { ok: remainingCount <= 0, initialCount, remainingCount, removedClicks, rounds: maxRounds, reason: 'remaining_items' };
+}
+
+async function parkHolderOnBasket(page, basketTimer, options = null) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const email = opts.email || null;
+    const password = opts.password || null;
+    const relogin = typeof opts.reloginIfRedirected === 'function' ? opts.reloginIfRedirected : null;
+    const label = String(opts.label || 'holder').trim() || 'holder';
+
+    try {
+        if (relogin && email && password) {
+            try { await relogin(page, email, password); } catch {}
+        }
+        await gotoWithRetry(page, 'https://www.passo.com.tr/tr/sepet', {
+            retries: 2,
+            waitUntil: 'networkidle2',
+            expectedUrlIncludes: '/sepet',
+            rejectIfHome: false,
+            backoffMs: 450
+        });
+        await page.waitForSelector(BASKET_ROOT_SELECTOR, { timeout: 12000 }).catch(() => {});
+    } catch {}
+
+    try {
+        const basketInfo = await checkBasketTimeoutFromPage(page);
+        const rem = Number(basketInfo?.remainingSeconds);
+        if (basketTimer && Number.isFinite(rem) && rem >= 0) {
+            basketTimer.syncFromRemainingSeconds(rem);
+            logger.info(`${label}:basket_timer_synced_from_ui`, { remainingSeconds: rem, foundTimeText: basketInfo?.foundTimeText || null });
+            return { ok: true, synced: true, remainingSeconds: rem, basketInfo };
+        }
+        return { ok: true, synced: false, basketInfo: basketInfo || null };
+    } catch {
+        return { ok: false, synced: false };
+    }
+}
+
+function normalizeHeldSeats(seatInfo) {
+    const base = seatInfo && typeof seatInfo === 'object' ? seatInfo : null;
+    const raw = [
+        ...(base ? [base] : []),
+        ...(Array.isArray(base?.heldSeats) ? base.heldSeats : [])
+    ];
+    const seen = new Set();
+    const out = [];
+    for (const item of raw) {
+        if (!item || typeof item !== 'object') continue;
+        const normalized = {
+            tribune: item.tribune != null ? String(item.tribune) : '',
+            block: item.block != null ? String(item.block) : '',
+            row: item.row != null ? String(item.row) : '',
+            seat: item.seat != null ? String(item.seat) : '',
+            blockId: item.blockId != null ? String(item.blockId) : '',
+            seatId: item.seatId != null ? String(item.seatId) : '',
+            combined: item.combined != null ? String(item.combined) : ''
+        };
+        if (!normalized.combined) {
+            normalized.combined = `${normalized.tribune} ${normalized.block} ${normalized.row} ${normalized.seat}`.trim();
+        }
+        const key = normalized.seatId || normalized.combined;
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push(normalized);
+    }
+    return out;
+}
+
+function mergeSeatBundle(primarySeat, pickedSeats) {
+    const seats = normalizeHeldSeats({
+        ...(primarySeat && typeof primarySeat === 'object' ? primarySeat : {}),
+        heldSeats: Array.isArray(pickedSeats) ? pickedSeats : []
+    });
+    const first = seats[0] || (primarySeat && typeof primarySeat === 'object' ? primarySeat : null);
+    if (!first) return primarySeat || null;
+    return {
+        ...(primarySeat && typeof primarySeat === 'object' ? primarySeat : {}),
+        ...first,
+        heldSeats: seats,
+        itemCount: seats.length || Number(primarySeat?.itemCount) || 1
+    };
+}
+
+async function pickExactSeatBundleReleaseAware(page, targetSeatInfo, maxMs, options = null) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const targets = normalizeHeldSeats(targetSeatInfo);
+    if (!targets.length) {
+        const single = await pickExactSeatWithVerify_ReleaseAware(page, targetSeatInfo, maxMs);
+        return single ? mergeSeatBundle(single, [single]) : single;
+    }
+
+    const deadline = Date.now() + Math.max(10000, Number(maxMs) || 0);
+    const pickedSeats = [];
+
+    for (let idx = 0; idx < targets.length; idx++) {
+        const target = targets[idx];
+        const remainingTargets = Math.max(1, targets.length - idx);
+        const remainingMs = Math.max(10000, deadline - Date.now());
+        const perSeatMs = idx === targets.length - 1
+            ? remainingMs
+            : Math.max(10000, Math.min(45000, Math.floor(remainingMs / remainingTargets)));
+
+        try {
+            if (typeof opts.audit === 'function') {
+                opts.audit('exact_pick_seat_start', {
+                    seatId: target.seatId || null,
+                    row: target.row || null,
+                    seat: target.seat || null,
+                    index: idx + 1,
+                    total: targets.length,
+                    maxMs: perSeatMs
+                });
+            }
+        } catch {}
+
+        const targetWithRecovery = {
+            ...target,
+            __recoveryOptions: targetSeatInfo?.__recoveryOptions || undefined
+        };
+        const picked = await pickExactSeatWithVerify_ReleaseAware(page, targetWithRecovery, perSeatMs);
+        pickedSeats.push({
+            ...target,
+            ...(picked && typeof picked === 'object' ? picked : {})
+        });
+
+        try {
+            if (typeof opts.audit === 'function') {
+                opts.audit('exact_pick_seat_done', {
+                    seatId: target.seatId || null,
+                    pickedSeatId: picked?.seatId || null,
+                    row: picked?.row || target.row || null,
+                    seat: picked?.seat || target.seat || null,
+                    index: idx + 1,
+                    total: targets.length
+                });
+            }
+        } catch {}
+    }
+
+    return mergeSeatBundle(targetSeatInfo, pickedSeats);
+}
+
+async function prepareSeatSelectionControls(page, logContext = 'seatPrep') {
+    if (!page) return { ok: false, reason: 'no_page' };
+    const appearDeadline = Date.now() + 12000;
+
+    let membershipResult = null;
+    let waitedMs = 0;
+
+    try {
+        do {
+            try {
+                await page.evaluate(() => {
+                    const overlays = document.querySelectorAll('.form-control-disabled');
+                    for (const el of overlays) {
+                        try { el.style.setProperty('display', 'none', 'important'); } catch {}
+                        try { el.style.setProperty('pointer-events', 'none', 'important'); } catch {}
+                    }
+                });
+            } catch {}
+
+            membershipResult = await page.evaluate(() => {
+                const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect?.();
+                    if (!r || r.width < 2 || r.height < 2) return false;
+                    const st = window.getComputedStyle(el);
+                    if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || '1') === 0)) return false;
+                    return true;
+                };
+                const selects = Array.from(document.querySelectorAll('select, select.form-control')).filter(isVisible);
+                const memberSelect = selects.find(s => {
+                    const opts = Array.from(s.options || []);
+                    return opts.some(o => norm(o.textContent).includes('üyelik') || norm(o.textContent).includes('kampanya'));
+                });
+                if (!memberSelect) return { ok: false, reason: 'no_membership_select', visibleSelectCount: selects.length };
+
+                const opts = Array.from(memberSelect.options || []);
+                const currentVal = memberSelect.value;
+                if (currentVal && !/^0:\s*null$/i.test(currentVal)) {
+                    return { ok: true, already: true, value: currentVal, text: norm(memberSelect.options[memberSelect.selectedIndex]?.textContent || ''), visibleSelectCount: selects.length };
+                }
+
+                const validOpt = opts.find(o => o.value && !/^0:\s*null$/i.test(o.value) && !o.disabled);
+                if (!validOpt) return { ok: false, reason: 'no_valid_option', optionCount: opts.length, visibleSelectCount: selects.length };
+
+                memberSelect.value = validOpt.value;
+                memberSelect.dispatchEvent(new Event('input', { bubbles: true }));
+                memberSelect.dispatchEvent(new Event('change', { bubbles: true }));
+                try { memberSelect.dispatchEvent(new Event('ngModelChange', { bubbles: true })); } catch {}
+                return { ok: true, selected: true, value: validOpt.value, text: norm(validOpt.textContent), visibleSelectCount: selects.length };
+            });
+
+            if (membershipResult?.ok || membershipResult?.reason !== 'no_membership_select') break;
+            if (Date.now() >= appearDeadline) break;
+            await delay(300);
+            waitedMs += 300;
+        } while (true);
+
+        logger.info(`${logContext}:membership_type_select`, { ...(membershipResult || {}), waitedMs });
+
+        if (membershipResult?.selected) {
+            await delay(1500);
+            try {
+                await page.evaluate(() => {
+                    const overlays = document.querySelectorAll('.form-control-disabled');
+                    for (const el of overlays) {
+                        try { el.style.setProperty('display', 'none', 'important'); } catch {}
+                        try { el.style.setProperty('pointer-events', 'none', 'important'); } catch {}
+                    }
+                });
+            } catch {}
+        }
+
+        return { ok: !!membershipResult?.ok, membershipResult, waitedMs };
+    } catch (e) {
+        logger.warn(`${logContext}:membership_type_select_failed`, { error: e?.message || String(e), waitedMs });
+        return { ok: false, error: e?.message || String(e), waitedMs };
+    }
 }
 
 function createCategoryChooser(selectedCategories, fallbackCategoryType, fallbackAlternativeCategory, defaultMode = 'scan') {
@@ -393,6 +889,36 @@ const runStore = (() => {
     return { get, upsert, remove, safeRunId, list, listRunning, killAllRunning };
 })();
 
+/** Panel "aktif oturumları kapat" — tüm Puppeteer oturumlarını buradan kapatır */
+const passobotActiveBrowsers = new Set();
+
+function registerPassobotBrowser(browser, runId) {
+    if (!browser || typeof browser.close !== 'function') return;
+    try {
+        browser.__passobotRunId = String(runId || '');
+    } catch {}
+    passobotActiveBrowsers.add(browser);
+}
+
+function unregisterPassobotBrowser(browser) {
+    if (!browser) return;
+    passobotActiveBrowsers.delete(browser);
+}
+
+async function closeAllPassobotBrowsers() {
+    const list = Array.from(passobotActiveBrowsers);
+    passobotActiveBrowsers.clear();
+    for (const br of list) {
+        try {
+            const pages = await br.pages().catch(() => []);
+            await Promise.all((pages || []).map((p) => p.close().catch(() => {})));
+        } catch {}
+        try {
+            await br.close();
+        } catch {}
+    }
+}
+
 /** start-bot-async ön kontrolünde çekilen listeler; startBotAfterValidation aynı body referansıyla tekrar DB çağırmasın */
 const accountListsWarmCache = new WeakMap();
 
@@ -571,6 +1097,12 @@ async function startBotAsync(req, res) {
     Promise.resolve()
         .then(() => startBot(reqLike, resLike))
         .catch((e) => {
+            if (e && e.code === 'RUN_KILLED') {
+                try {
+                    runStore.upsert(runId, { status: 'killed', error: e?.message || 'Oturum panelden sonlandırıldı', result: null });
+                } catch {}
+                return;
+            }
             runStore.upsert(runId, { status: 'error', error: e?.message || String(e) });
         });
 }
@@ -648,22 +1180,28 @@ async function getRunStatus(req, res) {
 async function killSessions(req, res) {
     const running = runStore.listRunning();
     const killedRunIds = runStore.killAllRunning();
-    
+
+    try {
+        await closeAllPassobotBrowsers();
+    } catch (e) {
+        try { logger.warnSafe('KILL_SESSIONS: tarayıcı kapatma hatası', e); } catch {}
+    }
+
     // Log separator for visual distinction in logs
     logger.info('==================================================');
-    logger.info('KILL_SESSIONS: Aktif oturumlar kapatılıyor', { 
-        runningCount: running.length, 
+    logger.info('KILL_SESSIONS: Aktif oturumlar kapatılıyor', {
+        runningCount: running.length,
         killedRunIds,
         timestamp: new Date().toISOString()
     });
     logger.info('==================================================');
-    
+
     // Also emit a special log entry that UI can detect
     logger.info('[SEPARATOR] ------------------- OTURUMLAR KAPATILDI -------------------');
-    
-    return res.json({ 
-        success: true, 
-        killedCount: killedRunIds.length, 
+
+    return res.json({
+        success: true,
+        killedCount: killedRunIds.length,
         killedRunIds,
         runningCount: running.length
     });
@@ -3890,6 +4428,272 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
             }
         }
         if (!proceedToDropdown) {
+            const svgProbeCache = new Map();
+            const readSvgLegendEntries = async () => {
+                return await page.evaluate(() => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect?.();
+                        if (!r || r.width < 2 || r.height < 2) return false;
+                        const st = window.getComputedStyle(el);
+                        if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || '1') === 0)) return false;
+                        return true;
+                    };
+                    const colorToText = (el) => {
+                        if (!el) return '';
+                        try {
+                            const st = window.getComputedStyle(el);
+                            return String(st?.backgroundColor || el.style?.background || el.style?.backgroundColor || '').trim();
+                        } catch {
+                            return '';
+                        }
+                    };
+                    const rows = Array.from(document.querySelectorAll('.blogContainer > div, .blogContainer > *'));
+                    const out = [];
+                    for (const row of rows) {
+                        const titleEl = row.querySelector?.('.title-category');
+                        const colorEl = row.querySelector?.('.color-category');
+                        const title = String(titleEl?.innerText || titleEl?.textContent || '').trim();
+                        if (!title || !isVisible(titleEl)) continue;
+                        out.push({
+                            title,
+                            color: colorToText(colorEl)
+                        });
+                    }
+                    return out;
+                }).catch(() => []);
+            };
+            const waitForSvgLegendEntries = async () => {
+                for (let attempt = 1; attempt <= 6; attempt++) {
+                    const entries = await readSvgLegendEntries();
+                    if (Array.isArray(entries) && entries.length) return entries;
+                    await delay(250);
+                }
+                return [];
+            };
+            const readVisibleSvgTooltipText = async () => {
+                return await page.evaluate(() => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect?.();
+                        if (!r || r.width < 2 || r.height < 2) return false;
+                        const st = window.getComputedStyle(el);
+                        if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || '1') === 0)) return false;
+                        return true;
+                    };
+                    const selectors = [
+                        '#toolTipList',
+                        '[role="tooltip"]',
+                        '[id*="tooltip" i]',
+                        '[class*="tooltip" i]',
+                        '[class*="popover" i]',
+                        '.tippy-box',
+                        '.tooltip-inner'
+                    ];
+                    const picks = [];
+                    for (const sel of selectors) {
+                        for (const el of Array.from(document.querySelectorAll(sel))) {
+                            if (!isVisible(el)) continue;
+                            const text = String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+                            if (!text) continue;
+                            picks.push(text);
+                        }
+                    }
+                    picks.sort((a, b) => {
+                        const aHas = /\bblok\b/i.test(a) ? 1 : 0;
+                        const bHas = /\bblok\b/i.test(b) ? 1 : 0;
+                        if (aHas !== bHas) return bHas - aHas;
+                        return b.length - a.length;
+                    });
+                    return picks[0] || '';
+                }).catch(() => '');
+            };
+            const readClickPoint = async (targetId) => {
+                return await page.evaluate((blockId) => {
+                    const el = document.getElementById(blockId);
+                    if (!el) return { ok: false, id: blockId, reason: 'not_found' };
+
+                    const asEl = /** @type {Element} */ (el);
+                    try { asEl.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+
+                    let rect = null;
+                    try {
+                        if (typeof asEl.getBoundingClientRect === 'function') rect = asEl.getBoundingClientRect();
+                    } catch {}
+
+                    if (!rect || !rect.width || !rect.height) {
+                        try {
+                            const svgEl = /** @type {any} */ (asEl);
+                            if (typeof svgEl.getBBox === 'function') {
+                                const b = svgEl.getBBox();
+                                const ctm = svgEl.getScreenCTM && svgEl.getScreenCTM();
+                                if (ctm) {
+                                    const x = (b.x + (b.width / 2)) * ctm.a + ctm.e;
+                                    const y = (b.y + (b.height / 2)) * ctm.d + ctm.f;
+                                    return { ok: true, id: blockId, tag: asEl.tagName, x, y, width: b.width || 0, height: b.height || 0, method: 'getBBox' };
+                                }
+                            }
+                        } catch {}
+                    }
+
+                    if (!rect) return { ok: false, id: blockId, reason: 'no_rect', tag: asEl.tagName };
+                    const x = rect.left + (rect.width / 2);
+                    const y = rect.top + (rect.height / 2);
+                    const top = (() => {
+                        try {
+                            const t = document.elementFromPoint(x, y);
+                            if (!t) return null;
+                            return {
+                                tag: t.tagName,
+                                id: t.getAttribute('id') || t.id || null,
+                                className: (t.getAttribute('class') || '').toString().slice(0, 120)
+                            };
+                        } catch {
+                            return null;
+                        }
+                    })();
+                    return { ok: true, id: blockId, tag: asEl.tagName, x, y, width: rect.width || 0, height: rect.height || 0, method: 'getBoundingClientRect', top };
+                }, targetId).catch(() => ({ ok: false, id: targetId, reason: 'eval_failed' }));
+            };
+            const enrichSvgCandidatesWithLegendColors = async (candidates, legendEntries) => {
+                const base = Array.isArray(candidates) ? candidates : [];
+                const legend = (Array.isArray(legendEntries) ? legendEntries : [])
+                    .map((entry) => ({ ...entry, rgb: parseRgbColorString(entry?.color || '') }))
+                    .filter((entry) => !!entry.rgb);
+                if (!base.length) return [];
+
+                const clickPoints = [];
+                for (const candidate of base) {
+                    const clickPoint = await readClickPoint(candidate.id);
+                    clickPoints.push({ ...candidate, clickPoint });
+                }
+                if (!legend.length) {
+                    return clickPoints.map((item) => ({
+                        ...item,
+                        sampledColor: null,
+                        colorDistance: Number.POSITIVE_INFINITY,
+                        colorScore: 0,
+                        legendTitle: null,
+                        legendColor: null
+                    }));
+                }
+
+                const dpr = await page.evaluate(() => Number(window.devicePixelRatio || 1) || 1).catch(() => 1);
+                let png = null;
+                try {
+                    const shot = await page.screenshot({ type: 'png' });
+                    png = PNG.sync.read(shot);
+                } catch {}
+                if (!png) {
+                    return clickPoints.map((item) => ({
+                        ...item,
+                        sampledColor: null,
+                        colorDistance: Number.POSITIVE_INFINITY,
+                        colorScore: 0,
+                        legendTitle: null,
+                        legendColor: null
+                    }));
+                }
+
+                return clickPoints.map((item) => {
+                    const cp = item.clickPoint || null;
+                    if (!cp?.ok || !Number.isFinite(cp.x) || !Number.isFinite(cp.y)) {
+                        return {
+                            ...item,
+                            sampledColor: null,
+                            colorDistance: Number.POSITIVE_INFINITY,
+                            colorScore: 0,
+                            legendTitle: null,
+                            legendColor: null
+                        };
+                    }
+                    const width = Math.max(6, Number(cp.width || 0));
+                    const height = Math.max(6, Number(cp.height || 0));
+                    const samplePoints = [
+                        { x: cp.x, y: cp.y },
+                        { x: cp.x - (width * 0.18), y: cp.y },
+                        { x: cp.x + (width * 0.18), y: cp.y },
+                        { x: cp.x, y: cp.y - (height * 0.18) },
+                        { x: cp.x, y: cp.y + (height * 0.18) }
+                    ].map((pt) => ({ x: pt.x * dpr, y: pt.y * dpr }));
+                    let bestColor = null;
+                    let bestLegend = null;
+                    let bestDistance = Number.POSITIVE_INFINITY;
+                    for (const pt of samplePoints) {
+                        const sampled = samplePngPatchColor(png, pt.x, pt.y, 3);
+                        if (!sampled) continue;
+                        for (const entry of legend) {
+                            const dist = colorDistance(sampled, entry.rgb);
+                            if (dist < bestDistance) {
+                                bestDistance = dist;
+                                bestColor = sampled;
+                                bestLegend = entry;
+                            }
+                        }
+                    }
+                    const colorScore = Number.isFinite(bestDistance)
+                        ? Math.max(0, 240 - Math.min(240, bestDistance * 2.1))
+                        : 0;
+                    return {
+                        ...item,
+                        sampledColor: bestColor,
+                        colorDistance: bestDistance,
+                        colorScore,
+                        legendTitle: bestLegend?.title || null,
+                        legendColor: bestLegend?.color || null
+                    };
+                });
+            };
+            const probeSvgCandidate = async (candidate, categoryTexts) => {
+                if (!candidate?.id) return { ...(candidate || {}), ok: false, tooltipText: '', matchScore: 0 };
+                if (svgProbeCache.has(candidate.id)) return svgProbeCache.get(candidate.id);
+                const clickPoint = await readClickPoint(candidate.id);
+                let tooltipText = '';
+                if (clickPoint?.ok && Number.isFinite(clickPoint.x) && Number.isFinite(clickPoint.y)) {
+                    try {
+                        await page.mouse.move(clickPoint.x, clickPoint.y, { steps: 10 });
+                        await delay(140);
+                    } catch {}
+                    try {
+                        await page.evaluate((x, y) => {
+                            const hit = document.elementFromPoint(x, y);
+                            const target = hit?.closest('g.block, .svgBlock') || hit;
+                            if (!target) return;
+                            const fire = (el, type) => {
+                                try {
+                                    const base = {
+                                        bubbles: true,
+                                        cancelable: true,
+                                        view: window,
+                                        clientX: x,
+                                        clientY: y,
+                                        button: 0,
+                                        buttons: 0
+                                    };
+                                    const usePointer = String(type || '').toLowerCase().startsWith('pointer') && (typeof PointerEvent !== 'undefined');
+                                    const ev = usePointer
+                                        ? new PointerEvent(type, { pointerId: 1, isPrimary: true, pointerType: 'mouse', ...base })
+                                        : new MouseEvent(type, base);
+                                    el.dispatchEvent(ev);
+                                } catch {}
+                            };
+                            fire(target, 'pointerover');
+                            fire(target, 'mouseover');
+                            fire(target, 'pointermove');
+                            fire(target, 'mousemove');
+                        }, clickPoint.x, clickPoint.y);
+                    } catch {}
+                    await delay(160);
+                    tooltipText = await readVisibleSvgTooltipText();
+                }
+                const tooltipScore = getSvgCategoryMatchScore(tooltipText, categoryTexts);
+                const colorScore = Number(candidate?.colorScore || 0);
+                const matchScore = Math.max(colorScore, tooltipScore);
+                const result = { ...candidate, clickPoint, tooltipText, tooltipScore, matchScore };
+                svgProbeCache.set(candidate.id, result);
+                return result;
+            };
+            const requestedSvgTexts = [cat, alt].filter(Boolean);
             const tried = new Set();
             const maxTries = 40;
             for (let attempt = 1; attempt <= maxTries; attempt++) {
@@ -3924,6 +4728,31 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                     continue;
                 }
 
+                const svgLegendEntries = await waitForSvgLegendEntries();
+                const matchedLegendEntries = svgLegendEntries
+                    .filter((entry) => getSvgCategoryMatchScore(entry?.title || '', requestedSvgTexts) > 0)
+                    .map((entry) => ({
+                        ...entry,
+                        score: getSvgCategoryMatchScore(entry?.title || '', requestedSvgTexts)
+                    }))
+                    .sort((a, b) => (b.score || 0) - (a.score || 0));
+                const svgDesiredTexts = Array.from(new Set([
+                    ...requestedSvgTexts,
+                    ...matchedLegendEntries.map((entry) => entry.title)
+                ].filter(Boolean)));
+                logger.info('categoryBlock:svg_targets', {
+                    attempt,
+                    categoryType: cat || null,
+                    alternativeCategory: alt || null,
+                    desiredTexts: svgDesiredTexts,
+                    legendCount: svgLegendEntries.length,
+                    legendMatches: matchedLegendEntries.map((entry) => ({
+                        title: entry.title,
+                        color: entry.color,
+                        score: entry.score
+                    }))
+                });
+
                 const candidates = await page.evaluate(() => {
                     const blocks = Array.from(document.querySelectorAll('svg.svgLayout g.block, .svgLayout g.block'));
                     const paths = Array.from(document.querySelectorAll('svg.svgLayout .svgBlock, .svgLayout .svgBlock'));
@@ -3938,70 +4767,58 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
 
                 let remaining = (candidates || []).filter(c => c?.id && !tried.has(c.id));
                 if (!remaining.length) break;
-                // SVG modda categoryType/alternativeCategory = blok ID ("block17363" veya "17363")
                 let pick = null;
-                const tryBlockId = (hint) => {
-                    if (!hint) return null;
-                    const h = String(hint).trim();
-                    const normalized = /^\d+$/.test(h) ? `block${h}` : (h.startsWith('block') ? h : `block${h}`);
-                    return remaining.find(c => c?.id === normalized);
-                };
-                pick = tryBlockId(cat) || tryBlockId(alt);
-                if (pick) logger.info('categoryBlock:svg_block_from_category', { categoryType: cat || null, alternativeCategory: alt || null, blockId: pick.id });
-                if (!pick) pick = remaining[Math.floor(Math.random() * remaining.length)];
-
-                const readClickPoint = async () => {
-                    return await page.evaluate((targetId) => {
-                        const el = document.getElementById(targetId);
-                        if (!el) return { ok: false, id: targetId, reason: 'not_found' };
-
-                        const asEl = /** @type {Element} */ (el);
-                        try { asEl.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
-
-                        let rect = null;
-                        try {
-                            if (typeof asEl.getBoundingClientRect === 'function') rect = asEl.getBoundingClientRect();
-                        } catch {}
-
-                        if (!rect || !rect.width || !rect.height) {
-                            try {
-                                const svgEl = /** @type {any} */ (asEl);
-                                if (typeof svgEl.getBBox === 'function') {
-                                    const b = svgEl.getBBox();
-                                    const ctm = svgEl.getScreenCTM && svgEl.getScreenCTM();
-                                    if (ctm) {
-                                        const x = (b.x + (b.width / 2)) * ctm.a + ctm.e;
-                                        const y = (b.y + (b.height / 2)) * ctm.d + ctm.f;
-                                        return { ok: true, id: targetId, tag: asEl.tagName, x, y, method: 'getBBox' };
-                                    }
-                                }
-                            } catch {}
-                        }
-
-                        if (!rect) return { ok: false, id: targetId, reason: 'no_rect', tag: asEl.tagName };
-                        const x = rect.left + (rect.width / 2);
-                        const y = rect.top + (rect.height / 2);
-                        const top = (() => {
-                            try {
-                                const t = document.elementFromPoint(x, y);
-                                if (!t) return null;
-                                return {
-                                    tag: t.tagName,
-                                    id: t.getAttribute('id') || t.id || null,
-                                    className: (t.getAttribute('class') || '').toString().slice(0, 120)
-                                };
-                            } catch {
-                                return null;
-                            }
-                        })();
-                        return { ok: true, id: targetId, tag: asEl.tagName, x, y, method: 'getBoundingClientRect', top };
-                    }, pick.id).catch(() => ({ ok: false, id: pick.id, reason: 'eval_failed' }));
-                };
+                let matchedCandidates = [];
+                if (svgDesiredTexts.length) {
+                    const relevantLegendEntries = matchedLegendEntries.length
+                        ? matchedLegendEntries
+                        : svgLegendEntries.filter((entry) => svgDesiredTexts.includes(entry.title));
+                    const coloredCandidates = await enrichSvgCandidatesWithLegendColors(remaining, relevantLegendEntries);
+                    for (const candidate of coloredCandidates) {
+                        const probed = await probeSvgCandidate(candidate, svgDesiredTexts);
+                        if (probed.matchScore > 0) matchedCandidates.push(probed);
+                    }
+                    matchedCandidates.sort((a, b) => {
+                        if ((b.matchScore || 0) !== (a.matchScore || 0)) return (b.matchScore || 0) - (a.matchScore || 0);
+                        if ((b.colorScore || 0) !== (a.colorScore || 0)) return (b.colorScore || 0) - (a.colorScore || 0);
+                        return String(a.id || '').localeCompare(String(b.id || ''));
+                    });
+                }
+                if (matchedCandidates.length) {
+                    pick = matchedCandidates[0];
+                    logger.info('categoryBlock:svg_block_from_tooltip', {
+                        categoryType: cat || null,
+                        alternativeCategory: alt || null,
+                        blockId: pick.id,
+                        legendTitle: pick.legendTitle || null,
+                        legendColor: pick.legendColor || null,
+                        sampledColor: pick.sampledColor || null,
+                        colorDistance: Number.isFinite(pick.colorDistance) ? pick.colorDistance : null,
+                        colorScore: pick.colorScore || 0,
+                        tooltipText: pick.tooltipText || '',
+                        tooltipScore: pick.tooltipScore || 0,
+                        matchScore: pick.matchScore || 0
+                    });
+                } else if (svgDesiredTexts.length && mode === 'svg') {
+                    throw new Error(`SVG_CATEGORY_MATCH_NOT_FOUND:${cat || alt || 'unknown'}`);
+                } else if (svgDesiredTexts.length && mode === 'scan') {
+                    logger.info('categoryBlock:scan_svg_fallback_dropdown', {
+                        reason: 'SVG_CATEGORY_MATCH_NOT_FOUND',
+                        categoryType: cat || null,
+                        alternativeCategory: alt || null
+                    });
+                    proceedToDropdown = true;
+                    break;
+                } else {
+                    pick = remaining[Math.floor(Math.random() * remaining.length)];
+                }
 
                 let clicked = { ok: false, id: pick.id, reason: 'no_point' };
                 let lastPoint = null;
                 for (let c = 0; c < 3; c++) {
-                    const clickPoint = await readClickPoint();
+                    const clickPoint = pick?.clickPoint && c === 0
+                        ? pick.clickPoint
+                        : await readClickPoint(pick.id);
                     lastPoint = clickPoint;
                     if (!clickPoint || !clickPoint.ok || !Number.isFinite(clickPoint.x) || !Number.isFinite(clickPoint.y)) {
                         clicked = { ok: false, id: pick.id, reason: 'no_point_eval' };
@@ -4822,6 +5639,8 @@ async function startBot(req, res) {
 }
 
 async function startBotAfterValidation(req, res, validatedData) {
+    logger.info('Bot start request payload', sanitizeStartRequestForLog(req?.body || validatedData || {}));
+
     const {
         team: requestedTeam, teamId, ticketType, eventAddress, categoryType, alternativeCategory,
         categorySelectionMode,
@@ -5064,7 +5883,21 @@ async function startBotAfterValidation(req, res, validatedData) {
         }
     };
 
+    const assertRunNotKilled = (label = '') => {
+        try {
+            const st = runStore.get(runId);
+            if (st && st.status === 'killed') {
+                const e = new Error(`RUN_KILLED${label ? `:${label}` : ''}`);
+                e.code = 'RUN_KILLED';
+                throw e;
+            }
+        } catch (e) {
+            if (e && e.code === 'RUN_KILLED') throw e;
+        }
+    };
+
     const finalizeToC = async () => {
+        assertRunNotKilled('finalizeToC');
         const fin = getFinalizeRequest();
         if (!fin?.requested) return null;
         const cAcc = fin?.cAccount;
@@ -5104,6 +5937,7 @@ async function startBotAfterValidation(req, res, validatedData) {
             proxyPassword
         }));
         try { multiBrowsers.push(browserC); } catch {}
+        registerPassobotBrowser(browserC, runId);
         setStep('C.launchAndLogin.done', { email: cAcc.email, snap: await snapshotPage(pageC, 'C.afterLogin') });
 
         const eventPathIncludes = (() => {
@@ -5187,13 +6021,15 @@ async function startBotAfterValidation(req, res, validatedData) {
                 rejectIfHome: false,
                 backoffMs: 450
             });
-            await holderPage.waitForSelector('.basket-list-detail, .basket-list, .basket, [data-testid*="basket" i], [data-testid*="sepet" i]', { timeout: 8000 }).catch(() => {});
+            await holderPage.waitForSelector(BASKET_ROOT_SELECTOR, { timeout: 8000 }).catch(() => {});
         } catch {}
 
         let removed = false;
+        let removeDiag = null;
         for (let attempt = 1; attempt <= 3; attempt++) {
             if (removed) break;
-            removed = await clickRemoveFromCartAndConfirm(holderPage, getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT);
+            removeDiag = await clearBasketFully(holderPage, { timeoutMs: getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT });
+            removed = removeDiag?.ok === true;
             if (removed) break;
             try {
                 await gotoWithRetry(holderPage, 'https://www.passo.com.tr/tr/sepet', {
@@ -5207,7 +6043,14 @@ async function startBotAfterValidation(req, res, validatedData) {
             } catch {}
         }
         if (!removed) throw new Error('FINALIZE_HOLDER_REMOVE_FAILED');
-        audit('finalize_holder_remove_done', { holder: currentHolder, holderEmail, seatId: currentSeatInfo?.seatId || null });
+        audit('finalize_holder_remove_done', {
+            holder: currentHolder,
+            holderEmail,
+            seatId: currentSeatInfo?.seatId || null,
+            initialItemCount: removeDiag?.initialCount ?? null,
+            remainingItemCount: removeDiag?.remainingCount ?? null,
+            removedClicks: removeDiag?.removedClicks ?? null
+        });
 
         const exactMaxMs = Math.max(30000, Math.min(getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 180000));
         try { await delay(350); } catch {}
@@ -5272,8 +6115,15 @@ async function startBotAfterValidation(req, res, validatedData) {
         setStep('C.seatmap.ensure.done', { ok: !!seatmapOk, snap: await snapshotPage(pageC, 'C.afterSeatmapEnsure') });
         if (!seatmapOk) throw new Error('FINALIZE_C_SEATMAP_MOUNT_FAILED');
 
-        const seatInfoC = await pickExactSeatWithVerify_ReleaseAware(pageC, currentSeatInfo, exactMaxMs);
-        audit('finalize_c_exact_pick_done', { cEmail: cAcc.email, seatId: currentSeatInfo?.seatId || null, pickedSeatId: seatInfoC?.seatId || null });
+        const seatInfoC = await pickExactSeatBundleReleaseAware(pageC, currentSeatInfo, exactMaxMs, {
+            audit: (phase, payload) => audit(`finalize_c_${phase}`, { cEmail: cAcc.email, ...payload })
+        });
+        audit('finalize_c_exact_pick_done', {
+            cEmail: cAcc.email,
+            seatId: currentSeatInfo?.seatId || null,
+            pickedSeatId: seatInfoC?.seatId || null,
+            heldSeatCount: Array.isArray(seatInfoC?.heldSeats) ? seatInfoC.heldSeats.length : (seatInfoC?.itemCount || null)
+        });
 
         setStep('C.clickContinue.start');
         await clickContinueInsidePage(pageC);
@@ -5360,6 +6210,12 @@ async function startBotAfterValidation(req, res, validatedData) {
         if (finalizeWatch) return;
         finalizeWatch = setInterval(() => {
             try {
+                const stKill = runStore.get(runId);
+                if (stKill && stKill.status === 'killed') {
+                    try { clearInterval(finalizeWatch); } catch {}
+                    finalizeWatch = null;
+                    return;
+                }
                 if (finalizedToCResult) return;
                 if (finalizeInFlight) return;
                 const fin = getFinalizeRequest();
@@ -5386,6 +6242,7 @@ async function startBotAfterValidation(req, res, validatedData) {
 
     /** Finalize panelden istendiğinde basket loop / pasif B oturum ping'i ile yarışmayı keser. */
     const pauseForFinalizeIfRequested = async (label) => {
+        assertRunNotKilled(label);
         const fin = getFinalizeRequest();
         if (!fin?.requested || !fin?.cAccount?.email || !fin?.cAccount?.password) return null;
         if (finalizedToCResult) return 'done';
@@ -5669,6 +6526,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 });
                 bBrowser = browser;
                 try { multiBrowsers.push(browser); } catch {}
+                registerPassobotBrowser(browser, runId);
                 setStep(`${label}.launchAndLogin.done`, { email: acc.email, snap: await snapshotPage(page, `${label}.afterLogin`) });
                 audit('account_launch_done', { role: 'B', idx: i, email: acc.email, url: (() => { try { return page.url(); } catch { return null; } })() });
 
@@ -5787,7 +6645,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 } catch (e) {
                     audit('b_prepare_failed', { idx: i, email: acc.email, error: e?.message || String(e) }, 'warn');
                     logger.warn(`${label} başarısız — tarayıcı kapatılıyor`, { email: acc.email, error: e?.message });
-                    try { if (bBrowser) { await bBrowser.close().catch(() => {}); const bIdx = multiBrowsers.indexOf(bBrowser); if (bIdx >= 0) multiBrowsers.splice(bIdx, 1); } } catch {}
+                    try { if (bBrowser) { unregisterPassobotBrowser(bBrowser); await bBrowser.close().catch(() => {}); const bIdx = multiBrowsers.indexOf(bBrowser); if (bIdx >= 0) multiBrowsers.splice(bIdx, 1); } } catch {}
                     return null;
                 }
                 });
@@ -5832,6 +6690,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 });
                 aBrowser = browser;
                 try { multiBrowsers.push(browser); } catch {}
+                registerPassobotBrowser(browser, runId);
                 setStep(`${label}.launchAndLogin.done`, { email: acc.email, snap: await snapshotPage(page, `${label}.afterLogin`) });
                 audit('account_launch_done', { role: 'A', idx: i, email: acc.email, url: (() => { try { return page.url(); } catch { return null; } })() });
 
@@ -5914,6 +6773,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     resolvedAlternativeCategory,
                     categorySelectionMode
                 );
+                let ticketQuantityPrimed = false;
                 setStep(`${label}.categoryBlock.select.start`, { categorySelectionMode });
                 const cbStart = Date.now();
                 const cbRes = await accountCategoryChooser.choose(page, resolvedCategoryType, resolvedAlternativeCategory, categorySelectionMode);
@@ -5943,6 +6803,11 @@ async function startBotAfterValidation(req, res, validatedData) {
                     await delay(350);
                 }
 
+                if (ticketCount > 1) {
+                    const qtyRes = await applyTicketQuantityDropdown(page, `${label}:postCategory`, ticketCount);
+                    ticketQuantityPrimed = qtyRes?.ok === true;
+                }
+
                 setStep(`${label}.seat.pickRandom.start`);
                 const seatSelectionUrl = (() => { try { return page.url(); } catch { return null; } })();
                 const netSeat = captureSeatIdFromNetwork(page, getCfg().TIMEOUTS.NETWORK_CAPTURE_TIMEOUT);
@@ -5958,7 +6823,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                     try {
                         const remaining = Math.max(15000, Number(getCfg().TIMEOUTS.SEAT_SELECTION_MAX) - (Date.now() - cycleStartedAt));
                         const catRule = cbRes?.chosenCategory || {};
-                        const effectiveTicketCount = (catRule.ticketCount && catRule.ticketCount > 1) ? catRule.ticketCount : ticketCount;
+                        const catMinTickets = (catRule.ticketCount && catRule.ticketCount > 1) ? catRule.ticketCount : 1;
+                        const effectiveTicketCount = Math.max(ticketCount, catMinTickets);
                         const adjacentSeats = catRule.adjacentSeats === true;
                         seatInfo = await seatHelper.pickRandomSeatWithVerify(page, remaining, {
                             context: label,
@@ -5972,6 +6838,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                             chooseCategoryFn: accountCategoryChooser.choose,
                             categorySelectionMode,
                             ticketCount: effectiveTicketCount,
+                            quantitySelectionMode: 'afterCategory',
+                            ticketQuantityPrimed,
                             adjacentSeats
                         });
                         break;
@@ -5986,6 +6854,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                             const cbRes2 = await accountCategoryChooser.choose(page, resolvedCategoryType, resolvedAlternativeCategory, mode2);
                             if (cbRes2 && cbRes2.svgBlockId) {
                                 try { catBlockA = { ...(catBlockA || {}), svgBlockId: cbRes2.svgBlockId }; } catch {}
+                            }
+                            if (ticketCount > 1) {
+                                const qtyRes2 = await applyTicketQuantityDropdown(page, `${label}:postCategoryRetry`, ticketCount);
+                                ticketQuantityPrimed = qtyRes2?.ok === true;
                             }
                             // Reselect can take time (loader). Reset the seat-pick deadline so we don't fail early.
                             cycleStartedAt = Date.now();
@@ -6052,7 +6924,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 } catch (e) {
                     audit('a_hold_failed', { idx: i, email: acc.email, error: e?.message || String(e) }, 'warn');
                     logger.warn(`${label} başarısız — tarayıcı kapatılıyor`, { email: acc.email, error: e?.message });
-                    try { if (aBrowser) { await aBrowser.close().catch(() => {}); const bIdx = multiBrowsers.indexOf(aBrowser); if (bIdx >= 0) multiBrowsers.splice(bIdx, 1); } } catch {}
+                    try { if (aBrowser) { unregisterPassobotBrowser(aBrowser); await aBrowser.close().catch(() => {}); const bIdx = multiBrowsers.indexOf(aBrowser); if (bIdx >= 0) multiBrowsers.splice(bIdx, 1); } } catch {}
                     return null;
                 }
                 });
@@ -6193,6 +7065,7 @@ async function startBotAfterValidation(req, res, validatedData) {
             audit('multi_transfer_start', { pairCount });
             const results = [];
             for (let i = 0; i < pairCount; i++) {
+                assertRunNotKilled(`multi_transfer_${i}`);
                 const aCtx = aCtxList[i];
                 const bCtx = bCtxList[i];
                 if (!aCtx?.seatInfo?.seatId) {
@@ -6311,12 +7184,15 @@ async function startBotAfterValidation(req, res, validatedData) {
                     });
                 } catch {}
                 let removed = false;
+                let removeDiag = null;
+                await ensureRemoveDelayAfterBasket();
                 for (let attempt = 1; attempt <= 3; attempt++) {
                     if (removed) break;
                     aRemoveAttempts = attempt;
-                    await ensureRemoveDelayAfterBasket();
-                    audit('a_remove_from_basket_start', { idx: i, aEmail: aCtx.email, seatId: aCtx.seatInfo.seatId, attempt });
-                    removed = await clickRemoveFromCartAndConfirm(aCtx.page, getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT);
+                    const beforeItemCount = await getBasketItemCountSafe(aCtx.page);
+                    audit('a_remove_from_basket_start', { idx: i, aEmail: aCtx.email, seatId: aCtx.seatInfo.seatId, attempt, beforeItemCount });
+                    removeDiag = await clearBasketFully(aCtx.page, { timeoutMs: getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT });
+                    removed = removeDiag?.ok === true;
                     if (removed) break;
                     try { await delay(1500); } catch {}
                 }
@@ -6328,7 +7204,9 @@ async function startBotAfterValidation(req, res, validatedData) {
                         aEmail: aCtx.email,
                         seatId: aCtx.seatInfo.seatId,
                         ms: Date.now() - aRemoveStartedAt,
-                        attempts: aRemoveAttempts
+                        attempts: aRemoveAttempts,
+                        remainingItemCount: removeDiag?.remainingCount ?? null,
+                        removedClicks: removeDiag?.removedClicks ?? null
                     }, 'warn');
                     if (dashboardPairs[i]) {
                         dashboardPairs[i] = { ...dashboardPairs[i], phase: 'Hata: A sepetten kaldırılamadı', transferOk: false, holder: 'A' };
@@ -6342,7 +7220,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                     aEmail: aCtx.email,
                     seatId: aCtx.seatInfo.seatId,
                     ms: Date.now() - aRemoveStartedAt,
-                    attempts: aRemoveAttempts
+                    attempts: aRemoveAttempts,
+                    initialItemCount: removeDiag?.initialCount ?? null,
+                    remainingItemCount: removeDiag?.remainingCount ?? null,
+                    removedClicks: removeDiag?.removedClicks ?? null
                 });
 
                 // B is already on seat selection with seatmap ready - just apply correct category/block
@@ -6373,10 +7254,20 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`PAIR${i}.b_apply_catblock.done`);
 
                 // start B exact pick immediately with short timeout for fast response
-                const exactMaxMs = Math.max(8000, Math.min(getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 30000));
+                const transferTargets = normalizeHeldSeats(aCtx.seatInfo);
+                const exactMaxMs = Math.max(30000, Math.min((getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0) * Math.max(1, transferTargets.length || 1), 120000));
 
-                audit('b_exact_pick_start', { idx: i, bEmail: bCtx.email, seatId: aCtx.seatInfo.seatId, maxMs: exactMaxMs, seatmapReady: bCtx.seatmapReady });
-                const exactPromise = pickExactSeatWithVerify_ReleaseAware(bCtx.page, aCtx.seatInfo, exactMaxMs);
+                audit('b_exact_pick_start', {
+                    idx: i,
+                    bEmail: bCtx.email,
+                    seatId: aCtx.seatInfo.seatId,
+                    heldSeatCount: transferTargets.length || 1,
+                    maxMs: exactMaxMs,
+                    seatmapReady: bCtx.seatmapReady
+                });
+                const exactPromise = pickExactSeatBundleReleaseAware(bCtx.page, aCtx.seatInfo, exactMaxMs, {
+                    audit: (phase, payload) => audit(`b_${phase}`, { idx: i, bEmail: bCtx.email, ...payload })
+                });
 
                 let seatBInfo = null;
                 try {
@@ -6397,7 +7288,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                     seatId: aCtx.seatInfo.seatId,
                     pickedSeatId: seatBInfo?.seatId || null,
                     row: seatBInfo?.row || null,
-                    seat: seatBInfo?.seat || null
+                    seat: seatBInfo?.seat || null,
+                    heldSeatCount: Array.isArray(seatBInfo?.heldSeats) ? seatBInfo.heldSeats.length : (seatBInfo?.itemCount || null)
                 });
 
                 results.push({ idx: i, ok: true, seatA: aCtx.seatInfo, seatB: seatBInfo, aEmail: aCtx.email, bEmail: bCtx.email });
@@ -6539,6 +7431,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         ({browser: browserA, page: pageA} = await launchAndLogin({
             email: emailA, password: passwordA, userDataDir: userDataDirA, proxyHost, proxyPort, proxyUsername, proxyPassword
         }));
+        registerPassobotBrowser(browserA, runId);
         setStep('A.launchAndLogin.done', { email: emailA, snap: await snapshotPage(pageA, 'A.afterLogin') });
         audit('account_launch_done', { role: 'A', idx: 0, email: emailA, url: (() => { try { return pageA.url(); } catch { return null; } })() });
         logger.info('A hesabı giriş yaptı');
@@ -6850,8 +7743,8 @@ async function startBotAfterValidation(req, res, validatedData) {
             logger.warn('A.categoryBlock.dom_diagnostic_failed', { error: e?.message });
         }
 
-        const aCredential = aList[pairIdx0] || null;
-        const bCredential = bList[pairIdx0] || null;
+        const aCredential = idProfileA || aList[0] || null;
+        const bCredential = idProfileB || bList[0] || null;
         const aAllowedCategories = await resolveCategoriesForCredential(teamId, selectedCategories, aCredential?.categoryIds || [], categorySelectionMode);
         const bAllowedCategories = await resolveCategoriesForCredential(teamId, selectedCategories, bCredential?.categoryIds || [], categorySelectionMode);
         const singleCategoryChooserA = createCategoryChooser(
@@ -6866,6 +7759,7 @@ async function startBotAfterValidation(req, res, validatedData) {
             resolvedAlternativeCategory,
             categorySelectionMode
         );
+        let ticketQuantityPrimedA = false;
         setStep('A.categoryBlock.select.start', { categoryType: resolvedCategoryType, alternativeCategory: resolvedAlternativeCategory, categorySelectionMode });
         const cbResA = await singleCategoryChooserA.choose(pageA, resolvedCategoryType, resolvedAlternativeCategory, categorySelectionMode);
         if (cbResA && cbResA.svgBlockId) {
@@ -6884,6 +7778,10 @@ async function startBotAfterValidation(req, res, validatedData) {
             } catch {}
             await delay(350);
         }
+        if (ticketCount > 1) {
+            const qtyResA = await applyTicketQuantityDropdown(pageA, 'A:postCategory', ticketCount);
+            ticketQuantityPrimedA = qtyResA?.ok === true;
+        }
         logger.info('A hesabı kategori/blok okundu', { catBlockA });
 
         setStep('A.seat.pickRandom.start');
@@ -6901,7 +7799,8 @@ async function startBotAfterValidation(req, res, validatedData) {
             try {
                 const remaining = Math.max(15000, Number(getCfg().TIMEOUTS.SEAT_SELECTION_MAX) - (Date.now() - cycleStartedAt));
                 const catRuleA = cbResA?.chosenCategory || {};
-                const effectiveTicketCountA = (catRuleA.ticketCount && catRuleA.ticketCount > 1) ? catRuleA.ticketCount : ticketCount;
+                const catMinTicketsA = (catRuleA.ticketCount && catRuleA.ticketCount > 1) ? catRuleA.ticketCount : 1;
+                const effectiveTicketCountA = Math.max(ticketCount, catMinTicketsA);
                 const adjacentSeatsA = catRuleA.adjacentSeats === true;
                 seatInfoA = await seatHelper.pickRandomSeatWithVerify(
                     pageA,
@@ -6918,6 +7817,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                         chooseCategoryFn: singleCategoryChooserA.choose,
                         categorySelectionMode,
                         ticketCount: effectiveTicketCountA,
+                        quantitySelectionMode: 'afterCategory',
+                        ticketQuantityPrimed: ticketQuantityPrimedA,
                         adjacentSeats: adjacentSeatsA
                     }
                 );
@@ -6933,6 +7834,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                     const cbResA2 = await singleCategoryChooserA.choose(pageA, resolvedCategoryType, resolvedAlternativeCategory, mode2);
                     if (cbResA2 && cbResA2.svgBlockId) {
                         try { catBlockA = { ...(catBlockA || {}), svgBlockId: cbResA2.svgBlockId }; } catch {}
+                    }
+                    if (ticketCount > 1) {
+                        const qtyResA2 = await applyTicketQuantityDropdown(pageA, 'A:postCategoryRetry', ticketCount);
+                        ticketQuantityPrimedA = qtyResA2?.ok === true;
                     }
                     setStep('A.categoryBlock.reselect.done', { cycle, snap: await snapshotPage(pageA, `A.afterReselect_${cycle}`) });
                     // Reset the seat-pick deadline after a reselect. Reselect can take significant time (loader/UI),
@@ -7081,6 +7986,7 @@ async function startBotAfterValidation(req, res, validatedData) {
             proxyUsername,
             proxyPassword
         }));
+        registerPassobotBrowser(browserB, runId);
         setStep('B.launchAndLogin.done', { email: emailB, snap: await snapshotPage(pageB, 'B.afterLogin') });
         audit('account_launch_done', { role: 'B', idx: 0, email: emailB, url: (() => { try { return pageB.url(); } catch { return null; } })() });
         logger.info('B hesabı giriş yaptı (A koltuk sepette beklerken)');
@@ -7217,14 +8123,25 @@ async function startBotAfterValidation(req, res, validatedData) {
             });
 
             // Öncelik: A'nın koltuğunu (aynı seatId) B hesabına aynen yakalat.
-            const exactMaxMs = Math.max(30000, Math.min(getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 120000));
-            logger.info('B hedef koltuğu zorluyor (aynı seatId)', { seatId: seatInfoA?.seatId || null, exactMaxMs });
-            audit('b_exact_pick_start', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null, maxMs: exactMaxMs, seatSelectionUrlB });
+            const exactTargets = normalizeHeldSeats(seatInfoA);
+            const exactMaxMs = Math.max(30000, Math.min((getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0) * Math.max(1, exactTargets.length || 1), 180000));
+            logger.info('B hedef koltukları zorluyor (aynı seatId listesi)', { seatId: seatInfoA?.seatId || null, heldSeatCount: exactTargets.length || 1, exactMaxMs });
+            audit('b_exact_pick_start', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null, heldSeatCount: exactTargets.length || 1, maxMs: exactMaxMs, seatSelectionUrlB });
             try {
-                const gotExact = await pickExactSeatWithVerify_ReleaseAware(pageB, seatInfoA, exactMaxMs);
+                const gotExact = await pickExactSeatBundleReleaseAware(pageB, seatInfoA, exactMaxMs, {
+                    audit: (phase, payload) => audit(`b_${phase}`, { aEmail: emailA, bEmail: emailB, ...payload })
+                });
                 if (gotExact) {
                     logger.info('B hedef koltuğu yakaladı (exact)', { seat: gotExact });
-                    audit('b_exact_pick_done', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null, pickedSeatId: gotExact?.seatId || null, row: gotExact?.row || null, seat: gotExact?.seat || null });
+                    audit('b_exact_pick_done', {
+                        aEmail: emailA,
+                        bEmail: emailB,
+                        seatId: seatInfoA?.seatId || null,
+                        pickedSeatId: gotExact?.seatId || null,
+                        row: gotExact?.row || null,
+                        seat: gotExact?.seat || null,
+                        heldSeatCount: Array.isArray(gotExact?.heldSeats) ? gotExact.heldSeats.length : (gotExact?.itemCount || null)
+                    });
                     return gotExact;
                 }
             } catch (e) {
@@ -7235,6 +8152,8 @@ async function startBotAfterValidation(req, res, validatedData) {
             // Fallback: Eğer exact koltuk alınamazsa (başkası aldı vs), random dene.
             logger.warn('B exact seat alınamadı, random fallback', { seatId: seatInfoA?.seatId || null });
             audit('b_random_fallback_start', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null });
+            const catRuleBFallback = cbResA?.chosenCategory || {};
+            const catMinBFallback = (catRuleBFallback.ticketCount && catRuleBFallback.ticketCount > 1) ? catRuleBFallback.ticketCount : 1;
             const randomGot = await pickRandomSeatWithVerify(
                 pageB,
                 getCfg().TIMEOUTS.SEAT_SELECTION_MAX,
@@ -7247,7 +8166,9 @@ async function startBotAfterValidation(req, res, validatedData) {
                     reloginIfRedirected,
                     ensureTurnstileFn: ensureCaptchaOnPage,
                     chooseCategoryFn: singleCategoryChooserB.choose,
-                    categorySelectionMode
+                    categorySelectionMode,
+                    ticketCount: Math.max(ticketCount, catMinBFallback),
+                    adjacentSeats: catRuleBFallback.adjacentSeats === true
                 }
             );
             logger.info('B rastgele koltuk yakaladı (fallback)', { seat: randomGot });
@@ -7359,7 +8280,7 @@ async function startBotAfterValidation(req, res, validatedData) {
 
                 // Ensure basket DOM is present; if not, one last retry (session drift / partial loads happen).
                 try {
-                    const ok = await pageA.waitForSelector('.basket-list-detail, .basket-list, .basket, [data-testid*="basket" i], [data-testid*="sepet" i]', { timeout: 8000 }).then(() => true).catch(() => false);
+                    const ok = await pageA.waitForSelector(BASKET_ROOT_SELECTOR, { timeout: 8000 }).then(() => true).catch(() => false);
                     if (!ok) {
                         try { await reloginIfRedirected(pageA, emailA, passwordA); } catch {}
                         await gotoWithRetry(pageA, 'https://www.passo.com.tr/tr/sepet', {
@@ -7369,19 +8290,21 @@ async function startBotAfterValidation(req, res, validatedData) {
                             rejectIfHome: false,
                             backoffMs: 450
                         }).catch(() => {});
-                        await pageA.waitForSelector('.basket-list-detail, .basket-list, .basket, [data-testid*="basket" i], [data-testid*="sepet" i]', { timeout: 8000 }).catch(() => {});
+                        await pageA.waitForSelector(BASKET_ROOT_SELECTOR, { timeout: 8000 }).catch(() => {});
                         aBasketArrivedAtMs = aBasketArrivedAtMs || Date.now();
                     }
                 } catch {}
 
                 let removed = false;
+                let removeDiag = null;
 
                 // DOM-based removal only (API/XHR removed per user request)
                 await ensureRemoveDelayAfterBasket();
 
                 for (let attempt = 1; attempt <= 3; attempt++) {
                     if (removed) break;
-                    removed = await clickRemoveFromCartAndConfirm(pageA, getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT);
+                    removeDiag = await clearBasketFully(pageA, { timeoutMs: getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT });
+                    removed = removeDiag?.ok === true;
                     if (removed) break;
                     try {
                         logger.warn('A.removeFromCart.retry.reload', { attempt });
@@ -7396,7 +8319,14 @@ async function startBotAfterValidation(req, res, validatedData) {
                     } catch {}
                 }
                 if (!removed) {
-                    audit('a_remove_from_basket_failed', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null, reason: 'dynamic_timing' }, 'warn');
+                    audit('a_remove_from_basket_failed', {
+                        aEmail: emailA,
+                        bEmail: emailB,
+                        seatId: seatInfoA?.seatId || null,
+                        reason: 'dynamic_timing',
+                        remainingItemCount: removeDiag?.remainingCount ?? null,
+                        removedClicks: removeDiag?.removedClicks ?? null
+                    }, 'warn');
                     try {
                         try {
                             const frames = (() => {
@@ -7487,7 +8417,15 @@ async function startBotAfterValidation(req, res, validatedData) {
                     elapsedSeconds: status.elapsedSeconds
                 });
 
-                audit('a_remove_from_basket_done', { aEmail: emailA, bEmail: emailB, seatId: seatInfoA?.seatId || null, reason: 'dynamic_timing' });
+                audit('a_remove_from_basket_done', {
+                    aEmail: emailA,
+                    bEmail: emailB,
+                    seatId: seatInfoA?.seatId || null,
+                    reason: 'dynamic_timing',
+                    initialItemCount: removeDiag?.initialCount ?? null,
+                    remainingItemCount: removeDiag?.remainingCount ?? null,
+                    removedClicks: removeDiag?.removedClicks ?? null
+                });
 
                 // B tarafı A'nın kaldırmasını bekliyor; sinyal gönder.
                 try { aRemovedResolve?.(); } catch {}
@@ -7599,6 +8537,12 @@ async function startBotAfterValidation(req, res, validatedData) {
         await clickContinueInsidePage(pageB);
         await delay(getCfg().DELAYS.AFTER_CONTINUE);
         setStep('B.clickContinue.done', { snap: await snapshotPage(pageB, 'B.afterContinue') });
+        await parkHolderOnBasket(pageB, basketTimer, {
+            email: emailB,
+            password: passwordB,
+            reloginIfRedirected,
+            label: 'B.afterContinue'
+        });
 
         // Optional: Basket loop (A<->B) to extend holding time by transferring before expiry.
         if (getCfg()?.BASKET?.LOOP_ENABLED) {
@@ -7730,15 +8674,35 @@ async function startBotAfterValidation(req, res, validatedData) {
                         try { await applyCategoryBlockSelection(toPage, categorySelectionMode, (currentCatBlock || catBlockA), loopSeatInfo); } catch {}
                         try { await openSeatMapStrict(toPage); } catch {}
                         const seatSelectionUrl = (() => { try { return toPage.url(); } catch { return null; } })();
-                        const exactMaxMs = Math.max(30000, Math.min(getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0, 180000));
-                        audit('basket_loop_exact_pick_start', { hop: hopCount + 1, from: fromRole, to: toRole, seatId: loopSeatInfo?.seatId || null, maxMs: exactMaxMs, seatSelectionUrl });
+                        const loopTargets = normalizeHeldSeats(loopSeatInfo);
+                        const exactMaxMs = Math.max(30000, Math.min((getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0) * Math.max(1, loopTargets.length || 1), 180000));
+                        audit('basket_loop_exact_pick_start', {
+                            hop: hopCount + 1,
+                            from: fromRole,
+                            to: toRole,
+                            seatId: loopSeatInfo?.seatId || null,
+                            heldSeatCount: loopTargets.length || 1,
+                            maxMs: exactMaxMs,
+                            seatSelectionUrl
+                        });
                         // Fix misleading error messages: context must reflect the receiver role.
                         try {
                             const prev = loopSeatInfo.__recoveryOptions || {};
                             loopSeatInfo.__recoveryOptions = { ...prev, context: String(toRole) };
                         } catch {}
-                        const got = await pickExactSeatWithVerify_ReleaseAware(toPage, loopSeatInfo, exactMaxMs);
-                        audit('basket_loop_exact_pick_done', { hop: hopCount + 1, from: fromRole, to: toRole, seatId: loopSeatInfo?.seatId || null, pickedSeatId: got?.seatId || null, row: got?.row || null, seat: got?.seat || null });
+                        const got = await pickExactSeatBundleReleaseAware(toPage, loopSeatInfo, exactMaxMs, {
+                            audit: (phase, payload) => audit(`basket_loop_${phase}`, { hop: hopCount + 1, from: fromRole, to: toRole, ...payload })
+                        });
+                        audit('basket_loop_exact_pick_done', {
+                            hop: hopCount + 1,
+                            from: fromRole,
+                            to: toRole,
+                            seatId: loopSeatInfo?.seatId || null,
+                            pickedSeatId: got?.seatId || null,
+                            row: got?.row || null,
+                            seat: got?.seat || null,
+                            heldSeatCount: Array.isArray(got?.heldSeats) ? got.heldSeats.length : (got?.itemCount || null)
+                        });
                         return got;
                     })();
 
@@ -7760,6 +8724,12 @@ async function startBotAfterValidation(req, res, validatedData) {
                         label: `loop_recv_${toRole}_wait_release`
                     });
                     try {
+                        await parkHolderOnBasket(fromPage, basketTimer, {
+                            email: fromEmail,
+                            password: fromPass,
+                            reloginIfRedirected,
+                            label: `${fromRole}.loop.waitingHolder`
+                        });
                         while (Date.now() - loopStartMs < (getCfg().BASKET.HOLDING_TIME_SECONDS * 1000)) {
                             if (finalizeInFlight) {
                                 try { await finalizeInFlight; } catch {}
@@ -7767,6 +8737,11 @@ async function startBotAfterValidation(req, res, validatedData) {
                                     try { runStore.upsert(runId, { status: 'completed', result: finalizedToCResult }); } catch {}
                                     return res.json(finalizedToCResult);
                                 }
+                            }
+                            const uiStatus = await checkBasketTimeoutFromPage(fromPage).catch(() => null);
+                            const uiRemaining = Number(uiStatus?.remainingSeconds);
+                            if (Number.isFinite(uiRemaining) && uiRemaining >= 0) {
+                                try { basketTimer.syncFromRemainingSeconds(uiRemaining); } catch {}
                             }
                             const st = basketTimer.getStatus();
                             const rem = st.remainingSeconds;
@@ -7797,13 +8772,15 @@ async function startBotAfterValidation(req, res, validatedData) {
                             rejectIfHome: false,
                             backoffMs: 450
                         });
-                        await fromPage.waitForSelector('.basket-list-detail, .basket-list, .basket, [data-testid*="basket" i], [data-testid*="sepet" i]', { timeout: 8000 }).catch(() => {});
+                        await fromPage.waitForSelector(BASKET_ROOT_SELECTOR, { timeout: 8000 }).catch(() => {});
                     } catch {}
 
                     let removed = false;
+                    let removeDiag = null;
                     for (let attempt = 1; attempt <= 3; attempt++) {
                         if (removed) break;
-                        removed = await clickRemoveFromCartAndConfirm(fromPage, getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT);
+                        removeDiag = await clearBasketFully(fromPage, { timeoutMs: getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT });
+                        removed = removeDiag?.ok === true;
                         if (removed) break;
                         try {
                             await gotoWithRetry(fromPage, 'https://www.passo.com.tr/tr/sepet', {
@@ -7817,7 +8794,16 @@ async function startBotAfterValidation(req, res, validatedData) {
                         } catch {}
                     }
                     if (!removed) throw new Error(formatError('REMOVE_FROM_CART_FAILED_LOOP'));
-                    audit('basket_loop_release_done', { hop: hopCount + 1, from: fromRole, to: toRole, fromEmail, seatId: loopSeatInfo?.seatId || null });
+                    audit('basket_loop_release_done', {
+                        hop: hopCount + 1,
+                        from: fromRole,
+                        to: toRole,
+                        fromEmail,
+                        seatId: loopSeatInfo?.seatId || null,
+                        initialItemCount: removeDiag?.initialCount ?? null,
+                        remainingItemCount: removeDiag?.remainingCount ?? null,
+                        removedClicks: removeDiag?.removedClicks ?? null
+                    });
                     try { releasedResolve?.(); } catch {}
 
                     // Receiver should pick now
@@ -7841,6 +8827,12 @@ async function startBotAfterValidation(req, res, validatedData) {
 
                     // Reset timer for the new holder holding period
                     try { basketTimer.start(); } catch {}
+                    await parkHolderOnBasket(toPage, basketTimer, {
+                        email: toEmail,
+                        password: toPass,
+                        reloginIfRedirected,
+                        label: `${toRole}.loop.afterHop`
+                    });
                 }
 
                 // For backward compatible response: put the latest seatInfo into seatInfoB variable
@@ -7899,6 +8891,19 @@ async function startBotAfterValidation(req, res, validatedData) {
         } catch {}
         return res.json({success: true, grabbedBy: emailB, seatA: seatInfoA, seatB: seatInfoB, catBlockA});
     } catch (err) {
+        if (err && err.code === 'RUN_KILLED') {
+            try {
+                if (basketTimer) basketTimer.reset();
+            } catch {}
+            try {
+                runStore.upsert(runId, { status: 'killed', error: 'Panelden oturumlar kapatıldı', result: null });
+            } catch {}
+            logger.infoSafe('Bot durduruldu (kill-sessions)', { runId, lastStep });
+            if (!res.headersSent) {
+                return res.status(200).json({ success: false, killed: true, message: 'Oturum panelden sonlandırıldı' });
+            }
+            return;
+        }
         // Sepette tutma süresi bilgisini hata mesajına ekle (eğer timer başlatıldıysa)
         let basketStatus = null;
         try {
@@ -7954,6 +8959,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     if (Array.isArray(multiBrowsers) && multiBrowsers.length) {
                         const uniq = Array.from(new Set(multiBrowsers.filter(Boolean)));
                         for (const br of uniq) {
+                            try { unregisterPassobotBrowser(br); } catch {}
                             try {
                                 const pages = await br.pages();
                                 await Promise.all((pages || []).map(p => p.close().catch(() => {})));
@@ -7965,6 +8971,7 @@ async function startBotAfterValidation(req, res, validatedData) {
 
                 try {
                     if (browserA) {
+                        try { unregisterPassobotBrowser(browserA); } catch {}
                         logger.debug('BrowserA kapatılıyor');
                         const pages = await browserA.pages();
                         await Promise.all(pages.map(p => p.close().catch(() => {})));
@@ -7977,6 +8984,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 
                 try {
                     if (browserB) {
+                        try { unregisterPassobotBrowser(browserB); } catch {}
                         logger.debug('BrowserB kapatılıyor');
                         const pages = await browserB.pages();
                         await Promise.all(pages.map(p => p.close().catch(() => {})));

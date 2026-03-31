@@ -542,10 +542,28 @@ async function readBasketData(page) {
       );
     };
 
+    const countExactLabels = (label) => {
+      const want = String(label || '').trim().toLowerCase();
+      if (!want) return 0;
+      const nodes = Array.from(document.querySelectorAll('.basket-span, div, span, li, p, dt'));
+      let count = 0;
+      for (const n of nodes) {
+        const t = norm(n.textContent).toLowerCase();
+        if (t === want) count++;
+      }
+      return count;
+    };
+
     const tribune = get('Tribün');
     const block = get('Blok');
     const row = get('Sıra');
     const seat = get('Koltuk');
+    const itemCount = Math.max(
+      countExactLabels('Koltuk'),
+      countExactLabels('Sıra'),
+      countExactLabels('Blok'),
+      countExactLabels('Tribün')
+    );
 
     const hasStrongBasketDom = !!document.querySelector(
       '.basket-list-detail, .basket-list, .basket, [data-testid*="basket" i], [data-testid*="sepet" i]'
@@ -564,9 +582,9 @@ async function readBasketData(page) {
 
     if (!tribune && !block && !row && !seat) {
       if (!hasStrongBasketDom && !isBasketUrl) return null;
-      return { tribune: '', block: '', row: '', seat: '', blockId, seatId, combined: '', inBasket: true, url };
+      return { tribune: '', block: '', row: '', seat: '', blockId, seatId, combined: '', inBasket: true, url, itemCount };
     }
-    return { tribune, block, row, seat, blockId, seatId, combined: `${tribune} ${block} ${row} ${seat}`.trim(), inBasket: true, url };
+    return { tribune, block, row, seat, blockId, seatId, combined: `${tribune} ${block} ${row} ${seat}`.trim(), inBasket: true, url, itemCount };
   }).catch(() => null);
 }
 

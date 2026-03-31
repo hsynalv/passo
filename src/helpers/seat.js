@@ -14,6 +14,33 @@ const SELECTED_SEAT_SELECTOR = (
   'svg.seatmap-svg rect.selected'
 );
 
+function mapHeldSeatsFromProducts(products) {
+  if (!Array.isArray(products) || !products.length) return [];
+  const seen = new Set();
+  const out = [];
+  for (const p of products) {
+    const seatId = p?.refSeatInfoID != null ? String(p.refSeatInfoID) : '';
+    const row = p?.refSeatInfo_RowName != null ? String(p.refSeatInfo_RowName) : '';
+    const seat = p?.refSeatInfo_SeatName != null ? String(p.refSeatInfo_SeatName) : '';
+    const tribune = p?.tribune_Name != null ? String(p.tribune_Name) : '';
+    const block = p?.block_Name != null ? String(p.block_Name) : '';
+    const blockId = p?.refBlockID != null ? String(p.refBlockID) : '';
+    const key = seatId || `${tribune}|${block}|${row}|${seat}`;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      tribune,
+      block,
+      row,
+      seat,
+      blockId,
+      seatId,
+      combined: `${tribune} ${block} ${row} ${seat}`.trim()
+    });
+  }
+  return out;
+}
+
 function parseBasketFromApiJson(j, currentUrl) {
   try {
     if (!j || j.isError !== false) return null;
@@ -21,6 +48,7 @@ function parseBasketFromApiJson(j, currentUrl) {
 
     const products = (v && Array.isArray(v.basketBookingProducts)) ? v.basketBookingProducts : null;
     const p0 = products && products.length ? products[0] : null;
+    const heldSeats = mapHeldSeatsFromProducts(products);
 
     const basket = v && v.basket ? v.basket : null;
     const basketId = basket?.basketId || '';
@@ -48,7 +76,9 @@ function parseBasketFromApiJson(j, currentUrl) {
       inBasket: true,
       url: currentUrl || '',
       basketId: basketId ? String(basketId) : '',
-      remainingTime
+      remainingTime,
+      itemCount: products && products.length ? products.length : 0,
+      heldSeats
     };
   } catch {
     return null;
@@ -283,6 +313,310 @@ async function robustSeatClick(page, x, y) {
   }
 }
 
+/**
+ * Passo koltuk seçim ekranı: bilet tipi satırında adet `<select>` (çoğunlukla `form-control`, 1–5/10) olabiliyor.
+ * DOM sürümüne göre sınıflı kapsayıcı değişebildiği için aday listesi geniş; üyelik/kategori selectleri elenir.
+ * Angular gerçek kullanıcı etkileşimi bekleyebilir: önce Puppeteer ile tıkla + selectedIndex, gerekirse evaluate fallback.
+ */
+const PASSO_QTY_SELECT_CANDIDATE_CSS = [
+  '.ticket-type-item-button select.form-control',
+  '.ticket-type-title select.form-control',
+  '.ticket-type-wrapped select.form-control',
+  '.ticket-type-item select.form-control',
+  '.ticket-type-row select.form-control',
+  '[class*="ticket-type"] select.form-control',
+  '.ticket-type-wrapped select',
+  '.ticket-type-item-button select',
+  '.ticket-type-title select',
+  'select.form-control'
+].join(', ');
+
+/** Kategori/blok seçildikten sonra Passo adet alanını geç basıyor; kısa süre yoksa poll et. */
+const PASSO_QTY_SELECT_APPEAR_MAX_MS = 12000;
+const PASSO_QTY_SELECT_APPEAR_POLL_MS = 280;
+
+async function applyTicketQuantityDropdown(page, context, desiredCount, options = null) {
+  const want = Math.max(1, Math.min(10, Number(desiredCount) || 1));
+  if (want <= 1) return { ok: false, reason: 'single_ticket' };
+  if (!page) return { ok: false, reason: 'no_page' };
+  const opt = options && typeof options === 'object' ? options : {};
+  const appearBudget =
+    want > 1
+      ? Number.isFinite(Number(opt.appearMaxMs)) && Number(opt.appearMaxMs) >= 0
+        ? Number(opt.appearMaxMs)
+        : PASSO_QTY_SELECT_APPEAR_MAX_MS
+      : 0;
+  try {
+    const appearDeadline = Date.now() + appearBudget;
+    let meta = null;
+    let waitedForAppearMs = 0;
+    let appearPollExhausted = false;
+    do {
+      meta = await page.evaluate(
+        (maxWant, selCss) => {
+        const isVisible = (el) => {
+          if (!el) return false;
+          const r = el.getBoundingClientRect?.();
+          if (!r || r.width < 2 || r.height < 2) return false;
+          const st = window.getComputedStyle(el);
+          if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || '1') === 0)) return false;
+          return true;
+        };
+
+        const isMembershipSelect = (s) => {
+          const opts = Array.from(s.options || []);
+          return opts.some((o) => /üyelik|kampanya/i.test(o.textContent || ''));
+        };
+
+        /** Kategori/angular value ("277: Object") ile karışmasın: sadece gerçek adet UI'si (1, 2, "3 Adet", value="3"). */
+        const parseQuantityOption = (o) => {
+          if (!o) return NaN;
+          const txt = String(o.textContent || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (/^\d+$/.test(txt)) {
+            const n = parseInt(txt, 10);
+            if (n >= 1 && n <= 15) return n;
+          }
+          const mAdet = txt.match(/^(\d+)\s*adet\b/i);
+          if (mAdet) {
+            const n = parseInt(mAdet[1], 10);
+            if (n >= 1 && n <= 15) return n;
+          }
+          const val = String(o.value || '').trim();
+          if (/^\d+$/.test(val)) {
+            const n = parseInt(val, 10);
+            if (n >= 1 && n <= 15) return n;
+          }
+          return NaN;
+        };
+
+        // Sıra page.$$(selCss) ile aynı olmalı; indeks ham listede (filtre sonrası yeniden sıra yok).
+        const rawList = Array.from(document.querySelectorAll(selCss));
+
+        let bestIdx = -1;
+        let bestNums = [];
+        for (let i = 0; i < rawList.length; i++) {
+          const sel = rawList[i];
+          if (!isVisible(sel) || isMembershipSelect(sel)) continue;
+          const nums = Array.from(sel.options || [])
+            .map(parseQuantityOption)
+            .filter((n) => Number.isFinite(n) && n >= 1 && n <= 15);
+          const uniq = [...new Set(nums)].sort((a, b) => a - b);
+          if (uniq.length < 2) continue;
+          const maxOpt = uniq[uniq.length - 1];
+          if (maxOpt > 10) continue;
+          if (bestIdx < 0 || maxOpt > bestNums[bestNums.length - 1]) {
+            bestIdx = i;
+            bestNums = uniq;
+          }
+        }
+
+        if (bestIdx < 0 || bestNums.length < 2) {
+          return { ok: false, reason: 'no_quantity_select' };
+        }
+
+        const bestSel = rawList[bestIdx];
+        const maxAvail = bestNums[bestNums.length - 1];
+        const targetNum = Math.min(maxWant, maxAvail);
+        const opt = Array.from(bestSel.options || []).find((o) => parseQuantityOption(o) === targetNum);
+        if (!opt) {
+          return { ok: false, reason: 'option_not_found', targetNum, bestNums };
+        }
+
+        return {
+          ok: true,
+          pick: targetNum,
+          requested: maxWant,
+          maxAvailable: maxAvail,
+          capped: maxWant > maxAvail,
+          candidateIndex: bestIdx,
+          optionElementIndex: opt.index,
+          optionValue: String(opt.value != null ? opt.value : ''),
+          currentValue: String(bestSel.value != null ? bestSel.value : ''),
+          currentNum: parseQuantityOption(bestSel.options?.[bestSel.selectedIndex] || null),
+          selectedMatchesTarget: parseQuantityOption(bestSel.options?.[bestSel.selectedIndex] || null) === targetNum
+        };
+      },
+      want,
+      PASSO_QTY_SELECT_CANDIDATE_CSS
+      );
+      if (meta && (meta.ok || meta.reason !== 'no_quantity_select')) break;
+      if (Date.now() >= appearDeadline) {
+        if (meta && meta.reason === 'no_quantity_select') appearPollExhausted = true;
+        break;
+      }
+      await delay(PASSO_QTY_SELECT_APPEAR_POLL_MS);
+      waitedForAppearMs += PASSO_QTY_SELECT_APPEAR_POLL_MS;
+    } while (true);
+
+    if (waitedForAppearMs > 0) {
+      if (meta?.ok) logger.info(`seatPick:${context}:ticket_qty_dropdown_appeared_after_wait`, { waitedMs: waitedForAppearMs });
+      else if (meta?.reason === 'no_quantity_select') {
+        logger.info(`seatPick:${context}:ticket_qty_dropdown_wait_exhausted`, { waitedMs: waitedForAppearMs });
+      }
+    }
+
+    if (!meta || !meta.ok) {
+      logger.info(`seatPick:${context}:ticket_qty_dropdown_skip`, { ...(meta || {}), appearPollExhausted, waitedForAppearMs });
+      return { ok: false, ...(meta || {}), appearPollExhausted: !!appearPollExhausted, waitedForAppearMs };
+    }
+
+    if (opt.readOnly) {
+      logger.info(`seatPick:${context}:ticket_qty_dropdown_read`, { ...meta, via: 'read_only' });
+      return {
+        ok: true,
+        pick: meta.pick,
+        requested: meta.requested,
+        maxAvailable: meta.maxAvailable,
+        capped: meta.capped,
+        currentValue: meta.currentValue,
+        currentNum: meta.currentNum,
+        selectedMatchesTarget: meta.selectedMatchesTarget,
+        changed: false
+      };
+    }
+
+    if (meta.selectedMatchesTarget) {
+      logger.info(`seatPick:${context}:ticket_qty_dropdown`, { ...meta, via: 'already_selected' });
+      return {
+        ok: true,
+        pick: meta.pick,
+        requested: meta.requested,
+        maxAvailable: meta.maxAvailable,
+        capped: meta.capped,
+        currentValue: meta.currentValue,
+        currentNum: meta.currentNum,
+        selectedMatchesTarget: true,
+        changed: false
+      };
+    }
+
+    const selector = PASSO_QTY_SELECT_CANDIDATE_CSS;
+    const handles = await page.$$(selector);
+    const h = handles[meta.candidateIndex];
+    if (h) {
+      try {
+        await h.scrollIntoView();
+        await delay(60);
+        try {
+          await h.click({ delay: 50 });
+        } catch {}
+        const optVal = meta.optionValue != null ? String(meta.optionValue).trim() : '';
+        if (optVal !== '') {
+          try {
+            await h.select(optVal);
+          } catch {
+            await h.evaluate((el, idx) => {
+              el.selectedIndex = idx;
+            }, meta.optionElementIndex);
+          }
+        } else {
+          await h.evaluate((el, idx) => {
+            el.selectedIndex = idx;
+          }, meta.optionElementIndex);
+        }
+        await h.evaluate((el) => {
+          try {
+            el.focus();
+          } catch {}
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          try {
+            el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+          } catch {
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          try {
+            el.dispatchEvent(new Event('ngModelChange', { bubbles: true }));
+          } catch {}
+          try {
+            el.blur();
+          } catch {}
+        });
+      } catch (pe) {
+        logger.warn(`seatPick:${context}:ticket_qty_dropdown_puppeteer_fallback`, { error: pe?.message || String(pe) });
+        await page.evaluate(
+          ({ idx, optIdx, selCss }) => {
+            const sels = Array.from(document.querySelectorAll(selCss));
+            const el = sels[idx];
+            if (!el || !el.options || !el.options[optIdx]) return;
+            const opt = el.options[optIdx];
+            el.selectedIndex = opt.index;
+            el.value = opt.value;
+            try {
+              el.focus();
+            } catch {}
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            try {
+              el.dispatchEvent(new Event('ngModelChange', { bubbles: true }));
+            } catch {}
+          },
+          { idx: meta.candidateIndex, optIdx: meta.optionElementIndex, selCss: PASSO_QTY_SELECT_CANDIDATE_CSS }
+        );
+      }
+    } else {
+      await page.evaluate(
+        ({ idx, optIdx, selCss }) => {
+          const sels = Array.from(document.querySelectorAll(selCss));
+          const el = sels[idx];
+          if (!el || !el.options || !el.options[optIdx]) return;
+          const opt = el.options[optIdx];
+          el.selectedIndex = opt.index;
+          el.value = opt.value;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          try {
+            el.dispatchEvent(new Event('ngModelChange', { bubbles: true }));
+          } catch {}
+        },
+        { idx: meta.candidateIndex, optIdx: meta.optionElementIndex, selCss: PASSO_QTY_SELECT_CANDIDATE_CSS }
+      );
+    }
+
+    logger.info(`seatPick:${context}:ticket_qty_dropdown`, { ...meta, via: 'puppeteer_or_eval' });
+    await delay(750);
+    return { ok: true, pick: meta.pick, requested: meta.requested, maxAvailable: meta.maxAvailable, capped: meta.capped, changed: true };
+  } catch (e) {
+    logger.warn(`seatPick:${context}:ticket_qty_dropdown_failed`, { error: e?.message || String(e) });
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
+/** Adet değişince Passo bazen mevcut koltuk seçimini yenilemeyi bekler (tek koltuk × N bilet). Tek gerçek mouse tıklaması (çift tık seçimi kaldırmasın). */
+async function reclickActiveSeatAfterQuantityChange(page, context) {
+  try {
+    const pt = await page.evaluate(() => {
+      const rect =
+        document.querySelector('svg.seatmap-svg g.seatActive rect') ||
+        document.querySelector('svg.seatmap-svg g.selected rect') ||
+        document.querySelector('circle.seat-circle.selected');
+      if (!rect) return null;
+      try {
+        rect.scrollIntoView({ block: 'center', inline: 'center' });
+      } catch {}
+      const r = rect.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      return { x, y };
+    });
+    if (pt && page.mouse) {
+      try {
+        await page.mouse.move(pt.x, pt.y);
+        await page.mouse.click(pt.x, pt.y, { delay: 40 });
+      } catch {}
+      logger.info(`seatPick:${context}:ticket_qty_reclick_active_seat`, { x: pt.x, y: pt.y });
+      await delay(450);
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 async function ensureSingleProductQuantity(page, context) {
   if (!page) return { attempted: false, changed: false };
   try {
@@ -349,6 +683,12 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
   const categorySelectionMode = options.categorySelectionMode || 'legacy';
   const ticketCount = Math.max(1, Math.min(10, Number(options.ticketCount) || 1));
   const adjacentSeats = options.adjacentSeats === true;
+  const quantitySelectionModeRaw = String(options.quantitySelectionMode || '').trim().toLowerCase();
+  const quantitySelectionMode =
+    quantitySelectionModeRaw === 'beforecategory' || quantitySelectionModeRaw === 'aftercategory'
+      ? 'outsideSeat'
+      : 'duringSeat';
+  let lastBasketGuardWarnAt = 0;
 
   const extendDeadline = (ms, reason) => {
     try {
@@ -362,6 +702,51 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
     } catch {}
   };
 
+  const canTreatBasketAsSuccess = async (basketData, source) => {
+    if (!basketData) return false;
+    if (ticketCount <= 1) return true;
+    if (quantitySelectionMode !== 'outsideSeat') return true;
+
+    const ddState = await applyTicketQuantityDropdown(page, `${context}:${source || 'basketGuard'}`, ticketCount, {
+      appearMaxMs: 0,
+      readOnly: true
+    }).catch(() => null);
+
+    if (ddState?.ok) {
+      const need = ticketCount;
+      const maxAv = Number(ddState.maxAvailable) || need;
+      const targetQty = Math.min(need, maxAv);
+      const gotQty = Number(ddState.currentNum) || 0;
+      const qtyReady = ddState.selectedMatchesTarget === true || gotQty === targetQty;
+      let selectedCountNow = 0;
+      try {
+        selectedCountNow = await page.evaluate((sel) => document.querySelectorAll(sel).length, SELECTED_SEAT_SELECTOR).catch(() => 0);
+      } catch {}
+      const basketItemCount = Math.max(0, Number(basketData?.itemCount) || 0);
+      const seatCountReady = selectedCountNow >= ticketCount || basketItemCount >= ticketCount;
+      const ready = qtyReady && seatCountReady;
+      if (!ready) {
+        const nowWarn = Date.now();
+        if ((nowWarn - lastBasketGuardWarnAt) > 2500) {
+          lastBasketGuardWarnAt = nowWarn;
+          logger.warn(`seatPick:${context}:basket_success_blocked_incomplete_multi`, {
+            source: source || 'basketGuard',
+            ticketCount,
+            gotQty,
+            targetQty,
+            selectedCountNow,
+            basketItemCount,
+            basketUrl: basketData?.url || null,
+            inBasket: basketData?.inBasket === true
+          });
+        }
+      }
+      return ready;
+    }
+
+    return false;
+  };
+
   let needsMoreCount = 0;
 
   const basketWatcher = startBasketNetworkWatcher(page, context);
@@ -369,6 +754,10 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
   try {
 
   let lastDiagAt = 0;
+  /** Çoklu bilet: adet select'i mümkünse koltuk tıklanmadan bir kez uygula (Angular modeli için). */
+  let ticketQtyPrimed = options.ticketQuantityPrimed === true;
+  /** Bir kez tam süre bekleyip hâlâ adet select yoksa döngüde her seferinde 12sn harcamayı kes */
+  let skipQtyAppearLongWait = false;
 
   const diag = async (label) => {
     const now = Date.now();
@@ -832,7 +1221,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
 
   while (Date.now() < end) {
       const nw = basketWatcher.getLatest();
-      if (nw && nw.data) return nw.data;
+      if (nw && nw.data && await canTreatBasketAsSuccess(nw.data, 'networkLatest')) return nw.data;
       await ensureOnSeatPage('loop');
       await diag('loop');
 
@@ -929,9 +1318,9 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
           // If the map looks sold-out, reselecting blocks is slow (loader), and we can miss seats
           // that are freed from other users' baskets. Poll the current seatmap for a short window.
           if (soldOutLike) {
-            const snipeMaxMs = Number(cfg?.TIMEOUTS?.SEAT_SNIPE_MAX_MS || 0) || 0;
-            const pollMs = Number(cfg?.TIMEOUTS?.SEAT_SNIPE_POLL_MS || 0) || 350;
-            const roamMs = Number(cfg?.TIMEOUTS?.SVG_CATEGORY_ROAM_MS || 0) || 0;
+            const snipeMaxMs = Number(getCfg()?.TIMEOUTS?.SEAT_SNIPE_MAX_MS || 0) || 0;
+            const pollMs = Number(getCfg()?.TIMEOUTS?.SEAT_SNIPE_POLL_MS || 0) || 350;
+            const roamMs = Number(getCfg()?.TIMEOUTS?.SVG_CATEGORY_ROAM_MS || 0) || 0;
             if (snipeMaxMs > 0) {
               const until = Date.now() + snipeMaxMs;
               let lastRoamAt = 0;
@@ -1178,8 +1567,8 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
       // Continue or run recover loops; instead wait for basket/route to settle.
       if (postContinueVerifyUntil && Date.now() < postContinueVerifyUntil) {
         const b = await readBasketData(page);
-        if (b && (b.row && b.seat)) return b;
-        if (b && b.inBasket && isBasketLikeUrl(b.url)) return b;
+        if (b && (b.row && b.seat) && await canTreatBasketAsSuccess(b, 'postContinueVerify')) return b;
+        if (b && b.inBasket && isBasketLikeUrl(b.url) && await canTreatBasketAsSuccess(b, 'postContinueVerify')) return b;
         await delay(400);
         continue;
       }
@@ -1198,6 +1587,45 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
             try {
               await ensureTurnstileFn(page, email, `seatPick:${context}:postContinueRetry${postContinueRetryCount}`, { background: true });
             } catch {}
+          }
+          if (ticketCount > 1) {
+            let ddR = null;
+            try {
+              ddR = await applyTicketQuantityDropdown(page, context, ticketCount, {
+                appearMaxMs: skipQtyAppearLongWait ? 0 : PASSO_QTY_SELECT_APPEAR_MAX_MS,
+                readOnly: quantitySelectionMode === 'outsideSeat'
+              });
+              if (ddR && ddR.ok) {
+                if (quantitySelectionMode === 'duringSeat') {
+                  await reclickActiveSeatAfterQuantityChange(page, context);
+                }
+                const needR = ticketCount;
+                const maxAvR = Number(ddR.maxAvailable) || needR;
+                const targetQtyR = Math.min(needR, maxAvR);
+                const gotR = quantitySelectionMode === 'outsideSeat'
+                  ? (Number(ddR.currentNum) || 0)
+                  : (Number(ddR.pick) || 0);
+                const readyR = quantitySelectionMode === 'outsideSeat'
+                  ? ddR.selectedMatchesTarget === true
+                  : gotR === targetQtyR;
+                if (!readyR) {
+                  logger.warn(`seatPick:${context}:post_continue_retry_blocked_qty`, { gotR, targetQtyR, ticketCount });
+                  await delay(400);
+                  continue;
+                }
+              } else {
+                const gsR = await getSelectionState();
+                if ((gsR?.selectedCount || 0) < ticketCount) {
+                  logger.warn(`seatPick:${context}:post_continue_retry_blocked_seats`, { selectedCount: gsR?.selectedCount, ticketCount });
+                  await delay(400);
+                  continue;
+                }
+              }
+            } catch {
+              await delay(400);
+              continue;
+            }
+            if (ddR?.appearPollExhausted) skipQtyAppearLongWait = true;
           }
           const r = await clickContinueInsidePage(page);
           logger.info(`seatPick:${context}:post_continue_retry_click`, { clicked: !!r, btnInfo: r?.btnInfo || null });
@@ -1282,6 +1710,16 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                   if (hasDropdown) {
                     logger.info(`seatPick:${context}:seatmap_recover_reselect_category`, { cats: roamCategoryTexts });
                     await chooseCategoryFn(page, roamCategoryTexts[0], roamCategoryTexts[1] || '', categorySelectionMode);
+                    if (quantitySelectionMode === 'outsideSeat' && ticketCount > 1) {
+                      const qtyAfterReselect = await applyTicketQuantityDropdown(page, context, ticketCount, {
+                        appearMaxMs: PASSO_QTY_SELECT_APPEAR_MAX_MS
+                      });
+                      ticketQtyPrimed = qtyAfterReselect?.ok === true;
+                      skipQtyAppearLongWait = !!qtyAfterReselect?.appearPollExhausted;
+                    } else {
+                      ticketQtyPrimed = false;
+                      skipQtyAppearLongWait = false;
+                    }
                     extendDeadline(8000, 'category_reselect_after_captcha');
                   }
                 } catch (e) {
@@ -1350,6 +1788,16 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                   if (hasDropdown) {
                     logger.info(`seatPick:${context}:seatmap_recoverNav_reselect_category`, { cats: roamCategoryTexts });
                     await chooseCategoryFn(page, roamCategoryTexts[0], roamCategoryTexts[1] || '', categorySelectionMode);
+                    if (quantitySelectionMode === 'outsideSeat' && ticketCount > 1) {
+                      const qtyAfterReselect = await applyTicketQuantityDropdown(page, context, ticketCount, {
+                        appearMaxMs: PASSO_QTY_SELECT_APPEAR_MAX_MS
+                      });
+                      ticketQtyPrimed = qtyAfterReselect?.ok === true;
+                      skipQtyAppearLongWait = !!qtyAfterReselect?.appearPollExhausted;
+                    } else {
+                      ticketQtyPrimed = false;
+                      skipQtyAppearLongWait = false;
+                    }
                     extendDeadline(8000, 'category_reselect_after_nav');
                   }
                 } catch (e) {
@@ -1370,8 +1818,20 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
 
       // zaten sepette mi? (seat selection sayfasındaki yanlış pozitifleri engelle)
       const b0 = await readBasketData(page);
-      if (b0 && (b0.row && b0.seat)) return b0;
-      if (b0 && b0.inBasket && isBasketLikeUrl(b0.url)) return b0;
+      if (b0 && (b0.row && b0.seat) && await canTreatBasketAsSuccess(b0, 'loopStart')) return b0;
+      if (b0 && b0.inBasket && isBasketLikeUrl(b0.url) && await canTreatBasketAsSuccess(b0, 'loopStart')) return b0;
+
+      if (quantitySelectionMode === 'duringSeat' && ticketCount > 1 && !ticketQtyPrimed) {
+        const earlyDd = await applyTicketQuantityDropdown(page, context, ticketCount, {
+          appearMaxMs: skipQtyAppearLongWait ? 0 : PASSO_QTY_SELECT_APPEAR_MAX_MS
+        });
+        if (earlyDd?.ok) {
+          ticketQtyPrimed = true;
+          const hasSelEarly = await page.evaluate((sel) => !!document.querySelector(sel), SELECTED_SEAT_SELECTOR);
+          if (hasSelEarly) await reclickActiveSeatAfterQuantityChange(page, context);
+        }
+        if (earlyDd?.appearPollExhausted) skipQtyAppearLongWait = true;
+      }
 
       // seçili koltuk varsa tekrar TIKLAMA YOK
       const hasSelected = await page.evaluate((sel) => !!document.querySelector(sel), SELECTED_SEAT_SELECTOR);
@@ -1520,48 +1980,124 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
           continue;
       }
 
+      /** Çoklu bilet: sepete devam ancak dropdown hedef adedi onaylı veya yeterli koltuk seçili iken */
+      let multiTicketReadyForContinue = ticketCount <= 1;
+
+      const tryCompleteMultiTicketSelection = async (currentSelected) => {
+        const normalizedSelected = Math.max(0, Number(currentSelected) || 0);
+        const needed = ticketCount - normalizedSelected;
+        if (needed <= 0) {
+          return { finalCount: normalizedSelected, addedCount: 0, ready: normalizedSelected >= ticketCount };
+        }
+
+        logger.info(`seatPick:${context}:multi_ticket_picking`, {
+          ticketCount,
+          currentSelected: normalizedSelected,
+          needed,
+          adjacentSeats
+        });
+
+        let addedCount = 0;
+        for (let s = 0; s < needed; s++) {
+          let added = false;
+          if (adjacentSeats) {
+            added = await tryPickAdjacentSeat();
+            if (!added) {
+              logger.warn(`seatPick:${context}:adjacent_not_found_fallback_random`, { attempt: s + 1 });
+              added = await tryPickAdditionalSeat();
+            }
+          } else {
+            added = await tryPickAdditionalSeat();
+          }
+
+          if (added) {
+            addedCount++;
+            await delay(300);
+          } else {
+            logger.warn(`seatPick:${context}:additional_seat_failed`, { attempt: s + 1, needed, addedSoFar: addedCount, adjacentSeats });
+            await delay(200);
+            const retry = adjacentSeats ? await tryPickAdjacentSeat() : await tryPickAdditionalSeat();
+            if (!retry && adjacentSeats) {
+              const retryRandom = await tryPickAdditionalSeat();
+              if (retryRandom) {
+                addedCount++;
+                await delay(300);
+                continue;
+              }
+            }
+            if (retry) {
+              addedCount++;
+              await delay(300);
+            }
+          }
+        }
+
+        const finalSelected = await getSelectionState();
+        const finalCount = Math.max(0, Number(finalSelected?.selectedCount) || 0);
+        const ready = finalCount >= ticketCount;
+        logger.info(`seatPick:${context}:multi_ticket_result`, {
+          ticketCount,
+          addedCount,
+          finalSelectedCount: finalCount,
+          adjacentSeats,
+          multiTicketReadyForContinue: ready
+        });
+        return { finalCount, addedCount, ready };
+      };
+
       if (selectedNow || lockedSelected) {
         const selState = await getSelectionState();
         logger.info(`seatPick:${context}:selection_before_continue`, { selectedNow, lockedSelected, selState, ticketCount });
 
-        // ticketCount > 1 ise ek koltuklar seç (Continue'a basmadan önce)
+        // ticketCount > 1: önce bilet tipi satırındaki adet dropdown (Passo), yoksa ek koltuk tıkla
         if (ticketCount > 1) {
-          const currentSelected = selState?.selectedCount || 1;
-          const needed = ticketCount - currentSelected;
-          if (needed > 0) {
-            logger.info(`seatPick:${context}:multi_ticket_picking`, { ticketCount, currentSelected, needed, adjacentSeats });
-            let addedCount = 0;
-            for (let s = 0; s < needed; s++) {
-              // adjacentSeats modunda önce yanyana dene, bulamazsa serbest fallback
-              let added = false;
-              if (adjacentSeats) {
-                added = await tryPickAdjacentSeat();
-                if (!added) {
-                  logger.warn(`seatPick:${context}:adjacent_not_found_fallback_random`, { attempt: s + 1 });
-                  added = await tryPickAdditionalSeat();
-                }
-              } else {
-                added = await tryPickAdditionalSeat();
-              }
-              if (added) {
-                addedCount++;
-                await delay(300);
-              } else {
-                logger.warn(`seatPick:${context}:additional_seat_failed`, { attempt: s + 1, needed, addedSoFar: addedCount, adjacentSeats });
-                await delay(200);
-                // Retry once more for this slot
-                const retry = adjacentSeats ? await tryPickAdjacentSeat() : await tryPickAdditionalSeat();
-                if (!retry && adjacentSeats) {
-                  const retryRandom = await tryPickAdditionalSeat();
-                  if (retryRandom) { addedCount++; await delay(300); continue; }
-                }
-                if (retry) { addedCount++; await delay(300); }
-              }
+          const dd = await applyTicketQuantityDropdown(page, context, ticketCount, {
+            appearMaxMs: skipQtyAppearLongWait ? 0 : PASSO_QTY_SELECT_APPEAR_MAX_MS,
+            readOnly: quantitySelectionMode === 'outsideSeat'
+          });
+          if (dd && dd.ok) {
+            if (quantitySelectionMode === 'duringSeat') {
+              await reclickActiveSeatAfterQuantityChange(page, context);
             }
-            const finalSelected = await getSelectionState();
-            logger.info(`seatPick:${context}:multi_ticket_result`, { ticketCount, addedCount, finalSelectedCount: finalSelected?.selectedCount || 0, adjacentSeats });
+            const need = ticketCount;
+            const maxAv = Number(dd.maxAvailable) || need;
+            const targetQty = Math.min(need, maxAv);
+            const got = quantitySelectionMode === 'outsideSeat'
+              ? (Number(dd.currentNum) || 0)
+              : (Number(dd.pick) || 0);
+            const selectedCount = Number(selState?.selectedCount) || 0;
+            const qtyReady = quantitySelectionMode === 'outsideSeat'
+              ? dd.selectedMatchesTarget === true || got === targetQty
+              : got === targetQty;
+            multiTicketReadyForContinue = quantitySelectionMode === 'outsideSeat'
+              ? (qtyReady && selectedCount >= ticketCount)
+              : qtyReady;
+            if (quantitySelectionMode === 'outsideSeat' && qtyReady && selectedCount < ticketCount) {
+              const fillRes = await tryCompleteMultiTicketSelection(selectedCount);
+              multiTicketReadyForContinue = fillRes.ready;
+            }
+            if (!multiTicketReadyForContinue) {
+              logger.warn(`seatPick:${context}:multi_ticket_not_ready`, {
+                need,
+                got,
+                targetQty,
+                maxAv,
+                qtyReady,
+                selectedCount
+              });
+            }
+          } else if (!dd || !dd.ok) {
+            const fillRes = await tryCompleteMultiTicketSelection(selState?.selectedCount || 0);
+            multiTicketReadyForContinue = fillRes.ready;
           }
+          if (dd?.appearPollExhausted) skipQtyAppearLongWait = true;
         }
+      }
+
+      if (ticketCount > 1 && !multiTicketReadyForContinue) {
+        logger.warn(`seatPick:${context}:continue_blocked_incomplete_multi_ticket`, { ticketCount });
+        await delay(300);
+        continue;
       }
 
       // seçiliyse DEVAM - önce turnstile token kontrolü
@@ -1668,7 +2204,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
             logger.info(`seatPick:${context}:post_continue_transition`, { transition, preUrl, curUrl: (() => { try { return page.url(); } catch { return null; } })() });
 
             const nw2 = basketWatcher.getLatest();
-            if (nw2 && nw2.data) return nw2.data;
+            if (nw2 && nw2.data && await canTreatBasketAsSuccess(nw2.data, 'postContinueNetworkLatest')) return nw2.data;
 
             // If network says basket has items, accept it as success even if UI didn't navigate.
             try {
@@ -1679,6 +2215,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                 const basket = v && v.basket ? v.basket : (j.value && j.value.basket ? j.value.basket : null);
                 const products = (j.value && Array.isArray(j.value.basketBookingProducts)) ? j.value.basketBookingProducts : null;
                 const p0 = products && products.length ? products[0] : null;
+                const heldSeats = mapHeldSeatsFromProducts(products);
                 const row = p0?.refSeatInfo_RowName ? String(p0.refSeatInfo_RowName) : '';
                 const seat = p0?.refSeatInfo_SeatName ? String(p0.refSeatInfo_SeatName) : '';
                 const tribune = p0?.tribune_Name ? String(p0.tribune_Name) : '';
@@ -1692,15 +2229,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                 const hasBasketFlag = basket?.isBasket === true;
 
                 if (hasBasketFlag || (products && products.length)) {
-                  logger.info(`seatPick:${context}:basket_from_network`, {
-                    basketId,
-                    remainingTime,
-                    seatId: seatIdFromNet,
-                    blockId: blockIdFromNet,
-                    row,
-                    seat
-                  });
-                  return {
+                  const basketFromNetwork = {
                     tribune,
                     block,
                     row,
@@ -1711,8 +2240,21 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                     inBasket: true,
                     url: (() => { try { return page.url(); } catch { return ''; } })(),
                     basketId: basketId ? String(basketId) : '',
-                    remainingTime
+                    remainingTime,
+                    itemCount: Array.isArray(products) ? products.length : 0,
+                    heldSeats
                   };
+                  if (await canTreatBasketAsSuccess(basketFromNetwork, 'networkTransition')) {
+                    logger.info(`seatPick:${context}:basket_from_network`, {
+                      basketId,
+                      remainingTime,
+                      seatId: seatIdFromNet,
+                      blockId: blockIdFromNet,
+                      row,
+                      seat
+                    });
+                    return basketFromNetwork;
+                  }
                 }
               }
             } catch {}
@@ -1777,7 +2319,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
       for (let w=0; w<20; w++){
           await ensureOnSeatPage('verify_wait');
           const data = await readBasketData(page);
-          if (data && (data.row && data.seat)) {
+          if (data && (data.row && data.seat) && await canTreatBasketAsSuccess(data, 'verifyWait')) {
             logger.info(`seatPick:${context}:basket_success`, {
               tribune: data.tribune,
               block: data.block,
@@ -1789,7 +2331,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
             });
             return data;
           }
-          if (data && data.inBasket && isBasketLikeUrl(data.url)) {
+          if (data && data.inBasket && isBasketLikeUrl(data.url) && await canTreatBasketAsSuccess(data, 'verifyWait')) {
             logger.info(`seatPick:${context}:basket_success`, {
               tribune: data.tribune,
               block: data.block,
@@ -2217,4 +2759,4 @@ async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) 
   }
 }
 
-module.exports = { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware };
+module.exports = { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware, applyTicketQuantityDropdown };
