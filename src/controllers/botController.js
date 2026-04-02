@@ -4442,6 +4442,7 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
     const UNAVAILABLE_TEXT = 'şu anda uygun bilet bulunmamaktadır';
 
     const mode = String(selectionMode || 'legacy').toLowerCase();
+    const isPageContextGone = (err) => /detached|target closed|protocol error|session closed|execution context was destroyed|cannot find context/i.test(String(err?.message || err || ''));
 
     // Scan mode: try SVG first if present, else use dropdown
     let useSvgFlow = (mode === 'svg');
@@ -5578,6 +5579,7 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
             optTexts = await page.$$eval(optSel, els => els.map(el => (el.innerText || el.textContent || '').trim()).filter(Boolean));
             options = await page.$$(optSel);
         } catch (e) {
+            if (isPageContextGone(e)) throw e;
             // Diagnostic: what's actually inside .custom-select-box after click?
             const clickDiag = await page.evaluate(() => {
                 const box = document.querySelector('.custom-select-box');
@@ -5789,6 +5791,7 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
             blocksReady = true;
             break;
         } catch (e) {
+            if (isPageContextGone(e)) throw e;
             lastBlocksDiag = await page.evaluate(() => {
                 const s = document.querySelector('select#blocks');
                 return {
@@ -6786,6 +6789,20 @@ async function startBotAfterValidation(req, res, validatedData) {
             if (e && e.code === 'RUN_KILLED') throw e;
         }
     };
+    const rethrowAsRunKilledIfNeeded = (err, label = '') => {
+        if (err && err.code === 'RUN_KILLED') throw err;
+        try {
+            const st = runStore.get(runId);
+            if (st && st.status === 'killed') {
+                const killedErr = new Error(`RUN_KILLED${label ? `:${label}` : ''}`);
+                killedErr.code = 'RUN_KILLED';
+                killedErr.cause = err;
+                throw killedErr;
+            }
+        } catch (e) {
+            if (e && e.code === 'RUN_KILLED') throw e;
+        }
+    };
 
     const finalizeToC = async () => {
         assertRunNotKilled('finalizeToC');
@@ -7262,9 +7279,61 @@ async function startBotAfterValidation(req, res, validatedData) {
     let deferredPayableTransferInFlight;
     let finalizedToCResult;
     let lastStep = 'init';
+    const decorateStepMeta = (stepKey, meta = {}) => {
+        const enriched = { ...(meta || {}) };
+        try {
+            if (!enriched.runId) enriched.runId = runId;
+            const raw = String(stepKey || '').trim();
+            let role = String(enriched.role || '').trim().toUpperCase();
+            let idx = Number.isFinite(Number(enriched.idx)) ? Number(enriched.idx) : null;
+            let pairIndex = Number.isFinite(Number(enriched.pairIndex)) ? Number(enriched.pairIndex) : null;
+
+            let m = raw.match(/^([ABC])(\d+)(?:\.|$)/i);
+            if (m) {
+                role = role || String(m[1] || '').toUpperCase();
+                if (idx == null) idx = Number(m[2]);
+                if (pairIndex == null && role !== 'C' && Number.isFinite(idx)) pairIndex = idx + 1;
+            } else {
+                m = raw.match(/^PAIR(\d+)\.([ABC])(?:\.|$)/i);
+                if (m) {
+                    if (pairIndex == null) pairIndex = Number(m[1]);
+                    role = role || String(m[2] || '').toUpperCase();
+                    if (idx == null && Number.isFinite(pairIndex) && pairIndex >= 1) idx = pairIndex - 1;
+                } else if (/^C(?:\.|$)/i.test(raw)) {
+                    role = role || 'C';
+                }
+            }
+
+            if (role) enriched.role = role;
+            if (idx != null) enriched.idx = idx;
+            if (pairIndex != null) enriched.pairIndex = pairIndex;
+
+            let resolvedEmail = String(enriched.email || '').trim();
+            if (!resolvedEmail && Number.isFinite(pairIndex) && pairIndex >= 1) {
+                const runtime = pairRuntimeByIndex.get(pairIndex) || null;
+                if (role === 'A') resolvedEmail = String(enriched.aEmail || runtime?.aCtx?.email || '').trim();
+                else if (role === 'B') resolvedEmail = String(enriched.bEmail || runtime?.bCtx?.email || '').trim();
+                else if (role === 'C') resolvedEmail = String(enriched.cEmail || getFinalizeRequest()?.cAccount?.email || '').trim();
+            }
+            if (!resolvedEmail && Number.isFinite(idx) && idx >= 0) {
+                if (role === 'A') resolvedEmail = String(enriched.aEmail || aList[idx]?.email || '').trim();
+                else if (role === 'B') resolvedEmail = String(enriched.bEmail || bList[idx]?.email || '').trim();
+            }
+            if (!resolvedEmail) {
+                if (role === 'A') resolvedEmail = String(enriched.aEmail || emailA || '').trim();
+                else if (role === 'B') resolvedEmail = String(enriched.bEmail || emailB || '').trim();
+                else if (role === 'C') resolvedEmail = String(enriched.cEmail || getFinalizeRequest()?.cAccount?.email || '').trim();
+            }
+            if (resolvedEmail && !enriched.email) enriched.email = resolvedEmail;
+            if (resolvedEmail && role === 'A' && !enriched.aEmail) enriched.aEmail = resolvedEmail;
+            if (resolvedEmail && role === 'B' && !enriched.bEmail) enriched.bEmail = resolvedEmail;
+            if (resolvedEmail && role === 'C' && !enriched.cEmail) enriched.cEmail = resolvedEmail;
+        } catch {}
+        return enriched;
+    };
     const setStep = (s, meta = {}) => {
         lastStep = s;
-        logger.info(`step:${s}`, meta);
+        logger.info(`step:${s}`, decorateStepMeta(s, meta));
     };
 
     const isActiveAPaymentCompleted = async (pairIndex) => {
@@ -7723,6 +7792,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     seatmapReady
                 };
                 } catch (e) {
+                    rethrowAsRunKilledIfNeeded(e, `${label}.prepare`);
                     audit('b_prepare_failed', { idx: i, email: acc.email, error: e?.message || String(e) }, 'warn');
                     logger.warn(`${label} başarısız — tarayıcı kapatılıyor`, { email: acc.email, error: e?.message });
                     try { if (bBrowser) { unregisterPassobotBrowser(bBrowser); await bBrowser.close().catch(() => {}); const bIdx = multiBrowsers.indexOf(bBrowser); if (bIdx >= 0) multiBrowsers.splice(bIdx, 1); } } catch {}
@@ -8065,6 +8135,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     basketArrivedAtMs
                 };
                 } catch (e) {
+                    rethrowAsRunKilledIfNeeded(e, `${label}.hold`);
                     audit('a_hold_failed', { idx: i, email: acc.email, error: e?.message || String(e) }, 'warn');
                     logger.warn(`${label} başarısız — tarayıcı kapatılıyor`, { email: acc.email, error: e?.message });
                     try { if (aBrowser) { unregisterPassobotBrowser(aBrowser); await aBrowser.close().catch(() => {}); const bIdx = multiBrowsers.indexOf(aBrowser); if (bIdx >= 0) multiBrowsers.splice(bIdx, 1); } } catch {}

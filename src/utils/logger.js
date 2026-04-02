@@ -9,6 +9,10 @@ const logsDir = path.join(process.cwd(), 'logs');
 if (!fs.existsSync(logsDir)) {
     fs.mkdirSync(logsDir, { recursive: true });
 }
+const sessionLogsDir = path.join(logsDir, 'sessions');
+if (!fs.existsSync(sessionLogsDir)) {
+    fs.mkdirSync(sessionLogsDir, { recursive: true });
+}
 
 // Hassas bilgileri maskeleme helper'ı
 const maskSensitive = (obj) => {
@@ -56,6 +60,52 @@ const logBus = new EventEmitter();
 const logContextStore = new AsyncLocalStorage();
 const LOG_BUFFER_MAX = parseInt(process.env.LOG_STREAM_BUFFER_MAX || '800', 10);
 const logBuffer = [];
+const sessionLogFiles = new Map();
+
+const safeFileToken = (value, fallback = 'session') => {
+    const cleaned = String(value || fallback)
+        .trim()
+        .replace(/[^a-zA-Z0-9._-]+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '');
+    return cleaned || fallback;
+};
+
+const formatSessionStamp = (ts) => {
+    try {
+        const d = ts ? new Date(ts) : new Date();
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        const hh = String(d.getHours()).padStart(2, '0');
+        const mi = String(d.getMinutes()).padStart(2, '0');
+        const ss = String(d.getSeconds()).padStart(2, '0');
+        const ms = String(d.getMilliseconds()).padStart(3, '0');
+        return `${yyyy}${mm}${dd}-${hh}${mi}${ss}-${ms}`;
+    } catch {
+        return 'unknown-time';
+    }
+};
+
+const getSessionLogFile = (runId, ts) => {
+    const key = String(runId || '').trim();
+    if (!key) return null;
+    if (sessionLogFiles.has(key)) return sessionLogFiles.get(key);
+    const filename = `${formatSessionStamp(ts)}-${safeFileToken(key, 'run')}.log`;
+    const filepath = path.join(sessionLogsDir, filename);
+    sessionLogFiles.set(key, filepath);
+    return filepath;
+};
+
+const appendSessionLog = (entry) => {
+    try {
+        const runId = String(entry?.runId || '').trim();
+        if (!runId) return;
+        const filepath = getSessionLogFile(runId, entry?.ts);
+        if (!filepath) return;
+        fs.appendFile(filepath, `${JSON.stringify(entry)}\n`, () => {});
+    } catch {}
+};
 
 const getActiveLogContext = () => {
     try { return logContextStore.getStore() || null; } catch { return null; }
@@ -75,6 +125,7 @@ const pushLog = (entry) => {
         logBuffer.push(entry);
         while (logBuffer.length > LOG_BUFFER_MAX) logBuffer.shift();
     } catch {}
+    try { appendSessionLog(entry); } catch {}
     try { logBus.emit('log', entry); } catch {}
 };
 
@@ -214,6 +265,15 @@ logger.runWithContext = (context, fn) => {
 };
 
 logger.getContext = () => getActiveLogContext();
+logger.getSessionLogFile = (runId) => {
+    try {
+        const key = String(runId || '').trim();
+        return key ? (sessionLogFiles.get(key) || null) : null;
+    } catch {
+        return null;
+    }
+};
+logger.getSessionLogsDir = () => sessionLogsDir;
 
 module.exports = logger;
 

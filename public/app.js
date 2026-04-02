@@ -648,42 +648,225 @@ async function killSessions() {
   }
 }
 
+function formatSeatDetailsFromMeta(m) {
+  const src = m?.seatInfo || m?.seatA || m?.seatB || m || {};
+  const parts = [];
+  if (src.combined) return ` (${src.combined})`;
+  if (src.tribune) parts.push(`Tribün: ${src.tribune}`);
+  if (src.block || src.blockText || src.blockName) parts.push(`Blok: ${src.block || src.blockText || src.blockName}`);
+  if (src.categoryText || src.categoryName) parts.push(`Kat: ${src.categoryText || src.categoryName}`);
+  if (src.row || src.rowNumber) parts.push(`Sıra: ${src.row || src.rowNumber}`);
+  if (src.seat || src.seatNumber || src.seatNum) parts.push(`Koltuk: ${src.seat || src.seatNumber || src.seatNum}`);
+  return parts.length > 0 ? ` (${parts.join(', ')})` : '';
+}
+
+function parseStepMessage(rawMessage) {
+  const raw = String(rawMessage || '').trim();
+  const match = raw.match(/^step:(.+)$/i);
+  if (!match) return null;
+  const body = String(match[1] || '').trim();
+  const parts = body.split('.').filter(Boolean);
+  if (!parts.length) return null;
+  const first = parts[0] || '';
+  let role = '';
+  let idx = null;
+  let pairIndex = null;
+  let stageParts = parts.slice(1);
+
+  let m = first.match(/^([ABC])(\d+)$/i);
+  if (m) {
+    role = String(m[1] || '').toUpperCase();
+    idx = Number(m[2]);
+    if (role !== 'C' && Number.isFinite(idx)) pairIndex = idx + 1;
+  } else {
+    m = first.match(/^PAIR(\d+)$/i);
+    if (m) {
+      pairIndex = Number(m[1]);
+      role = String(parts[1] || '').toUpperCase();
+      if (Number.isFinite(pairIndex)) idx = pairIndex - 1;
+      stageParts = parts.slice(2);
+    } else if (/^C$/i.test(first)) {
+      role = 'C';
+      idx = 0;
+    } else if (/^MULTI$/i.test(first)) {
+      role = 'MULTI';
+      stageParts = parts.slice(1);
+    } else if (/^B$/i.test(first)) {
+      role = 'B';
+      idx = 0;
+    } else if (/^A$/i.test(first)) {
+      role = 'A';
+      idx = 0;
+    }
+  }
+
+  return {
+    raw,
+    body,
+    role,
+    idx,
+    pairIndex,
+    stageKey: stageParts.join('.'),
+  };
+}
+
+function formatStatusActor(stepInfo, meta = {}) {
+  if (!stepInfo) return '';
+  const roleNames = {
+    A: 'Ana hesap',
+    B: 'Tutucu hesap',
+    C: 'C hesabı',
+    MULTI: 'Çoklu akış',
+  };
+  const roleLabel = roleNames[stepInfo.role] || '';
+  const accountNumber = Number.isFinite(Number(meta?.idx)) ? Number(meta.idx) + 1 : (Number.isFinite(stepInfo.idx) ? stepInfo.idx + 1 : null);
+  const pairIndex = Number.isFinite(Number(meta?.pairIndex)) ? Number(meta.pairIndex) : stepInfo.pairIndex;
+  const email = String(meta?.email || meta?.aEmail || meta?.bEmail || meta?.cEmail || '').trim();
+  const bits = [];
+  if (Number.isFinite(pairIndex) && pairIndex >= 1) bits.push(`Akış #${pairIndex}`);
+  if (roleLabel) {
+    if (stepInfo.role === 'A' || stepInfo.role === 'B') bits.push(`${roleLabel} #${accountNumber || 1}`);
+    else bits.push(roleLabel);
+  }
+  if (email) bits.push(email);
+  return bits.join(' · ');
+}
+
+function compactStepStageLabel(stageKey = '') {
+  const key = String(stageKey || '').toLowerCase();
+  const map = {
+    'afirst.start': 'çoklu akış başlatıldı',
+    'afirst.done': 'çoklu akış ilk hazırlığı tamamlandı',
+    'a.hold.start': 'ana hesaplar koltuk aramaya başladı',
+    'a.hold.done': 'ana hesapların ilk koltuk araması tamamlandı',
+    'b.prepare.start': 'tutucu hesap hazırlığı başladı',
+    'b.prepare.done': 'tutucu hesap hazırlığı tamamlandı',
+    'launchandlogin.start': 'giriş denemesi başladı',
+    'launchandlogin.done': 'giriş yapıldı',
+    'gotoevent.start': 'etkinlik sayfasına gidiliyor',
+    'gotoevent.done': 'etkinlik sayfası açıldı',
+    'clickbuy.start': 'SATIN AL adımı başlatıldı',
+    'clickbuy.done': 'SATIN AL adımı tamamlandı',
+    'postbuy.ensureurl.start': 'koltuk seçimi sayfası doğrulanıyor',
+    'postbuy.ensureurl.done': 'koltuk seçimi sayfası doğrulandı',
+    'postbuy.relogincheck.start': 'oturum kontrolü yapılıyor',
+    'postbuy.relogincheck.done': 'oturum kontrolü tamamlandı',
+    'turnstile.ensure.start': 'captcha/turnstile hazırlanıyor',
+    'turnstile.ensure.done': 'captcha/turnstile hazır',
+    'categoryblock.select.start': 'kategori ve blok aranıyor',
+    'categoryblock.select.done': 'kategori ve blok seçildi',
+    'prerelease.categoryblock.start': 'ön hazırlıkta kategori/blok ayarlanıyor',
+    'prerelease.seatmap.start': 'ön hazırlıkta koltuk haritası açılıyor',
+    'seat.pickrandom.start': 'koltuk arama başladı',
+    'seat.pickrandom.done': 'koltuk seçimi tamamlandı',
+    'payment.tcassign.start': 'TC tanımlama başladı',
+    'payment.tcassign.done': 'TC tanımlama tamamlandı',
+    'payment.devamtoodeme.start': 'ödeme sayfasına geçiliyor',
+    'payment.devamtoodeme.done': 'ödeme sayfasına geçiş tamamlandı',
+    'payment.dismissinfomodal.start': 'uyarı modalları kontrol ediliyor',
+    'payment.dismissinfomodal.done': 'uyarı modalları kapatıldı',
+    'payment.invoicetc.start': 'fatura formu dolduruluyor',
+    'payment.invoicetc.done': 'fatura formu tamamlandı',
+    'payment.agreements.start': 'sözleşme onayları işaretleniyor',
+    'payment.agreements.done': 'sözleşme onayları tamamlandı',
+    'payment.iframefill.start': 'kart formu dolduruluyor',
+    'payment.iframefill.done': 'kart formu dolduruldu',
+    'clickcontinue.start': 'sepette devam adımı başlatıldı',
+    'clickcontinue.done': 'sepette devam adımı tamamlandı',
+    'seatmap.ensure.start': 'koltuk haritası hazırlanıyor',
+    'seatmap.ensure.done': 'koltuk haritası hazır',
+    'afterrelease.captcha.ensure.start': 'release sonrası captcha hazırlanıyor',
+    'afterrelease.captcha.ensure.done': 'release sonrası captcha hazır',
+    'afterrelease.waittoken.start': 'release sonrası token bekleniyor',
+    'afterrelease.waittoken.done': 'release sonrası token alındı',
+    'turnstile.prerelease.waitmount.start': 'pre-release turnstile mount bekleniyor',
+    'turnstile.prerelease.waitmount.done': 'pre-release turnstile mount tamam',
+    'turnstile.prerelease.ensure.start': 'pre-release captcha çözülüyor',
+    'turnstile.prerelease.ensure.done': 'pre-release captcha hazır',
+    'turnstile.prerelease.waittoken.start': 'pre-release token bekleniyor',
+    'turnstile.prerelease.waittoken.done': 'pre-release token alındı',
+  };
+  if (map[key]) return map[key];
+  const pretty = String(stageKey || '')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/\./g, ' / ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  return pretty || '';
+}
+
+function statusTextFromStep(entry, meta = {}) {
+  const rawMessage = String(entry?.message || '').trim();
+  const stepInfo = parseStepMessage(rawMessage);
+  if (!stepInfo) return null;
+  const actor = formatStatusActor(stepInfo, meta);
+  const label = compactStepStageLabel(stepInfo.stageKey);
+  if (!label) return actor ? `ℹ️ ${actor} · ${stepInfo.stageKey}` : `ℹ️ ${stepInfo.stageKey}`;
+  const extras = [];
+  if (meta?.ok === false) extras.push('başarısız');
+  else if (meta?.ok === true && /\.done$/i.test(stepInfo.stageKey)) extras.push('ok');
+  if (meta?.attempt != null) extras.push(`deneme ${meta.attempt}`);
+  if (meta?.dismissedCount) extras.push(`${meta.dismissedCount} modal kapatıldı`);
+  const suffix = extras.length ? ` (${extras.join(', ')})` : '';
+  return actor ? `ℹ️ ${actor} · ${label}${suffix}` : `ℹ️ ${label}${suffix}`;
+}
+
+function statusTextFromAudit(eventKey, meta = {}) {
+  const event = String(eventKey || '').trim().toLowerCase();
+  if (!event || event === 'audit') return null;
+  const pairIndex = Number.isFinite(Number(meta?.pairIndex)) ? Number(meta.pairIndex) : null;
+  const email = String(meta?.email || meta?.aEmail || meta?.bEmail || meta?.cEmail || meta?.holderEmail || '').trim();
+  const prefixBits = [];
+  if (pairIndex != null) prefixBits.push(`Akış #${pairIndex}`);
+  if (email) prefixBits.push(email);
+  const prefix = prefixBits.length ? `${prefixBits.join(' · ')} · ` : '';
+
+  if (event === 'account_launch_start') return `ℹ️ ${prefix}giriş süreci başladı`;
+  if (event === 'account_launch_done') return `ℹ️ ${prefix}giriş tamamlandı`;
+  if (event === 'account_goto_event_start') return `ℹ️ ${prefix}etkinlik sayfasına gidiliyor`;
+  if (event === 'account_goto_event_done') return `ℹ️ ${prefix}etkinlik sayfası açıldı`;
+  if (event === 'account_click_buy_start') return `ℹ️ ${prefix}SATIN AL deneniyor`;
+  if (event === 'account_click_buy_done') return `ℹ️ ${prefix}SATIN AL tamamlandı`;
+  if (event === 'a_category_block_selected') return `📚 ${prefix}kategori/blok seçildi`;
+  if (event === 'a_payment_tc_assign') return `💳 ${prefix}TC tanımlama ${meta?.ok ? 'tamamlandı' : 'başarısız'}`;
+  if (event === 'a_payment_invoice_tc') return `💳 ${prefix}fatura formu ${meta?.ok ? 'tamamlandı' : 'başarısız'}`;
+  if (event === 'a_payment_agreements') return `💳 ${prefix}sözleşme onayları ${meta?.ok ? 'tamamlandı' : 'başarısız'}`;
+  if (event === 'a_payment_iframe_filled') return `💳 ${prefix}kart formu ${meta?.ok ? 'dolduruldu' : 'doldurulamadı'}`;
+  if (event === 'a_payment_ready') return `💳 ${prefix}ödeme sayfası hazır`;
+  if (event === 'c_payment_tc_assign') return `💳 ${prefix}C ödeme TC tanımlama ${meta?.ok ? 'tamamlandı' : 'başarısız'}`;
+  if (event === 'c_payment_invoice_tc') return `💳 ${prefix}C fatura formu ${meta?.ok ? 'tamamlandı' : 'başarısız'}`;
+  if (event === 'c_payment_agreements') return `💳 ${prefix}C sözleşme onayları ${meta?.ok ? 'tamamlandı' : 'başarısız'}`;
+  if (event === 'c_payment_iframe_filled') return `💳 ${prefix}C kart formu ${meta?.ok ? 'dolduruldu' : 'doldurulamadı'}`;
+  if (event === 'finalize_start') return `ℹ️ ${prefix}finalize süreci başladı`;
+  if (event === 'finalize_done') return `✅ ${prefix}finalize tamamlandı`;
+  if (event === 'finalize_failed') return `⚠️ ${prefix}finalize başarısız`;
+  if (event === 'deferred_payer_transfer_start') return `↔️ ${prefix}süre eşiği nedeniyle tutucuya transfer başladı`;
+  if (event === 'deferred_payer_transfer_done') return `↔️ ${prefix}süre eşiği transferi tamamlandı`;
+  if (event === 'deferred_payer_transfer_triggered') return `↔️ ${prefix}süre eşiği transferi tetiklendi`;
+  if (event === 'holder_updated') return `↔️ ${prefix}tutucu güncellendi: ${meta?.holder || '—'}`;
+  return null;
+}
+
 function isStatusMessage(entry, line) {
-  const msg = String(entry?.message || line || '').toLowerCase();
+  const rawMsg = String(entry?.message || line || '');
+  const msg = rawMsg.toLowerCase();
   const eventKey = entryEventKey(entry, line);
   const meta = entry?.meta || {};
-  
-  // Helper to format seat details from meta
-  const formatSeatDetails = (m) => {
-    const src = m?.seatInfo || m?.seatA || m?.seatB || m || {};
-    const parts = [];
-    // Use combined if available (has full seat info: tribune block row seat)
-    if (src.combined) return ` (${src.combined})`;
-    if (src.tribune) parts.push(`Tribün: ${src.tribune}`);
-    if (src.block || src.blockText || src.blockName) parts.push(`Blok: ${src.block || src.blockText || src.blockName}`);
-    if (src.categoryText || src.categoryName) parts.push(`Kat: ${src.categoryText || src.categoryName}`);
-    if (src.row || src.rowNumber) parts.push(`Sıra: ${src.row || src.rowNumber}`);
-    if (src.seat || src.seatNumber || src.seatNum) parts.push(`Koltuk: ${src.seat || src.seatNumber || src.seatNum}`);
-    return parts.length > 0 ? ` (${parts.join(', ')})` : '';
-  };
+
+  const stepStatus = statusTextFromStep(entry, meta);
+  if (stepStatus) return stepStatus;
+  const auditStatus = statusTextFromAudit(eventKey, meta);
+  if (auditStatus) return auditStatus;
   
   // Keep mappings strict to avoid false positives in status panel.
   if (msg.includes('run started')) return '🚀 Bot çalışmaya başladı';
   if (msg.includes('run stopped') || msg.includes('bot başarıyla tamamlandı') || msg.includes('completed')) return '✅ Bot tamamlandı';
 
-  if (msg.includes('step:a.launchandlogin.done') || msg.includes('step:b.launchandlogin.done') || msg.includes('step:c.launchandlogin.done')) {
-    const account = msg.includes('step:a.') ? 'Ana hesap' : (msg.includes('step:b.') ? 'Tutucu hesap' : (msg.includes('step:c.') ? 'C hesabi' : null));
-    const email = meta?.email || '';
-    return account ? `✓ ${account} Hesabı giriş yapıldı${email ? ': ' + email : ''}` : null;
-  }
-
   if (msg.includes('launchandlogin: login tamamlanamadı')) return '❌ Giriş tamamlanamadı, login sayfasında kaldı';
   if (msg.includes('launchandlogin: login formu bulunamadı')) return '❌ Giriş formu bulunamadı (site/challenge yüklenmedi)';
   if (msg.includes('reloginifredirected: login redirect tespit edildi')) return '🔁 Oturum düştü, yeniden giriş deneniyor';
   if (msg.includes('reloginifredirected: login submit sonrası')) return '🔐 Yeniden giriş denemesi yapıldı';
-  if (msg.includes('step:a.gotoevent.start') || msg.includes('step:b.gotoevent.start')) return '🎯 Etkinlik sayfasına gidiliyor';
-  if (msg.includes('step:a.clickbuy.start') || msg.includes('step:b.clickbuy.start')) return '🛍️ SATIN AL butonu aranıyor/tıklanıyor';
-  if (msg.includes('step:a.postbuy.ensureurl.start')) return '🧭 Koltuk seçimi sayfasına geçiş doğrulanıyor';
 
   if (msg.includes('categoryblock.select.done') || msg.includes('categoryblock.reselect.done') || msg.includes('categoryblock:svg_block_ok')) {
     const blockId = meta?.blockId || meta?.svgBlockId || null;
@@ -709,7 +892,7 @@ function isStatusMessage(entry, line) {
     msg.includes('seat_selected_a') ||
     msg.includes('seat_grabbed_b');
   if (seatConfirmed) {
-    const details = formatSeatDetails(meta);
+    const details = formatSeatDetailsFromMeta(meta);
     return `🪑 Koltuk seçildi${details}`;
   }
 
@@ -722,10 +905,14 @@ function isStatusMessage(entry, line) {
     msg.includes('basket_success') ||
     msg.includes('basket_from_network')
   ) {
-    const details = formatSeatDetails(meta);
+    const details = formatSeatDetailsFromMeta(meta);
     const pairLabel = meta?.pairIndex != null ? ` #${meta.pairIndex}` : (meta?.idx != null ? ` #${Number(meta.idx) + 1}` : '');
     const account = meta?.email ? ` (${meta.email})` : '';
     return `🛒 Sepete koltuk eklendi${pairLabel}${account}${details}`;
+  }
+
+  if (msg.includes('kategori boş:') || msg.includes('kategori seçildi:') || msg.includes('kategori atlandı:') || msg.includes('tüm kategoriler kontrol edildi')) {
+    return `📚 ${rawMsg}`;
   }
 
   if (msg.includes('seat.noselectable.retry_block')) {
@@ -745,15 +932,15 @@ function isStatusMessage(entry, line) {
     return null; // too noisy for customer status panel
   }
 
-  if (msg.includes('finalize') || msg.includes('payment') || msg.includes('ödeme')) return '💳 Ödeme işlemi başlatıldı';
-  if (msg.includes('transfer') || msg.includes('holder_updated')) return '↔️ Koltuk transfer ediliyor';
+  if (msg.includes('finalize') || msg.includes('payment') || msg.includes('ödeme')) return `💳 ${rawMsg}`;
+  if (msg.includes('transfer') || msg.includes('holder_updated')) return `↔️ ${rawMsg}`;
   if (msg.includes('remove_from_cart') || msg.includes('çıkarıldı') || msg.includes('boşaltıldı')) return '🗑️ Sepet boşaltıldı';
 
   if (msg.includes('error') || msg.includes('hata') || msg.includes('failed') || msg.includes('başarısız')) {
     if (msg.includes('login') || msg.includes('giriş')) return '❌ Giriş hatası';
     if (msg.includes('basket') || msg.includes('sepet')) return '❌ Sepet hatası';
     if (msg.includes('seat') || msg.includes('koltuk')) return '❌ Koltuk seçim hatası';
-    return '⚠️ Hata oluştu';
+    return `⚠️ ${rawMsg}`;
   }
 
   return null;
