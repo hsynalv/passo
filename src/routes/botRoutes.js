@@ -4,6 +4,7 @@ const { startBot, startBotAsync, registerCAccount, requestFinalize, getRunStatus
 const { createTeam, deleteTeam, listTeams, updateTeam } = require('../controllers/teamController');
 const { createCategory, deleteCategory, listCategories, updateCategory } = require('../controllers/categoryController');
 const { createCredential, deleteCredential, listCredentials, updateCredential } = require('../controllers/credentialController');
+const { listOrderRecords, getOrderRecord, streamOrderRecords } = require('../controllers/orderRecordController');
 const { botRateLimiter } = require('../middleware/rateLimiter');
 const logger = require('../utils/logger');
 const cfg = require('../config');
@@ -32,6 +33,9 @@ router.get('/api/teams/:teamId/credentials', listCredentials);
 router.post('/api/teams/:teamId/credentials', createCredential);
 router.put('/api/teams/:teamId/credentials/:credentialId', updateCredential);
 router.delete('/api/teams/:teamId/credentials/:credentialId', deleteCredential);
+router.get('/api/order-records', listOrderRecords);
+router.get('/api/order-records/stream', streamOrderRecords);
+router.get('/api/order-records/:recordId', getOrderRecord);
 
 router.post('/kill-sessions', botRateLimiter, killSessions);
 

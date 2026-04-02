@@ -2,6 +2,7 @@ const winston = require('winston');
 const path = require('path');
 const fs = require('fs');
 const { EventEmitter } = require('events');
+const { AsyncLocalStorage } = require('async_hooks');
 
 // logs klasörünü oluştur
 const logsDir = path.join(process.cwd(), 'logs');
@@ -52,8 +53,23 @@ const logger = winston.createLogger({
 
 // Live log stream support (UI)
 const logBus = new EventEmitter();
+const logContextStore = new AsyncLocalStorage();
 const LOG_BUFFER_MAX = parseInt(process.env.LOG_STREAM_BUFFER_MAX || '800', 10);
 const logBuffer = [];
+
+const getActiveLogContext = () => {
+    try { return logContextStore.getStore() || null; } catch { return null; }
+};
+
+const mergeLogContext = (meta) => {
+    const ctx = getActiveLogContext();
+    if (!ctx || typeof ctx !== 'object') return meta;
+    if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+        return { ...ctx, ...meta };
+    }
+    return { ...ctx };
+};
+
 const pushLog = (entry) => {
     try {
         logBuffer.push(entry);
@@ -68,13 +84,15 @@ try {
     const baseLog = logger.log.bind(logger);
     logger.log = (...callArgs) => {
         try {
+            const ctx = getActiveLogContext();
             // Winston supports: logger.log('info', 'msg', meta) and logger.log({ level, message, ...meta })
             if (callArgs.length === 1 && callArgs[0] && typeof callArgs[0] === 'object') {
-                const info = callArgs[0];
+                const info = ctx ? { ...ctx, ...callArgs[0] } : callArgs[0];
                 pushLog({
                     ts: (() => { try { return new Date().toISOString(); } catch { return null; } })(),
                     level: String(info.level || 'info'),
                     message: String(info.message || ''),
+                    runId: info.runId ? String(info.runId) : null,
                     meta: maskSensitive(info)
                 });
                 return baseLog(info);
@@ -82,13 +100,16 @@ try {
 
             const level = callArgs[0];
             const message = callArgs[1];
-            const meta = (callArgs.length >= 3) ? callArgs[2] : undefined;
+            const meta = mergeLogContext((callArgs.length >= 3) ? callArgs[2] : undefined);
             pushLog({
                 ts: (() => { try { return new Date().toISOString(); } catch { return null; } })(),
                 level: String(level || 'info'),
                 message: String(message || ''),
+                runId: meta?.runId ? String(meta.runId) : (ctx?.runId ? String(ctx.runId) : null),
                 meta: maskSensitive(meta)
             });
+            if (callArgs.length >= 3) callArgs[2] = meta;
+            else if (meta && Object.keys(meta).length) callArgs.push(meta);
         } catch {}
         return baseLog(...callArgs);
     };
@@ -183,6 +204,16 @@ logger.subscribeLogs = (handler) => {
         try { logBus.off('log', fn); } catch {}
     };
 };
+
+logger.runWithContext = (context, fn) => {
+    const nextContext = {
+        ...(getActiveLogContext() || {}),
+        ...((context && typeof context === 'object') ? context : {})
+    };
+    return logContextStore.run(nextContext, fn);
+};
+
+logger.getContext = () => getActiveLogContext();
 
 module.exports = logger;
 

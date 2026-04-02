@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Passobot Kayit Ekrani</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div>
+        <div class="title">Passobot Kayit Ekrani</div>
+        <div class="subtitle">Sepet, odeme ve finalize kayitlarini canli izle</div>
+      </div>
+      <div class="headerRight">
+        <a href="/index.html" class="btnGhost navGhost">Panele Don</a>
+        <div class="status" id="recordsConnStatus">Disconnected</div>
+      </div>
+    </header>
+
+    <section class="card recordsToolbar">
+      <div class="row2">
+        <div class="row">
+          <label>Arama</label>
+          <input id="filterQuery" type="text" placeholder="takim, hesap, seat id, blok..." />
+        </div>
+        <div class="row">
+          <label>Takim</label>
+          <input id="filterTeam" type="text" placeholder="Galatasaray" />
+        </div>
+      </div>
+      <div class="row2">
+        <div class="row">
+          <label>Event URL</label>
+          <input id="filterEventUrl" type="text" placeholder="https://www.passo.com.tr/..." />
+        </div>
+        <div class="row">
+          <label>Hesap (Ana/Tutucu/C)</label>
+          <input id="filterAccountEmail" type="text" placeholder="hesap@mail.com" />
+        </div>
+      </div>
+      <div class="row2">
+        <div class="row">
+          <label>Odeme Kaynagi</label>
+          <select id="filterPaymentSource">
+            <option value="">Hepsi</option>
+            <option value="A">Ana Hesap</option>
+            <option value="C">C</option>
+          </select>
+        </div>
+        <div class="row">
+          <label>Odeme Durumu</label>
+          <select id="filterPaymentState">
+            <option value="">Hepsi</option>
+            <option value="none">none</option>
+            <option value="a_ready">a_ready</option>
+            <option value="a_paid">a_paid</option>
+            <option value="c_ready">c_ready</option>
+            <option value="c_paid">c_paid</option>
+            <option value="failed">failed</option>
+          </select>
+        </div>
+        <div class="row">
+          <label>Kayit Durumu</label>
+          <select id="filterRecordStatus">
+            <option value="">Hepsi</option>
+            <option value="basketed">basketed</option>
+            <option value="transferred">transferred</option>
+            <option value="payment_ready">payment_ready</option>
+            <option value="payment_completed">payment_completed</option>
+            <option value="finalize_ready">finalize_ready</option>
+            <option value="finalized">finalized</option>
+            <option value="failed">failed</option>
+          </select>
+        </div>
+      </div>
+      <div class="row2">
+        <div class="row">
+          <label>Baslangic Tarihi</label>
+          <input id="filterFrom" type="datetime-local" />
+        </div>
+        <div class="row">
+          <label>Bitis Tarihi</label>
+          <input id="filterTo" type="datetime-local" />
+        </div>
+      </div>
+      <div class="actions">
+        <button type="button" id="btnApplyRecordFilters">Filtrele</button>
+        <button type="button" id="btnResetRecordFilters" class="btnMuted">Temizle</button>
+      </div>
+    </section>
+
+    <section class="recordsSummary" id="recordsSummary"></section>
+
+    <section class="recordsLayout">
+      <div class="card recordsListPanel">
+        <div class="logsHeader">
+          <h2>Canli Kayitlar</h2>
+          <div id="recordsMeta" class="pairDashMeta muted"></div>
+        </div>
+        <div id="recordsList" class="recordsListBody">
+          <div class="pairDashEmpty">Kayitlar yukleniyor...</div>
+        </div>
+      </div>
+
+      <div class="card recordsDetailPanel">
+        <div class="logsHeader">
+          <h2>Kayit Detayi</h2>
+          <div id="recordDetailMeta" class="pairDashMeta muted"></div>
+        </div>
+        <div id="recordDetailBody" class="recordDetailBody">
+          <div class="pairDashEmpty">Soldan bir kayit sec.</div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="/records.js"></script>
+</body>
+</html>

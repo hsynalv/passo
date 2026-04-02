@@ -8,6 +8,7 @@ const accountSchema = z.object({
   fanCardCode: z.string().nullable().optional(),
   sicilNo: z.string().nullable().optional(),
   priorityTicketCode: z.string().nullable().optional(),
+  canPay: z.boolean().optional(),
 });
 
 const selectedCategorySchema = z.object({
@@ -74,6 +75,7 @@ const botRequestSchema = z.object({
   bAccounts: z.array(accountSchema).optional(),
   aCredentialIds: z.array(z.string().min(1)).optional(),
   bCredentialIds: z.array(z.string().min(1)).optional(),
+  payerACredentialIds: z.array(z.string().min(1)).optional(),
   selectedCategoryIds: z.array(z.string().min(1)).optional(),
   selectedCategories: z.array(selectedCategorySchema).optional(),
 
@@ -131,6 +133,7 @@ const botRequestSchema = z.object({
   const bList = Array.isArray(data.bAccounts) ? data.bAccounts : [];
   const aCredentialIds = Array.isArray(data.aCredentialIds) ? data.aCredentialIds : [];
   const bCredentialIds = Array.isArray(data.bCredentialIds) ? data.bCredentialIds : [];
+  const payerACredentialIds = Array.isArray(data.payerACredentialIds) ? data.payerACredentialIds : [];
   const hasLegacyA = !!(data.email && data.password);
   const hasLegacyB = !!(data.email2 && data.password2);
 
@@ -140,6 +143,56 @@ const botRequestSchema = z.object({
       path: ['aAccounts'],
       message: 'En az 1 A hesabı zorunludur (aAccounts, aCredentialIds veya email/password)'
     });
+  }
+  if (aList.length) {
+    const hasExplicitCanPay = aList.some((item) => item && Object.prototype.hasOwnProperty.call(item, 'canPay'));
+    if (hasExplicitCanPay) {
+      const hasPayerA = aList.some((item) => item && item.canPay === true);
+      if (!hasPayerA) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['aAccounts'],
+          message: 'A hesaplarında en az 1 adet `canPay=true` hesap bulunmalıdır'
+        });
+      }
+      const payerWithoutIdentity = aList.find((item) => item && item.canPay === true && !/^\d{11}$/.test(String(item.identity || '').trim()));
+      if (payerWithoutIdentity) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['aAccounts'],
+          message: 'Odeme yapabilir secilen her A hesabinda gecerli bir T.C. Kimlik No bulunmalidir'
+        });
+      }
+    }
+  }
+  if (aCredentialIds.length && payerACredentialIds.length) {
+    const payerSet = new Set(payerACredentialIds.map(String));
+    const hasPayerCredential = aCredentialIds.some((id) => payerSet.has(String(id)));
+    if (!hasPayerCredential) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['payerACredentialIds'],
+        message: 'Seçili A üyeliklerinden en az 1 tanesi ödeme yapabilir olmalıdır'
+      });
+    }
+  }
+
+  const hasPayerAFromAccounts = aList.some((item) => item && item.canPay === true);
+  const hasPayerAFromCredentialIds = !!payerACredentialIds.length;
+  if (hasPayerAFromAccounts || hasPayerAFromCredentialIds) {
+    const missingCardFields = [];
+    if (!String(data.cardHolder || '').trim()) missingCardFields.push('cardHolder');
+    if (!String(data.cardNumber || '').trim()) missingCardFields.push('cardNumber');
+    if (!String(data.expiryMonth || '').trim()) missingCardFields.push('expiryMonth');
+    if (!String(data.expiryYear || '').trim()) missingCardFields.push('expiryYear');
+    if (!String(data.cvv || '').trim()) missingCardFields.push('cvv');
+    if (missingCardFields.length) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['cardHolder'],
+        message: 'En az 1 A hesabı ödeme yapabilir seçildiyse kart bilgileri zorunludur'
+      });
+    }
   }
   // B hesabı opsiyonel: yoksa A-only mod çalışır (ödeme veya sepette tutma)
 

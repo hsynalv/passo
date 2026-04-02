@@ -22,18 +22,44 @@ async function ensureTcAssignedOnBasket(page, identity, options = null) {
   if (!page) return false;
   const opts = options && typeof options === 'object' ? options : {};
   const preferAssignToMyId = opts.preferAssignToMyId !== false;
-  const maxAttempts = Number.isFinite(opts.maxAttempts) ? opts.maxAttempts : 3;
+  const maxAttempts = Number.isFinite(opts.maxAttempts) ? opts.maxAttempts : 4;
 
   const tc = identity != null ? String(identity).trim() : '';
+  if (!/^\d{11}$/.test(tc)) return false;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const done = await evaluateSafe(page, (tcValue, preferMyId) => {
         const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim();
         const lower = (s) => norm(s).toLowerCase();
+        const setInputValue = (inp, value) => {
+          try {
+            const proto = Object.getPrototypeOf(inp);
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && typeof desc.set === 'function') desc.set.call(inp, value);
+            else inp.value = value;
+          } catch {
+            try { inp.value = value; } catch {}
+          }
+          try { inp.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
+          try { inp.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+          try { inp.dispatchEvent(new Event('blur', { bubbles: true })); } catch {}
+        };
+        const isVisible = (el) => {
+          if (!el) return false;
+          try {
+            const st = window.getComputedStyle(el);
+            if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+            const r = el.getBoundingClientRect?.();
+            return !!(r && r.width >= 2 && r.height >= 2);
+          } catch {
+            return false;
+          }
+        };
 
         const getRowEls = () => {
-          const inputs = Array.from(document.querySelectorAll('input[placeholder="T.C. Kimlik No"][maxlength="11"]'));
+          const inputs = Array.from(document.querySelectorAll('input[placeholder="T.C. Kimlik No"][maxlength="11"]'))
+            .filter(isVisible);
           return inputs.map((inp) => {
             const td = inp.closest('td') || inp.closest('tr') || inp.parentElement;
             return { inp, td };
@@ -44,6 +70,8 @@ async function ensureTcAssignedOnBasket(page, identity, options = null) {
         if (!rows.length) return { ok: true, reason: 'no_tc_ui' };
 
         let anyTouched = false;
+        let clickedDefine = false;
+        let pendingCount = 0;
         for (const r of rows) {
           const inp = r.inp;
           const td = r.td || document.body;
@@ -52,41 +80,52 @@ async function ensureTcAssignedOnBasket(page, identity, options = null) {
           const notCitizen = td.querySelector('input[type="checkbox"][id^="checknot-tc-citizen"]');
           if (notCitizen && notCitizen.checked) continue;
 
-          const curVal = norm(inp.value || '');
-          if (curVal && curVal.length === 11) continue;
+          let curVal = norm(inp.value || '');
+          const btns = Array.from(td.querySelectorAll('button')).filter(isVisible);
+          const defineBtn = btns.find((b) => lower(b.innerText || b.textContent) === 'tanımla') || null;
+          const deleteBtn = btns.find((b) => lower(b.innerText || b.textContent) === 'sil') || null;
+          const alreadyAssigned = curVal.length === 11 && ((!defineBtn && !!deleteBtn) || (defineBtn && defineBtn.disabled && !!deleteBtn));
+          if (alreadyAssigned) continue;
 
-          if (preferMyId && assign && !assign.checked) {
+          if (preferMyId && assign && !assign.checked && !curVal) {
             try { assign.click(); } catch {}
             anyTouched = true;
             continue;
           }
 
-          if (tcValue && tcValue.length === 11) {
-            try {
-              inp.focus();
-              inp.value = '';
-              inp.dispatchEvent(new Event('input', { bubbles: true }));
-              inp.value = tcValue;
-              inp.dispatchEvent(new Event('input', { bubbles: true }));
-              inp.dispatchEvent(new Event('change', { bubbles: true }));
-            } catch {}
-
-            const btns = Array.from(td.querySelectorAll('button')).filter(b => !b.disabled);
-            const defineBtn = btns.find(b => lower(b.innerText || b.textContent) === 'tanımla');
-            if (defineBtn) {
-              try { defineBtn.click(); } catch {}
-              anyTouched = true;
-              continue;
-            }
+          if (curVal !== tcValue) {
+            try { inp.focus(); } catch {}
+            setInputValue(inp, '');
+            setInputValue(inp, tcValue);
             anyTouched = true;
+            curVal = norm(inp.value || '');
           }
+
+          if (curVal.length !== 11) {
+            pendingCount++;
+            continue;
+          }
+
+          if (defineBtn && !defineBtn.disabled) {
+            try { defineBtn.click(); } catch {}
+            anyTouched = true;
+            clickedDefine = true;
+            continue;
+          }
+
+          if (!defineBtn) continue;
+          pendingCount++;
         }
 
-        return { ok: true, reason: anyTouched ? 'touched' : 'already_ok' };
+        return {
+          ok: pendingCount === 0,
+          reason: pendingCount === 0 ? 'assigned' : (clickedDefine || anyTouched ? 'touched' : 'pending'),
+          pendingCount
+        };
       }, tc, preferAssignToMyId).catch(() => null);
 
       if (done && done.ok) {
-        if (done.reason === 'touched') {
+        if (done.reason === 'touched' || done.reason === 'pending') {
           await delay(600);
           continue;
         }
@@ -101,39 +140,56 @@ async function ensureTcAssignedOnBasket(page, identity, options = null) {
 async function clickBasketDevamToOdeme(page) {
   if (!page) return false;
   try {
-    const btn = await evaluateSafe(page, () => {
-      const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
-      const els = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
-        .filter(el => {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const btn = await evaluateSafe(page, () => {
+        const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+        const isVisible = (el) => {
           try {
             const st = window.getComputedStyle(el);
             if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
             if (el.disabled) return false;
-            return !!(el.offsetParent !== null);
+            const r = el.getBoundingClientRect?.();
+            return !!(r && r.width >= 2 && r.height >= 2);
+          } catch {
+            return false;
+          }
+        };
+        const els = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
+          .filter(isVisible);
+        const cand = els
+          .map((el) => ({ el, t: norm(el.innerText || el.textContent || el.value || '') }))
+          .filter((x) => x.t === 'devam')
+          .map((x) => x.el);
+        const best = cand.find((b) => (b.getAttribute('class') || '').toLowerCase().includes('red-btn')) || cand[0] || null;
+        if (!best) return null;
+        try { best.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+        const r = best.getBoundingClientRect();
+        try { best.click(); } catch {}
+        return { x: r.left + (r.width / 2), y: r.top + (r.height / 2) };
+      });
+      if (!btn || !Number.isFinite(btn.x) || !Number.isFinite(btn.y)) continue;
+      const wait = waitForFunctionSafe(page, () => {
+        const u = String(location.href || '');
+        if (/\/odeme(\b|\/|\?|#)/i.test(u)) return true;
+        const modals = Array.from(document.querySelectorAll('.tingle-modal, .modal, .swal2-container, [role="dialog"]'));
+        return modals.some((m) => {
+          try {
+            const st = window.getComputedStyle(m);
+            return st && st.display !== 'none' && st.visibility !== 'hidden';
           } catch {
             return false;
           }
         });
-      const cand = els
-        .map(el => ({ el, t: norm(el.innerText || el.textContent || el.value || '') }))
-        .filter(x => x.t === 'devam')
-        .map(x => x.el);
-      const best = cand.find(b => (b.getAttribute('class') || '').toLowerCase().includes('red-btn')) || cand[0] || null;
-      if (!best) return null;
-      best.scrollIntoView({ block: 'center', inline: 'center' });
-      const r = best.getBoundingClientRect();
-      return { x: r.left + (r.width / 2), y: r.top + (r.height / 2) };
-    });
-    if (!btn || !Number.isFinite(btn.x) || !Number.isFinite(btn.y)) return false;
-    const wait = waitForFunctionSafe(page, () => {
-      const u = String(location.href || '');
-      return /\/odeme(\b|\/|\?|#)/i.test(u);
-    }, { timeout: 30000 }).catch(() => null);
-    await page.mouse.move(btn.x, btn.y);
-    await page.mouse.down();
-    await page.mouse.up();
-    await Promise.race([wait, delay(2500)]);
-    return true;
+      }, { timeout: 10000 }).catch(() => null);
+      await page.mouse.move(btn.x, btn.y);
+      await page.mouse.down();
+      await page.mouse.up();
+      await Promise.race([wait, delay(2500 + (attempt * 500))]);
+      const currentUrl = (() => { try { return String(page.url() || ''); } catch { return ''; } })();
+      if (/\/odeme(\b|\/|\?|#)/i.test(currentUrl)) return true;
+      if (attempt < 3) await delay(400 * attempt);
+    }
+    return false;
   } catch {
     return false;
   }
@@ -142,30 +198,41 @@ async function clickBasketDevamToOdeme(page) {
 async function dismissPaymentInfoModalIfPresent(page) {
   if (!page) return false;
   try {
-    const did = await evaluateSafe(page, () => {
+    let dismissedCount = 0;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const did = await evaluateSafe(page, () => {
       const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
-      const conts = Array.from(document.querySelectorAll('.modal, .swal2-container, [role="dialog"], .cdk-overlay-container'));
-      const visible = conts.filter(c => {
+        const isVisible = (el) => {
         try {
-          const st = window.getComputedStyle(c);
-          return st && st.display !== 'none' && st.visibility !== 'hidden' && (c.offsetParent !== null || st.position === 'fixed');
-        } catch { return false; }
+            const st = window.getComputedStyle(el);
+            if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+            const r = el.getBoundingClientRect?.();
+            return !!(r && r.width >= 2 && r.height >= 2);
+          } catch {
+            return false;
+          }
+        };
+        const conts = Array.from(document.querySelectorAll('.tingle-modal, .modal, .swal2-container, [role="dialog"], .cdk-overlay-container'));
+        const visible = conts.filter(isVisible);
+        if (!visible.length) return false;
+        const btns = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
+          .filter((b) => {
+            const t = norm(b.innerText || b.textContent || b.value || '');
+            if (!t) return false;
+            if (b.disabled) return false;
+            if (!isVisible(b)) return false;
+            return t === 'tamam' || t === 'ok' || t === 'kapat';
+          });
+        const b = btns[btns.length - 1] || null;
+        if (!b) return false;
+        try { b.click(); } catch {}
+        return true;
       });
-      if (!visible.length) return false;
-      const btns = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
-        .filter(b => {
-          const t = norm(b.innerText || b.textContent || b.value || '');
-          if (!t) return false;
-          if (b.disabled) return false;
-          return t === 'tamam' || t === 'ok' || t === 'kapat';
-        });
-      const b = btns[0] || null;
-      if (!b) return false;
-      try { b.click(); } catch {}
-      return true;
-    });
-    if (did) await delay(500);
-    return !!did;
+      if (!did) break;
+      dismissedCount += 1;
+      await delay(500);
+    }
+    return dismissedCount > 0;
   } catch {
     return false;
   }
@@ -174,40 +241,74 @@ async function dismissPaymentInfoModalIfPresent(page) {
 async function fillInvoiceTcAndContinue(page, identity) {
   if (!page) return false;
   const tc = identity != null ? String(identity).trim() : '';
-  if (!tc || tc.length !== 11) return false;
+  if (!/^\d{11}$/.test(tc)) return false;
 
   try {
-    const ok = await evaluateSafe(page, (tcValue) => {
+    const alreadyAtIframe = await evaluateSafe(page, () => !!document.querySelector('iframe#payment_nkolay_frame')).catch(() => false);
+    if (alreadyAtIframe) return true;
+    const result = await evaluateSafe(page, (tcValue) => {
       const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
-      const inputs = Array.from(document.querySelectorAll('quick-input input.form-control[placeholder="T.C. Kimlik No"], input.form-control[placeholder="T.C. Kimlik No"][maxlength="11"]'));
-      if (!inputs.length) return false;
-      const inp = inputs[0];
-      try {
-        inp.focus();
-        inp.value = '';
-        inp.dispatchEvent(new Event('input', { bubbles: true }));
-        inp.value = tcValue;
-        inp.dispatchEvent(new Event('input', { bubbles: true }));
-        inp.dispatchEvent(new Event('change', { bubbles: true }));
-      } catch {}
+      const isVisible = (el) => {
+        try {
+          const st = window.getComputedStyle(el);
+          if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+          const r = el.getBoundingClientRect?.();
+          return !!(r && r.width >= 2 && r.height >= 2);
+        } catch {
+          return false;
+        }
+      };
+      const setInputValue = (inp, value) => {
+        try {
+          const proto = Object.getPrototypeOf(inp);
+          const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+          if (desc && typeof desc.set === 'function') desc.set.call(inp, value);
+          else inp.value = value;
+        } catch {
+          try { inp.value = value; } catch {}
+        }
+        try { inp.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
+        try { inp.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+        try { inp.dispatchEvent(new Event('blur', { bubbles: true })); } catch {}
+      };
+
+      const membershipBox = document.querySelector('#checksend-invoice-my-membership');
+      if (membershipBox && !membershipBox.checked && !membershipBox.disabled) {
+        try { membershipBox.click(); } catch {}
+      }
+
+      const personalRadio = document.querySelector('#rbPersonal');
+      if (personalRadio && !personalRadio.checked && !personalRadio.disabled) {
+        try { personalRadio.click(); } catch {}
+      }
+
+      const inputs = Array.from(document.querySelectorAll('quick-input input.form-control[placeholder="T.C. Kimlik No"], input.form-control[placeholder="T.C. Kimlik No"][maxlength="11"]'))
+        .filter(isVisible);
+      if (inputs.length) {
+        const inp = inputs[0];
+        try { inp.focus(); } catch {}
+        setInputValue(inp, '');
+        setInputValue(inp, tcValue);
+      }
 
       const btns = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
-        .filter(b => {
+        .filter((b) => {
           try {
-            const st = window.getComputedStyle(b);
-            if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+            if (!isVisible(b)) return false;
             if (b.disabled) return false;
-            return !!(b.offsetParent !== null);
-          } catch { return false; }
+            return true;
+          } catch {
+            return false;
+          }
         });
       const cand = btns.find(b => (b.getAttribute('class') || '').toLowerCase().includes('black-btn') && norm(b.innerText || b.textContent || b.value || '').includes('devam'))
         || btns.find(b => norm(b.innerText || b.textContent || b.value || '') === 'devam')
         || null;
-      if (!cand) return false;
+      if (!cand) return { ok: false, reason: 'continue_missing' };
       try { cand.click(); } catch {}
-      return true;
+      return { ok: true };
     }, tc);
-    if (ok) {
+    if (result && result.ok) {
       await delay(1200);
       return true;
     }
@@ -218,11 +319,24 @@ async function fillInvoiceTcAndContinue(page, identity) {
 async function acceptAgreementsAndContinue(page) {
   if (!page) return false;
   try {
+    const alreadyAtIframe = await evaluateSafe(page, () => !!document.querySelector('iframe#payment_nkolay_frame')).catch(() => false);
+    if (alreadyAtIframe) return true;
     const did = await evaluateSafe(page, () => {
       const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+      const isVisible = (el) => {
+        try {
+          const st = window.getComputedStyle(el);
+          if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+          const r = el.getBoundingClientRect?.();
+          return !!(r && r.width >= 2 && r.height >= 2);
+        } catch {
+          return false;
+        }
+      };
       const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'))
         .filter(cb => {
           if (cb.disabled) return false;
+          if (!isVisible(cb)) return false;
           const id = cb.getAttribute('id') || '';
           let labelTxt = '';
           try {
@@ -242,10 +356,9 @@ async function acceptAgreementsAndContinue(page) {
       const btns = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
         .filter(b => {
           try {
-            const st = window.getComputedStyle(b);
-            if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+            if (!isVisible(b)) return false;
             if (b.disabled) return false;
-            return !!(b.offsetParent !== null);
+            return true;
           } catch { return false; }
         });
       const cont = btns.find(b => {

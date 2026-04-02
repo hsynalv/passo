@@ -10,6 +10,7 @@ const { botRequestSchema } = require('../validators/botRequest');
 const configRoot = require('../config');
 const categoryRepo = require('../repositories/categoryRepository');
 const credentialRepo = require('../repositories/credentialRepository');
+const orderRecordRepo = require('../repositories/orderRecordRepository');
 const teamRepo = require('../repositories/teamRepository');
 const { withRunCfg, getCfg } = require('../runCfg');
 const delay = require('../utils/delay');
@@ -921,11 +922,22 @@ async function closeAllPassobotBrowsers() {
 
 /** start-bot-async ön kontrolünde çekilen listeler; startBotAfterValidation aynı body referansıyla tekrar DB çağırmasın */
 const accountListsWarmCache = new WeakMap();
+const svgLegendEntriesCache = new WeakMap();
+
+function normalizeCanPay(value, fallback = true) {
+    if (value === true || value === false) return value;
+    if (typeof value === 'string') {
+        const v = value.trim().toLowerCase();
+        if (['1', 'true', 'on', 'yes', 'evet'].includes(v)) return true;
+        if (['0', 'false', 'off', 'no', 'hayir', 'hayır'].includes(v)) return false;
+    }
+    return !!fallback;
+}
 
 async function buildCredentialBackedAccountLists(validatedData) {
     const {
         teamId,
-        aCredentialIds, bCredentialIds,
+        aCredentialIds, bCredentialIds, payerACredentialIds,
         aAccounts, bAccounts,
         email, password, email2, password2,
         identity, fanCardCode, sicilNo, priorityTicketCode,
@@ -933,6 +945,12 @@ async function buildCredentialBackedAccountLists(validatedData) {
 
     const aCredentialIdsSafe = Array.isArray(aCredentialIds) ? aCredentialIds.map((id) => String(id).trim()).filter(Boolean) : [];
     const bCredentialIdsSafe = Array.isArray(bCredentialIds) ? bCredentialIds.map((id) => String(id).trim()).filter(Boolean) : [];
+    const payerACredentialIdSet = new Set(
+        Array.isArray(payerACredentialIds)
+            ? payerACredentialIds.map((id) => String(id).trim()).filter(Boolean)
+            : []
+    );
+    const hasExplicitPayerAIds = payerACredentialIdSet.size > 0;
 
     let aAccountsFromTeam = [];
     if (teamId && aCredentialIdsSafe.length) {
@@ -947,7 +965,8 @@ async function buildCredentialBackedAccountLists(validatedData) {
             fanCardCode: item.fanCardCode || null,
             sicilNo: item.sicilNo || null,
             priorityTicketCode: item.priorityTicketCode || null,
-            categoryIds: Array.isArray(item.categoryIds) ? item.categoryIds.map(String) : []
+            categoryIds: Array.isArray(item.categoryIds) ? item.categoryIds.map(String) : [],
+            canPay: hasExplicitPayerAIds ? payerACredentialIdSet.has(String(item.id || '')) : true
         }));
     }
 
@@ -978,11 +997,12 @@ async function buildCredentialBackedAccountLists(validatedData) {
             identity: (a && Object.prototype.hasOwnProperty.call(a, 'identity')) ? a.identity : null,
             fanCardCode: (a && Object.prototype.hasOwnProperty.call(a, 'fanCardCode')) ? a.fanCardCode : null,
             sicilNo: (a && Object.prototype.hasOwnProperty.call(a, 'sicilNo')) ? a.sicilNo : null,
-            priorityTicketCode: (a && Object.prototype.hasOwnProperty.call(a, 'priorityTicketCode')) ? a.priorityTicketCode : null
+            priorityTicketCode: (a && Object.prototype.hasOwnProperty.call(a, 'priorityTicketCode')) ? a.priorityTicketCode : null,
+            canPay: normalizeCanPay(a?.canPay, true)
         }))
         : (aAccountsFromTeam.length
             ? aAccountsFromTeam
-            : [{ email: (a0Raw?.email || email || '').toString(), password: (a0Raw?.password || password || '').toString(), identity: identity ?? null, fanCardCode: fanCardCode ?? null, sicilNo: sicilNo ?? null, priorityTicketCode: priorityTicketCode ?? null }]);
+            : [{ email: (a0Raw?.email || email || '').toString(), password: (a0Raw?.password || password || '').toString(), identity: identity ?? null, fanCardCode: fanCardCode ?? null, sicilNo: sicilNo ?? null, priorityTicketCode: priorityTicketCode ?? null, canPay: normalizeCanPay(a0Raw?.canPay, true) }]);
     const bList = (Array.isArray(bAccounts) && bAccounts.length)
         ? bAccounts.map(b => ({
             email: String(b.email || ''),
@@ -1071,11 +1091,41 @@ async function startBotAsync(req, res) {
         finalizeRequestedAt: null,
         cAccount: null,
         cTransferPairIndex: validatedData.cTransferPairIndex ?? 1,
+        paymentQueue: { activePairIndex: null, queue: [], updatedAt: new Date().toISOString() },
         result: null,
         error: null
     });
 
     res.json({ success: true, runId, status: 'running' });
+
+    const capturedRunLogs = [];
+    const pushCapturedRunLog = (entry) => {
+        try {
+            const entryRunId = String(entry?.runId || entry?.meta?.runId || '').trim();
+            if (!entryRunId || entryRunId !== runId) return;
+            capturedRunLogs.push(entry);
+            while (capturedRunLogs.length > 2000) capturedRunLogs.shift();
+            runStore.upsert(runId, {
+                logCount: capturedRunLogs.length,
+                logTail: capturedRunLogs.slice(-120)
+            });
+        } catch {}
+    };
+    const detachRunLogCapture = logger.subscribeLogs(pushCapturedRunLog);
+    let failureLogsPersisted = false;
+    const persistRunFailureLogs = async (errorText) => {
+        try {
+            if (failureLogsPersisted) return;
+            if (!capturedRunLogs.length) return;
+            await orderRecordRepo.attachSessionLogsToRun(runId, {
+                failureReason: errorText,
+                sessionLogs: capturedRunLogs
+            });
+            failureLogsPersisted = true;
+        } catch (error) {
+            logger.warnSafe('order_record_attach_run_logs_failed', { runId, error: error?.message || String(error) });
+        }
+    };
 
     const reqLike = {
         body: validatedData,
@@ -1086,24 +1136,49 @@ async function startBotAsync(req, res) {
             return null;
         }
     };
+    let resLikeStatusCode = 200;
     const resLike = {
-        status: () => resLike,
+        status: (code) => {
+            const n = Number(code);
+            if (Number.isFinite(n) && n >= 100) resLikeStatusCode = n;
+            return resLike;
+        },
         json: (payload) => {
-            runStore.upsert(runId, { status: 'completed', result: payload || null, error: null });
+            if (resLikeStatusCode >= 400) {
+                runStore.upsert(runId, {
+                    status: resLikeStatusCode >= 500 ? 'error' : 'completed',
+                    result: payload || null,
+                    error: payload?.error || null
+                });
+            } else {
+                runStore.upsert(runId, { status: 'completed', result: payload || null, error: null });
+            }
             return payload;
         }
     };
 
     Promise.resolve()
-        .then(() => startBot(reqLike, resLike))
-        .catch((e) => {
+        .then(() => logger.runWithContext({ runId }, () => startBot(reqLike, resLike)))
+        .catch(async (e) => {
             if (e && e.code === 'RUN_KILLED') {
                 try {
                     runStore.upsert(runId, { status: 'killed', error: e?.message || 'Oturum panelden sonlandırıldı', result: null });
                 } catch {}
+                try { await persistRunFailureLogs(e?.message || 'Oturum panelden sonlandırıldı'); } catch {}
+                try { detachRunLogCapture && detachRunLogCapture(); } catch {}
                 return;
             }
             runStore.upsert(runId, { status: 'error', error: e?.message || String(e) });
+            try { await persistRunFailureLogs(e?.message || String(e)); } catch {}
+        })
+        .finally(async () => {
+            try {
+                const current = runStore.get(runId);
+                if (current?.status === 'error') {
+                    await persistRunFailureLogs(current?.error || 'Oturum hata ile sonlandı');
+                }
+            } catch {}
+            try { detachRunLogCapture && detachRunLogCapture(); } catch {}
         });
 }
 
@@ -1141,7 +1216,7 @@ async function requestFinalize(req, res) {
         if (v === true || v === 'true' || v === 1 || v === '1' || v === 'on') return true;
         return false;
     })();
-    runStore.upsert(runId, {
+    const patch = {
         finalizeRequested: true,
         finalizeRequestedAt: new Date().toISOString(),
         finalizeMeta: {
@@ -1153,7 +1228,13 @@ async function requestFinalize(req, res) {
             cvv: cvv || null,
             autoPay
         }
-    });
+    };
+    const rawPair = req?.body?.cTransferPairIndex ?? req?.body?.pairIndex;
+    if (rawPair !== undefined && rawPair !== null && String(rawPair).trim() !== '') {
+        const n = parseInt(String(rawPair).trim(), 10);
+        if (Number.isFinite(n) && n >= 1) patch.cTransferPairIndex = n;
+    }
+    runStore.upsert(runId, patch);
     return res.json({ success: true, runId });
 }
 
@@ -2678,6 +2759,17 @@ async function launchAndLogin(options) {
         return null;
     };
 
+    const fillLoginCredentials = async (ctx) => {
+        if (!ctx?.userEl || !ctx?.passEl) throw new Error('Login inputları bulunamadı');
+        await ctx.userEl.click({ clickCount: 3 }).catch(() => {});
+        await ctx.userEl.type(String(email || ''), { delay: 20 });
+        await ctx.userEl.evaluate((el) => { el.dispatchEvent(new Event('blur', { bubbles: true })); }).catch(() => {});
+        await ctx.passEl.click({ clickCount: 3 }).catch(() => {});
+        await ctx.passEl.type(String(password || ''), { delay: 20 });
+        await ctx.passEl.evaluate((el) => { el.dispatchEvent(new Event('blur', { bubbles: true })); }).catch(() => {});
+        await delay(500);
+    };
+
     let loginCtx = await ensureLoginFormWithReload();
     if (!loginCtx) {
         const u = (() => { try { return page.url(); } catch { return ''; } })();
@@ -2709,17 +2801,10 @@ async function launchAndLogin(options) {
     const turnstileTarget = loginCtx.frame || page;
     await (turnstileTarget.waitForSelector ? turnstileTarget.waitForSelector('.cf-turnstile, input[name="cf-turnstile-response"]', { timeout: 15000 }) : page.waitForSelector('.cf-turnstile, input[name="cf-turnstile-response"]', { timeout: 15000 })).catch(() => {});
 
-    const userEl = loginCtx.userEl;
-    const passEl = loginCtx.passEl;
+    let userEl = loginCtx.userEl;
+    let passEl = loginCtx.passEl;
     if (!userEl || !passEl) throw new Error('Login inputları bulunamadı');
-
-    await userEl.click({ clickCount: 3 }).catch(() => {});
-    await userEl.type(String(email || ''), { delay: 20 });
-    await userEl.evaluate((el) => { el.dispatchEvent(new Event('blur', { bubbles: true })); }).catch(() => {});
-    await passEl.click({ clickCount: 3 }).catch(() => {});
-    await passEl.type(String(password || ''), { delay: 20 });
-    await passEl.evaluate((el) => { el.dispatchEvent(new Event('blur', { bubbles: true })); }).catch(() => {});
-    await delay(500);
+    await fillLoginCredentials(loginCtx);
 
     // Some Passo login pages require an additional "I am human" checkbox.
     // If it's present and unchecked, submit attempts can trigger a generic "Genel hata" modal.
@@ -2759,11 +2844,23 @@ async function launchAndLogin(options) {
         logger.info('launchAndLogin: form iframe içinde, token aynı frame\'e enjekte edilecek', { email });
     }
     await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.warmup', { background: true, targetFrame: loginCtx.frame || undefined });
-    await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.beforeSubmit', { targetFrame: loginCtx.frame || undefined });
+    let turnstileEnsure = await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.beforeSubmit', { targetFrame: loginCtx.frame || undefined });
+    if (turnstileEnsure?.error) {
+        logger.warn('launchAndLogin: turnstile blocking ensure failed, recovery başlayacak', { email, error: turnstileEnsure.error });
+        try {
+            loginCtx = await ensureLoginFormWithReload() || loginCtx;
+            userEl = loginCtx?.userEl || userEl;
+            passEl = loginCtx?.passEl || passEl;
+            if (loginCtx?.userEl && loginCtx?.passEl) {
+                await fillLoginCredentials(loginCtx);
+            }
+        } catch {}
+        turnstileEnsure = await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.beforeSubmit.retry', { targetFrame: loginCtx?.frame || undefined });
+    }
     // Token injected; avoid long fixed sleeps. We'll rely on the button-enabled wait below.
     await delay(450);
 
-    const evalTarget = loginCtx.frame || page;
+    let evalTarget = loginCtx.frame || page;
 
     // Wait until the login button becomes enabled after Turnstile is solved.
     // On Passo the "GİRİŞ" button can remain disabled until the widget signals success.
@@ -2996,6 +3093,36 @@ async function launchAndLogin(options) {
     }
     if (!submitResult) {
         try {
+            logger.warn('launchAndLogin: submit bulunamadı, login form recovery deneniyor', { email });
+            loginCtx = await ensureLoginFormWithReload() || loginCtx;
+            userEl = loginCtx?.userEl || userEl;
+            passEl = loginCtx?.passEl || passEl;
+            evalTarget = loginCtx?.frame || page;
+            if (loginCtx?.userEl && loginCtx?.passEl) {
+                await fillLoginCredentials(loginCtx);
+            }
+            await dismissObstructions('before_recover_submit');
+            await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.recoverSubmit', { targetFrame: loginCtx?.frame || undefined });
+            await delay(800);
+            await waitForGirisBtn(10000);
+            submitResult = await tryClickGirisBtn();
+            if (!submitResult) {
+                const retrySubmit = await tryFormSubmitEarly();
+                if (retrySubmit) submitResult = `recover_${retrySubmit}`;
+            }
+            if (!submitResult && passEl) {
+                try {
+                    await passEl.focus();
+                    await page.keyboard.press('Enter');
+                    submitResult = 'recover_enter';
+                } catch {}
+            }
+        } catch (e) {
+            logger.warn('launchAndLogin: submit recovery failed', { email, error: e?.message || String(e) });
+        }
+    }
+    if (!submitResult) {
+        try {
             const diag = await evaluateSafe(evalTarget, () => {
                 var btns = document.querySelectorAll('button, input[type="submit"]');
                 var texts = []; for (var di = 0; di < Math.min(btns.length, 15); di++) texts.push((btns[di].innerText || btns[di].value || '').trim().substring(0, 30));
@@ -3123,6 +3250,36 @@ async function launchAndLogin(options) {
                 await delay(getCfg().DELAYS.AFTER_LOGIN || 800);
             }
             finalUrl = (() => { try { return page.url(); } catch { return ''; } })();
+        }
+    }
+    if (/\/giris(\?|$)/i.test(finalUrl) && submitResult) {
+        logger.warn('launchAndLogin: hala login sayfasında, final recovery deneniyor', { email, submitResult, finalUrl });
+        try {
+            loginCtx = await ensureLoginFormWithReload() || loginCtx;
+            userEl = loginCtx?.userEl || userEl;
+            passEl = loginCtx?.passEl || passEl;
+            evalTarget = loginCtx?.frame || page;
+            if (loginCtx?.userEl && loginCtx?.passEl) {
+                await fillLoginCredentials(loginCtx);
+            }
+            await ensureTurnstileTokenOnPage(page, email, 'launchAndLogin.finalRecovery', { targetFrame: loginCtx?.frame || undefined });
+            await delay(1000);
+            const finalRecoverySubmit = await tryClickGirisBtn();
+            if (!finalRecoverySubmit) {
+                const retrySubmit = await tryFormSubmitEarly();
+                if (retrySubmit) {
+                    logger.info('launchAndLogin: final recovery submit', { email, method: retrySubmit });
+                }
+            }
+            await Promise.race([
+                page.waitForNavigation({ waitUntil: 'load', timeout: 20000 }).catch(() => {}),
+                page.waitForFunction(() => !/\/giris(\?|$)/i.test(location.href || ''), { timeout: 20000 }).catch(() => {}),
+                delay(20000)
+            ]);
+            await delay(getCfg().DELAYS.AFTER_LOGIN || 800);
+            finalUrl = (() => { try { return page.url(); } catch { return ''; } })();
+        } catch (e) {
+            logger.warn('launchAndLogin: final recovery failed', { email, error: e?.message || String(e) });
         }
     }
     if (/\/giris(\?|$)/i.test(finalUrl)) {
@@ -4466,10 +4623,19 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
             const waitForSvgLegendEntries = async () => {
                 for (let attempt = 1; attempt <= 6; attempt++) {
                     const entries = await readSvgLegendEntries();
-                    if (Array.isArray(entries) && entries.length) return entries;
+                    if (Array.isArray(entries) && entries.length) {
+                        try { svgLegendEntriesCache.set(page, entries); } catch {}
+                        return { entries, source: 'live' };
+                    }
                     await delay(250);
                 }
-                return [];
+                const cached = (() => {
+                    try { return svgLegendEntriesCache.get(page) || []; } catch { return []; }
+                })();
+                if (Array.isArray(cached) && cached.length) {
+                    return { entries: cached, source: 'cache' };
+                }
+                return { entries: [], source: 'empty' };
             };
             const readVisibleSvgTooltipText = async () => {
                 return await page.evaluate(() => {
@@ -4728,7 +4894,8 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                     continue;
                 }
 
-                const svgLegendEntries = await waitForSvgLegendEntries();
+                const legendState = await waitForSvgLegendEntries();
+                const svgLegendEntries = Array.isArray(legendState?.entries) ? legendState.entries : [];
                 const matchedLegendEntries = svgLegendEntries
                     .filter((entry) => getSvgCategoryMatchScore(entry?.title || '', requestedSvgTexts) > 0)
                     .map((entry) => ({
@@ -4745,6 +4912,7 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                     categoryType: cat || null,
                     alternativeCategory: alt || null,
                     desiredTexts: svgDesiredTexts,
+                    legendSource: legendState?.source || 'empty',
                     legendCount: svgLegendEntries.length,
                     legendMatches: matchedLegendEntries.map((entry) => ({
                         title: entry.title,
@@ -5780,7 +5948,11 @@ async function startBotAfterValidation(req, res, validatedData) {
 
     /** Arayüz: eşleşme tablosu (GET /run/:id/status → pairDashboard). */
     let dashboardPairs = [];
-    const dashboardMeta = { cTargetPairIndex: 1 };
+    const dashboardMeta = { cTargetPairIndex: 1, activePairIndex: null };
+    const pairRuntimeByIndex = new Map();
+    const pairRecordKeyByIndex = new Map();
+    let paymentQueueState = [];
+    let paymentQueueActivePairIndex = null;
 
     const fmtSeatLabel = (si) => {
         if (!si) return '—';
@@ -5791,6 +5963,70 @@ async function startBotAfterValidation(req, res, validatedData) {
             if (si.seatId) return String(si.seatId);
         } catch {}
         return '—';
+    };
+
+    const buildBasketTimingPatch = ({ basketArrivedAtMs = null, remainingSeconds = null, observedAtMs = null } = {}) => {
+        const holdingTimeSeconds = Number(getCfg()?.BASKET?.HOLDING_TIME_SECONDS || 600);
+        const observed = Number.isFinite(Number(observedAtMs)) ? Math.floor(Number(observedAtMs)) : Date.now();
+        const arrived = Number.isFinite(Number(basketArrivedAtMs)) ? Math.floor(Number(basketArrivedAtMs)) : null;
+        const remaining = Number.isFinite(Number(remainingSeconds)) ? Math.max(0, Math.floor(Number(remainingSeconds))) : null;
+        return {
+            basketHoldingTimeSeconds: holdingTimeSeconds,
+            basketArrivedAtMs: arrived,
+            basketRemainingSeconds: remaining,
+            basketObservedAt: remaining != null ? new Date(observed).toISOString() : null
+        };
+    };
+
+    const resolveRuntimeBasketTiming = (runtime = {}, preferredHolder = '') => {
+        const holder = String(preferredHolder || runtime?.currentHolder || '').toUpperCase();
+        const source = holder === 'B'
+            ? (runtime?.bCtx || {})
+            : (runtime?.aCtx || {});
+        const arrivedAtMs = source?.basketArrivedAtMs ?? runtime?.basketArrivedAtMs ?? null;
+        const remainingSeconds = source?.basketRemainingSeconds ?? runtime?.basketRemainingSeconds ?? null;
+        const observedAt = source?.basketObservedAt ?? runtime?.basketObservedAt ?? null;
+        return buildBasketTimingPatch({
+            basketArrivedAtMs: arrivedAtMs,
+            remainingSeconds,
+            observedAtMs: observedAt ? Date.parse(String(observedAt)) : null
+        });
+    };
+
+    const resolveDashboardActivePair = () => {
+        const idx = parseInt(String(dashboardMeta.activePairIndex ?? '').trim(), 10);
+        if (!Number.isFinite(idx) || idx < 1) return null;
+        return dashboardPairs.some((p) => Number(p?.pairIndex) === idx) ? idx : null;
+    };
+
+    const upsertPaymentQueueEntry = (entry) => {
+        if (!entry || !Number.isFinite(Number(entry.pairIndex))) return null;
+        const pairIndex = Math.max(1, Math.floor(Number(entry.pairIndex)));
+        const prev = paymentQueueState.find((item) => Number(item.pairIndex) === pairIndex) || {};
+        const next = { ...prev, ...entry, pairIndex };
+        const without = paymentQueueState.filter((item) => Number(item.pairIndex) !== pairIndex);
+        without.push(next);
+        without.sort((a, b) => Number(a.pairIndex) - Number(b.pairIndex));
+        paymentQueueState = without;
+        return next;
+    };
+
+    const upsertDashboardPairRow = (pairIndex, patch = {}) => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        const prev = dashboardPairs.find((row) => Number(row?.pairIndex) === idx) || { pairIndex: idx };
+        const next = { ...prev, pairIndex: idx, ...patch };
+        const rest = dashboardPairs.filter((row) => Number(row?.pairIndex) !== idx);
+        rest.push(next);
+        rest.sort((a, b) => Number(a?.pairIndex || 0) - Number(b?.pairIndex || 0));
+        dashboardPairs = rest;
+        try { syncDashboardToRunStore(); } catch {}
+        return next;
+    };
+
+    const markPairPaymentState = (pairIndex, patch = {}) => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        upsertPaymentQueueEntry({ pairIndex: idx, ...patch });
+        upsertDashboardPairRow(idx, patch);
     };
 
     /** Tek çift + panelde yanlış C eşleşme # ile canlı tutucu/koltuk hiç satıra yazılmamasını önler. */
@@ -5820,11 +6056,15 @@ async function startBotAfterValidation(req, res, validatedData) {
         try {
             if (!dashboardPairs.length) return;
             const cTarget = resolveDashboardCTarget();
+            const activePair = resolveDashboardActivePair();
             const merged = dashboardPairs.map((p) => {
                 const idx = Number(p.pairIndex);
                 const isTarget = Number.isFinite(idx) && idx === cTarget;
-                const row = { ...p, isCTarget: isTarget };
-                if (isTarget) {
+                const isActivePair = Number.isFinite(idx) && activePair != null && idx === activePair;
+                const runtime = pairRuntimeByIndex.get(idx) || null;
+                const runtimeTiming = resolveRuntimeBasketTiming(runtime, p?.holder || runtime?.currentHolder || '');
+                const row = { ...runtimeTiming, ...p, isCTarget: isTarget, isActivePair };
+                if (isActivePair || (!activePair && isTarget)) {
                     row.holder = currentHolder;
                     row.seatLabel = fmtSeatLabel(currentSeatInfo) || row.seatLabel || '—';
                     row.seatId = currentSeatInfo?.seatId ? String(currentSeatInfo.seatId) : row.seatId;
@@ -5841,7 +6081,13 @@ async function startBotAfterValidation(req, res, validatedData) {
                     mode: isMulti ? 'multi' : 'single',
                     pairCount: merged.length,
                     cTargetPairIndex: cTarget,
+                    activePairIndex: activePair,
                     pairs: merged,
+                    updatedAt: new Date().toISOString()
+                },
+                paymentQueue: {
+                    activePairIndex: paymentQueueActivePairIndex,
+                    queue: paymentQueueState.map((item) => ({ ...item })),
                     updatedAt: new Date().toISOString()
                 }
             });
@@ -5855,8 +6101,10 @@ async function startBotAfterValidation(req, res, validatedData) {
         try {
             if (dashboardPairs.length) {
                 const cTarget = resolveDashboardCTarget();
+                const activePair = resolveDashboardActivePair();
+                const targetPair = activePair || cTarget;
                 dashboardPairs = dashboardPairs.map((p) => {
-                    if (Number(p.pairIndex) !== cTarget) return p;
+                    if (Number(p.pairIndex) !== targetPair) return p;
                     const next = { ...p, holder: role };
                     if (seatInfo) {
                         next.seatId = seatInfo.seatId ? String(seatInfo.seatId) : next.seatId;
@@ -5877,10 +6125,596 @@ async function startBotAfterValidation(req, res, validatedData) {
         try {
             const st = runStore.get(runId);
             if (!st) return { requested: false };
-            return { requested: !!st.finalizeRequested, cAccount: st.cAccount || null, finalizeMeta: st.finalizeMeta || null };
+            return {
+                requested: !!st.finalizeRequested,
+                cAccount: st.cAccount || null,
+                finalizeMeta: st.finalizeMeta || null,
+                cTransferPairIndex: st.cTransferPairIndex ?? 1
+            };
         } catch {
             return { requested: false };
         }
+    };
+
+    const getPairRecordKey = (pairIndex, seatInfo = null) => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        const existing = pairRecordKeyByIndex.get(idx);
+        if (existing) return existing;
+        const seatId = String(
+            seatInfo?.seatId ||
+            pairRuntimeByIndex.get(idx)?.currentSeatInfo?.seatId ||
+            pairRuntimeByIndex.get(idx)?.aCtx?.seatInfo?.seatId ||
+            currentSeatInfo?.seatId ||
+            `pair-${idx}`
+        ).trim();
+        const key = `${runId}:${idx}:${seatId || `pair-${idx}`}`;
+        pairRecordKeyByIndex.set(idx, key);
+        return key;
+    };
+
+    const buildOrderRecordPayload = (pairIndex, extra = {}) => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        const runtime = pairRuntimeByIndex.get(idx) || {};
+        const seat = extra.seat || runtime.currentSeatInfo || runtime.aCtx?.seatInfo || currentSeatInfo || null;
+        const category = extra.category || runtime.currentCatBlock || runtime.aCtx?.catBlock || currentCatBlock || null;
+        return {
+            recordKey: getPairRecordKey(idx, seat),
+            runId,
+            teamId,
+            teamName: team,
+            eventUrl: eventAddress,
+            ticketType,
+            pairIndex: idx,
+            sourceRole: extra.sourceRole || runtime.currentHolder || currentHolder || 'A',
+            holderRole: extra.holderRole || runtime.currentHolder || currentHolder || '',
+            paymentOwnerRole: extra.paymentOwnerRole || '',
+            paymentSource: extra.paymentSource !== undefined ? extra.paymentSource : null,
+            paymentActorEmail: extra.paymentActorEmail || '',
+            paymentState: extra.paymentState || 'none',
+            finalizeState: extra.finalizeState || 'none',
+            recordStatus: extra.recordStatus || 'basketed',
+            aAccountEmail: extra.aAccountEmail || runtime.aCtx?.email || emailA || '',
+            bAccountEmail: extra.bAccountEmail || runtime.bCtx?.email || emailB || '',
+            cAccountEmail: extra.cAccountEmail || getFinalizeRequest()?.cAccount?.email || '',
+            seat,
+            category,
+            basketStatus: extra.basketStatus || 'in_basket',
+            auditMeta: extra.auditMeta || {}
+        };
+    };
+
+    const safePersistOrderRecord = async (label, fn) => {
+        try {
+            return await fn();
+        } catch (error) {
+            try { logger.warnSafe(`order_record_${label}_failed`, { runId, error: error?.message || String(error) }); } catch {}
+            return null;
+        }
+    };
+
+    const persistBasketRecordForPair = async (pairIndex, extra = {}) => {
+        const payload = buildOrderRecordPayload(pairIndex, extra);
+        return safePersistOrderRecord('basket_upsert', () => orderRecordRepo.upsertBasketRecord(payload));
+    };
+
+    const persistTransferForPair = async (pairIndex, extra = {}) => {
+        const payload = buildOrderRecordPayload(pairIndex, extra);
+        return safePersistOrderRecord('transfer', () => orderRecordRepo.markTransfer(payload.recordKey, payload));
+    };
+
+    const persistAPaymentReadyForPair = async (pairIndex, extra = {}) => {
+        const payload = buildOrderRecordPayload(pairIndex, extra);
+        return safePersistOrderRecord('a_payment_ready', () => orderRecordRepo.markAPaymentReady(payload.recordKey, payload));
+    };
+
+    const persistAPaymentCompletedForPair = async (pairIndex, extra = {}) => {
+        const payload = buildOrderRecordPayload(pairIndex, extra);
+        return safePersistOrderRecord('a_payment_completed', () => orderRecordRepo.markAPaymentCompleted(payload.recordKey, payload));
+    };
+
+    const persistCFinalizeReadyForPair = async (pairIndex, extra = {}) => {
+        const payload = buildOrderRecordPayload(pairIndex, extra);
+        return safePersistOrderRecord('c_finalize_ready', () => orderRecordRepo.markCFinalizeReady(payload.recordKey, payload));
+    };
+
+    const persistCFinalizeCompletedForPair = async (pairIndex, extra = {}) => {
+        const payload = buildOrderRecordPayload(pairIndex, extra);
+        return safePersistOrderRecord('c_finalize_completed', () => orderRecordRepo.markCFinalizeCompleted(payload.recordKey, payload));
+    };
+
+    const persistFailureForPair = async (pairIndex, extra = {}) => {
+        const payload = buildOrderRecordPayload(pairIndex, extra);
+        return safePersistOrderRecord('failed', () => orderRecordRepo.markFailed(payload.recordKey, payload));
+    };
+
+    const updatePairRuntime = (pairIndex, patch = {}) => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        const prev = pairRuntimeByIndex.get(idx);
+        if (!prev) return null;
+        const next = { ...prev, ...patch };
+        pairRuntimeByIndex.set(idx, next);
+        return next;
+    };
+
+    const bindPairRuntime = (pairIndex, reason = 'bind') => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        const runtime = pairRuntimeByIndex.get(idx);
+        if (!runtime) return null;
+        dashboardMeta.activePairIndex = idx;
+        paymentQueueActivePairIndex = idx;
+        if (runtime.aCtx) {
+            browserA = runtime.aCtx.browser || browserA;
+            pageA = runtime.aCtx.page || pageA;
+            emailA = runtime.aCtx.email || emailA;
+            passwordA = runtime.aCtx.password || passwordA;
+        }
+        if (runtime.bCtx) {
+            browserB = runtime.bCtx.browser || browserB;
+            pageB = runtime.bCtx.page || pageB;
+            emailB = runtime.bCtx.email || emailB;
+            passwordB = runtime.bCtx.password || passwordB;
+        }
+        idProfileA = runtime.idProfileA || aList[idx - 1] || idProfileA;
+        idProfileB = runtime.idProfileB || bList[idx - 1] || idProfileB;
+        if (runtime.currentCatBlock) currentCatBlock = runtime.currentCatBlock;
+        if (runtime.currentSeatInfo) currentSeatInfo = runtime.currentSeatInfo;
+        if (runtime.currentHolder) currentHolder = runtime.currentHolder;
+        try {
+            audit('pair_runtime_bound', {
+                pairIndex: idx,
+                reason,
+                holder: currentHolder || null,
+                seatId: currentSeatInfo?.seatId || null,
+                aEmail: emailA || null,
+                bEmail: emailB || null
+            });
+        } catch {}
+        try { syncDashboardToRunStore(); } catch {}
+        return runtime;
+    };
+
+    const bindFinalizePairFromRunState = () => {
+        const fin = getFinalizeRequest();
+        const idx = Math.max(1, Math.floor(Number(fin?.cTransferPairIndex) || 1));
+        return bindPairRuntime(idx, 'finalize');
+    };
+
+    const preparePaymentOnA = async (pairIndex, seatInfoForA = currentSeatInfo) => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        if (!pageA) throw new Error(`A_PAYMENT_PAGE_MISSING:${idx}`);
+        const runtime = pairRuntimeByIndex.get(idx) || null;
+        const paymentIdentity = String(runtime?.idProfileA?.identity || idProfileA?.identity || identity || '').trim();
+        const isOnPaymentUrl = () => {
+            try { return /\/odeme(\b|\/|\?|#)/i.test(String(pageA.url() || '')); } catch { return false; }
+        };
+        const waitForPaymentIframe = async (timeout = 15000) => {
+            const iframe = await pageA.waitForSelector('iframe#payment_nkolay_frame', { timeout }).catch(() => null);
+            return !!iframe;
+        };
+        markPairPaymentState(idx, {
+            paymentOwnerRole: 'A',
+            paymentEligible: true,
+            paymentState: hasCardInfo ? 'preparing' : 'waiting',
+            phase: hasCardInfo ? 'A ödeme sayfası hazırlanıyor' : 'A sepette tutuluyor'
+        });
+
+        if (!basketTimer) basketTimer = new BasketTimer();
+        try { basketTimer.start(); } catch {}
+        setHolder('A', seatInfoForA, currentCatBlock);
+
+        if (!hasCardInfo) {
+            updatePairRuntime(idx, { currentHolder: 'A', currentSeatInfo: seatInfoForA, currentCatBlock });
+            return { ok: true, payment: 'no_card' };
+        }
+
+        if (!/^\d{11}$/.test(paymentIdentity)) {
+            throw new Error(`A_PAYMENT_IDENTITY_REQUIRED:${idx}`);
+        }
+
+        setStep(`PAIR${idx}.A.payment.tcAssign.start`);
+        const okTcAssign = await ensureTcAssignedOnBasket(pageA, paymentIdentity, { preferAssignToMyId: true, maxAttempts: 4 });
+        setStep(`PAIR${idx}.A.payment.tcAssign.done`, { ok: !!okTcAssign });
+        try { audit('a_payment_tc_assign', { pairIndex: idx, aEmail: emailA, seatId: seatInfoForA?.seatId || null, ok: !!okTcAssign }); } catch {}
+        if (!okTcAssign) {
+            throw new Error(`A_PAYMENT_TC_ASSIGN_FAILED:${idx}`);
+        }
+
+        setStep(`PAIR${idx}.A.payment.devamToOdeme.start`);
+        const clickedContinue = await clickBasketDevamToOdeme(pageA);
+        if (!clickedContinue) {
+            throw new Error(`A_PAYMENT_CONTINUE_CLICK_FAILED:${idx}`);
+        }
+        if (!isOnPaymentUrl()) {
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                const didDismiss = await dismissPaymentInfoModalIfPresent(pageA).catch(() => false);
+                if (isOnPaymentUrl()) break;
+                if (!didDismiss) {
+                    await pageA.waitForFunction(() => /\/odeme(\b|\/|\?|#)/i.test(String(location.href || '')), { timeout: 4000 }).catch(() => {});
+                }
+                if (isOnPaymentUrl()) break;
+            }
+        }
+        setStep(`PAIR${idx}.A.payment.devamToOdeme.done`, { url: (() => { try { return pageA.url(); } catch { return null; } })(), ok: isOnPaymentUrl() });
+        if (!isOnPaymentUrl()) {
+            throw new Error(`A_PAYMENT_CONTINUE_BLOCKED:${idx}`);
+        }
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            const dismissed = await dismissPaymentInfoModalIfPresent(pageA).catch(() => false);
+            if (!dismissed) break;
+        }
+
+        let iframeReady = await waitForPaymentIframe(4000);
+        if (!iframeReady) {
+            setStep(`PAIR${idx}.A.payment.invoiceTc.start`);
+            const okInvoice = await fillInvoiceTcAndContinue(pageA, paymentIdentity);
+            setStep(`PAIR${idx}.A.payment.invoiceTc.done`, { ok: !!okInvoice });
+            try { audit('a_payment_invoice_tc', { pairIndex: idx, aEmail: emailA, seatId: seatInfoForA?.seatId || null, ok: !!okInvoice }); } catch {}
+            for (let attempt = 1; attempt <= 2; attempt++) {
+                const dismissed = await dismissPaymentInfoModalIfPresent(pageA).catch(() => false);
+                if (!dismissed) break;
+            }
+            iframeReady = await waitForPaymentIframe(6000);
+        }
+
+        if (!iframeReady) {
+            setStep(`PAIR${idx}.A.payment.agreements.start`);
+            const okAgreements = await acceptAgreementsAndContinue(pageA);
+            setStep(`PAIR${idx}.A.payment.agreements.done`, { ok: !!okAgreements });
+            try { audit('a_payment_agreements', { pairIndex: idx, aEmail: emailA, seatId: seatInfoForA?.seatId || null, ok: !!okAgreements }); } catch {}
+            iframeReady = await waitForPaymentIframe(12000);
+        }
+
+        if (!iframeReady) {
+            throw new Error(`A_PAYMENT_IFRAME_NOT_READY:${idx}`);
+        }
+
+        const cardData = { cardHolder, cardNumber, expiryMonth, expiryYear, cvv };
+        setStep(`PAIR${idx}.A.payment.iframeFill.start`);
+        const okIframe = await fillNkolayPaymentIframe(pageA, cardData, { clickPay: false });
+        setStep(`PAIR${idx}.A.payment.iframeFill.done`, { ok: !!okIframe });
+        try { audit('a_payment_iframe_filled', { pairIndex: idx, aEmail: emailA, seatId: seatInfoForA?.seatId || null, ok: !!okIframe }); } catch {}
+        if (!okIframe) {
+            throw new Error(`A_PAYMENT_IFRAME_FILL_FAILED:${idx}`);
+        }
+
+        markPairPaymentState(idx, {
+            paymentOwnerRole: 'A',
+            paymentEligible: true,
+            paymentState: 'ready',
+            phase: 'A ödeme sayfası hazır'
+        });
+        updatePairRuntime(idx, { currentHolder: 'A', currentSeatInfo: seatInfoForA, currentCatBlock });
+        await persistAPaymentReadyForPair(idx, {
+            holderRole: 'A',
+            paymentOwnerRole: 'A',
+            paymentSource: 'A',
+            paymentActorEmail: emailA,
+            paymentState: hasCardInfo ? 'a_ready' : 'none',
+            recordStatus: hasCardInfo ? 'payment_ready' : 'basketed',
+            aAccountEmail: emailA,
+            seat: seatInfoForA,
+            category: currentCatBlock,
+            auditMeta: {
+                phase: 'a_payment_ready',
+                hasCardInfo,
+                aEmail: emailA
+            }
+        });
+        try { audit('a_payment_ready', { pairIndex: idx, aEmail: emailA, seatId: seatInfoForA?.seatId || null }); } catch {}
+        return { ok: true, payment: 'ready' };
+    };
+
+    const moveSeatToAForPayment = async (pairIndex) => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        const runtime = bindPairRuntime(idx, 'payment_queue');
+        if (!runtime) throw new Error(`PAIR_RUNTIME_NOT_FOUND:${idx}`);
+        if (runtime.currentHolder === 'A' || currentHolder === 'A') {
+            return runtime.currentSeatInfo || currentSeatInfo;
+        }
+        if (!runtime.bCtx || !runtime.currentSeatInfo?.seatId) {
+            throw new Error(`PAIR_NOT_READY_FOR_A_PAYMENT:${idx}`);
+        }
+
+        markPairPaymentState(idx, {
+            paymentOwnerRole: 'A',
+            paymentEligible: true,
+            paymentState: 'preparing',
+            phase: 'B→A ödeme transferi hazırlanıyor'
+        });
+
+        const activeCatBlock = runtime.currentCatBlock || currentCatBlock || runtime.aCtx?.catBlock || null;
+        const activeSeatInfo = runtime.currentSeatInfo || currentSeatInfo;
+        const aIdentity = idProfileA?.identity ?? identity;
+        const aFanCard = idProfileA?.fanCardCode ?? fanCardCode;
+        const aSicilNo = idProfileA?.sicilNo ?? sicilNo;
+        const aPriorityTicketCode = idProfileA?.priorityTicketCode ?? priorityTicketCode;
+
+        try { await reloginIfRedirected(pageA, emailA, passwordA); } catch {}
+        await gotoWithRetry(pageA, String(eventAddress), {
+            retries: 2,
+            waitUntil: 'networkidle2',
+            expectedUrlIncludes: eventPathIncludes,
+            rejectIfHome: true,
+            backoffMs: 450
+        });
+        await clickBuy(pageA, eventAddress);
+        await handlePrioritySaleModal(pageA, {
+            prioritySale,
+            fanCardCode: aFanCard,
+            identity: aIdentity,
+            sicilNo: aSicilNo,
+            priorityTicketCode: aPriorityTicketCode
+        });
+        await ensureUrlContains(pageA, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
+        await pageA.waitForSelector('.custom-select-box, .ticket-type-title, #custom_seat_button', { timeout: 12000 }).catch(() => {});
+
+        try { await reloginIfRedirected(pageB, emailB, passwordB); } catch {}
+        try {
+            await gotoWithRetry(pageB, 'https://www.passo.com.tr/tr/sepet', {
+                retries: 2,
+                waitUntil: 'networkidle2',
+                expectedUrlIncludes: '/sepet',
+                rejectIfHome: false,
+                backoffMs: 450
+            });
+            await pageB.waitForSelector(BASKET_ROOT_SELECTOR, { timeout: 8000 }).catch(() => {});
+        } catch {}
+
+        let removed = false;
+        let removeDiag = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            if (removed) break;
+            removeDiag = await clearBasketFully(pageB, { timeoutMs: getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT });
+            removed = removeDiag?.ok === true;
+            if (removed) break;
+            try { await delay(1200 + (attempt * 300)); } catch {}
+        }
+        if (!removed) throw new Error(`B_TO_A_REMOVE_FAILED:${idx}`);
+
+        try { await applyCategoryBlockSelection(pageA, categorySelectionMode, activeCatBlock, activeSeatInfo); } catch {}
+        try { await openSeatMapStrict(pageA); } catch {}
+        const exactMaxMs = Math.max(30000, Math.min((getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0), 120000));
+        const seatInfoOnA = await pickExactSeatBundleReleaseAware(pageA, activeSeatInfo, exactMaxMs, {
+            audit: (phase, payload) => audit(`a_queue_${phase}`, { pairIndex: idx, aEmail: emailA, ...payload })
+        });
+        await clickContinueInsidePage(pageA);
+        await delay(getCfg().DELAYS.AFTER_CONTINUE);
+        if (!basketTimer) basketTimer = new BasketTimer();
+        try { basketTimer.start(); } catch {}
+        const parkedOnA = await parkHolderOnBasket(pageA, basketTimer, {
+            email: emailA,
+            password: passwordA,
+            reloginIfRedirected,
+            label: `PAIR${idx}.A.afterContinue`
+        });
+        const basketTimingPatch = buildBasketTimingPatch({
+            basketArrivedAtMs: Date.now(),
+            remainingSeconds: parkedOnA?.remainingSeconds,
+            observedAtMs: Date.now()
+        });
+        currentCatBlock = activeCatBlock || currentCatBlock;
+        setHolder('A', seatInfoOnA, currentCatBlock);
+        updatePairRuntime(idx, {
+            aCtx: {
+                ...(runtime?.aCtx || {}),
+                ...basketTimingPatch
+            },
+            currentHolder: 'A',
+            currentSeatInfo: seatInfoOnA,
+            currentCatBlock,
+            lastBRemoveDiag: removeDiag || null,
+            ...basketTimingPatch
+        });
+        upsertDashboardPairRow(idx, {
+            holder: 'A',
+            seatId: seatInfoOnA?.seatId ? String(seatInfoOnA.seatId) : null,
+            seatLabel: fmtSeatLabel(seatInfoOnA),
+            tribune: seatInfoOnA?.tribune ?? null,
+            seatRow: seatInfoOnA?.row ?? null,
+            seatNumber: seatInfoOnA?.seat ?? null,
+            ...basketTimingPatch
+        });
+        return seatInfoOnA;
+    };
+
+    const getPairBasketRemainingSeconds = async (pairIndex) => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        const runtime = pairRuntimeByIndex.get(idx);
+        if (!runtime) return null;
+        const holder = String(runtime.currentHolder || '').toUpperCase();
+        const page = holder === 'B' ? runtime?.bCtx?.page : runtime?.aCtx?.page;
+        if (!page) return null;
+        try {
+            const uiStatus = await checkBasketTimeoutFromPage(page);
+            const rem = Number(uiStatus?.remainingSeconds);
+            if (Number.isFinite(rem) && rem >= 0) return rem;
+        } catch {}
+        const arrivedAt = holder === 'B'
+            ? Number(runtime?.bCtx?.basketArrivedAtMs || runtime?.basketArrivedAtMs || 0)
+            : Number(runtime?.aCtx?.basketArrivedAtMs || runtime?.basketArrivedAtMs || 0);
+        if (!Number.isFinite(arrivedAt) || arrivedAt <= 0) return null;
+        const holdSec = Number(getCfg()?.BASKET?.HOLDING_TIME_SECONDS || 600);
+        const elapsedSec = Math.max(0, Math.floor((Date.now() - arrivedAt) / 1000));
+        return Math.max(0, holdSec - elapsedSec);
+    };
+
+    const transferSeatToBForHold = async (pairIndex, reason = 'threshold') => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        const runtime = pairRuntimeByIndex.get(idx);
+        if (!runtime) throw new Error(`PAIR_RUNTIME_NOT_FOUND:${idx}`);
+        const aCtx = runtime.aCtx;
+        const bCtx = runtime.bCtx;
+        if (!aCtx?.seatInfo?.seatId) throw new Error(`PAIR_A_SEAT_MISSING:${idx}`);
+        if (!bCtx?.page) throw new Error(`PAIR_B_CTX_MISSING:${idx}`);
+        if (String(runtime.currentHolder || '').toUpperCase() === 'B') return runtime.currentSeatInfo || aCtx.seatInfo;
+
+        audit('deferred_payer_transfer_start', {
+            pairIndex: idx,
+            reason,
+            aEmail: aCtx.email,
+            bEmail: bCtx.email,
+            seatId: aCtx.seatInfo.seatId
+        });
+
+        try {
+            await gotoWithRetry(aCtx.page, 'https://www.passo.com.tr/tr/sepet', {
+                retries: 1,
+                waitUntil: 'networkidle2',
+                expectedUrlIncludes: '/sepet',
+                rejectIfHome: false,
+                backoffMs: 350
+            });
+        } catch {}
+
+        let removed = false;
+        let removeDiag = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            if (removed) break;
+            removeDiag = await clearBasketFully(aCtx.page, { timeoutMs: getCfg().TIMEOUTS.REMOVE_FROM_CART_TIMEOUT });
+            removed = removeDiag?.ok === true;
+            if (removed) break;
+            try { await delay(1200 + (attempt * 300)); } catch {}
+        }
+        if (!removed) throw new Error(`A_TO_B_DEFERRED_REMOVE_FAILED:${idx}`);
+
+        try {
+            await applyCategoryBlockSelection(bCtx.page, categorySelectionMode, aCtx.catBlock, aCtx.seatInfo);
+        } catch (e) {
+            audit('deferred_payer_transfer_apply_catblock_warn', {
+                pairIndex: idx,
+                bEmail: bCtx.email,
+                error: e?.message || String(e)
+            }, 'warn');
+        }
+
+        if (!bCtx.seatmapReady) {
+            try {
+                await openSeatMapStrict(bCtx.page);
+                await bCtx.page.waitForFunction((sel) => {
+                    try { return document.querySelectorAll(sel).length > 0; } catch { return false; }
+                }, { timeout: 10000 }, SEAT_NODE_SELECTOR);
+            } catch (e) {
+                audit('deferred_payer_transfer_seatmap_reopen_warn', {
+                    pairIndex: idx,
+                    bEmail: bCtx.email,
+                    error: e?.message || String(e)
+                }, 'warn');
+            }
+        }
+
+        const transferTargets = normalizeHeldSeats(aCtx.seatInfo);
+        const exactMaxMs = Math.max(30000, Math.min((getCfg().TIMEOUTS.SEAT_PICK_EXACT_MAX || 0) * Math.max(1, transferTargets.length || 1), 120000));
+        const seatBInfo = await pickExactSeatBundleReleaseAware(bCtx.page, aCtx.seatInfo, exactMaxMs, {
+            audit: (phase, payload) => audit(`deferred_payer_b_${phase}`, { pairIndex: idx, bEmail: bCtx.email, ...payload })
+        });
+        const basketTimingPatch = buildBasketTimingPatch({
+            basketArrivedAtMs: Date.now(),
+            remainingSeconds: seatBInfo?.remainingTime,
+            observedAtMs: Date.now()
+        });
+
+        updatePairRuntime(idx, {
+            aCtx,
+            bCtx: {
+                ...(bCtx || {}),
+                ...basketTimingPatch
+            },
+            currentHolder: 'B',
+            currentSeatInfo: seatBInfo || aCtx?.seatInfo || null,
+            currentCatBlock: aCtx?.catBlock || null,
+            lastBRemoveDiag: removeDiag || null,
+            ...basketTimingPatch
+        });
+        upsertDashboardPairRow(idx, {
+            aEmail: aCtx?.email || '',
+            bEmail: bCtx?.email || '',
+            holder: 'B',
+            seatId: seatBInfo?.seatId ? String(seatBInfo.seatId) : (aCtx?.seatInfo?.seatId ? String(aCtx.seatInfo.seatId) : null),
+            seatLabel: fmtSeatLabel(seatBInfo),
+            tribune: seatBInfo?.tribune ?? null,
+            seatRow: seatBInfo?.row ?? null,
+            seatNumber: seatBInfo?.seat ?? null,
+            phase: 'B sepette — A ödeme sırası bekliyor',
+            paymentOwnerRole: 'A',
+            paymentEligible: true,
+            paymentState: hasCardInfo ? 'queued' : 'waiting',
+            transferOk: true,
+            ...basketTimingPatch
+        });
+        upsertPaymentQueueEntry({
+            pairIndex: idx,
+            paymentOwnerRole: 'A',
+            paymentEligible: true,
+            paymentState: hasCardInfo ? 'queued' : 'waiting',
+            aEmail: aCtx?.email || '',
+            bEmail: bCtx?.email || ''
+        });
+        await persistTransferForPair(idx, {
+            sourceRole: 'B',
+            holderRole: 'B',
+            paymentOwnerRole: 'A',
+            recordStatus: 'transferred',
+            aAccountEmail: aCtx?.email || '',
+            bAccountEmail: bCtx?.email || '',
+            seat: seatBInfo,
+            category: aCtx?.catBlock || null,
+            auditMeta: {
+                phase: 'deferred_payer_transfer_done',
+                reason,
+                aEmail: aCtx?.email || '',
+                bEmail: bCtx?.email || ''
+            }
+        });
+        audit('deferred_payer_transfer_done', {
+            pairIndex: idx,
+            reason,
+            aEmail: aCtx.email,
+            bEmail: bCtx.email,
+            seatId: seatBInfo?.seatId || aCtx?.seatInfo?.seatId || null
+        });
+        return seatBInfo;
+    };
+
+    const ensureDeferredPayableTransferWatcher = () => {
+        if (deferredPayableTransferWatch) return;
+        deferredPayableTransferWatch = setInterval(async () => {
+            try {
+                const stKill = runStore.get(runId);
+                if (stKill && stKill.status === 'killed') {
+                    try { clearInterval(deferredPayableTransferWatch); } catch {}
+                    deferredPayableTransferWatch = null;
+                    return;
+                }
+                if (!hasCardInfo || finalizeInFlight || deferredPayableTransferInFlight) return;
+                const threshold = Number.isFinite(extendWhenRemainingSecondsBelow)
+                    ? extendWhenRemainingSecondsBelow
+                    : 90;
+                const activeIdx = Math.max(0, Math.floor(Number(paymentQueueActivePairIndex) || 0));
+                const candidates = Array.from(pairRuntimeByIndex.entries())
+                    .map(([candidateIndex, runtime]) => ({ pairIndex: Number(candidateIndex), runtime }))
+                    .filter(({ pairIndex, runtime }) => (
+                        runtime &&
+                        runtime.aCtx?.canPay !== false &&
+                        runtime.bCtx?.page &&
+                        String(runtime.currentHolder || '').toUpperCase() === 'A' &&
+                        pairIndex !== activeIdx
+                    ))
+                    .sort((a, b) => a.pairIndex - b.pairIndex);
+                for (const candidate of candidates) {
+                    const remaining = await getPairBasketRemainingSeconds(candidate.pairIndex);
+                    if (!Number.isFinite(remaining) || remaining > threshold) continue;
+                    audit('deferred_payer_transfer_triggered', {
+                        pairIndex: candidate.pairIndex,
+                        remainingSeconds: remaining,
+                        threshold
+                    });
+                    deferredPayableTransferInFlight = transferSeatToBForHold(candidate.pairIndex, 'remaining_threshold');
+                    try { await deferredPayableTransferInFlight; } finally { deferredPayableTransferInFlight = null; }
+                    break;
+                }
+            } catch {}
+        }, 2000);
     };
 
     const assertRunNotKilled = (label = '') => {
@@ -5900,6 +6734,8 @@ async function startBotAfterValidation(req, res, validatedData) {
         assertRunNotKilled('finalizeToC');
         const fin = getFinalizeRequest();
         if (!fin?.requested) return null;
+        try { bindFinalizePairFromRunState(); } catch {}
+        const finalizePairIndex = Math.max(1, Math.floor(Number(dashboardMeta.activePairIndex || fin?.cTransferPairIndex || 1)));
         const cAcc = fin?.cAccount;
         const finMeta = fin?.finalizeMeta || null;
         if (!cAcc?.email || !cAcc?.password) throw new Error('FINALIZE_C_ACCOUNT_MISSING');
@@ -5918,6 +6754,25 @@ async function startBotAfterValidation(req, res, validatedData) {
             cvv: (finMeta?.cvv != null && String(finMeta.cvv).trim()) ? String(finMeta.cvv).trim() : (cvv != null ? String(cvv).trim() : null)
         };
         const autoPayFinal = !!(finMeta && finMeta.autoPay === true);
+
+        await persistCFinalizeReadyForPair(finalizePairIndex, {
+            holderRole: currentHolder || 'B',
+            paymentOwnerRole: 'C',
+            paymentSource: 'C',
+            paymentActorEmail: cAcc?.email || '',
+            paymentState: 'c_ready',
+            finalizeState: 'requested',
+            recordStatus: 'finalize_ready',
+            cAccountEmail: cAcc?.email || '',
+            seat: currentSeatInfo,
+            category: currentCatBlock,
+            auditMeta: {
+                phase: 'c_finalize_ready',
+                cEmail: cAcc?.email || '',
+                holder: currentHolder || null,
+                autoPay: autoPayFinal
+            }
+        });
 
         audit('finalize_start', { holder: currentHolder, seatId: currentSeatInfo?.seatId || null, cEmail: cAcc.email });
         logger.warn('Finalize requested: transferring seat to C', { holder: currentHolder, seatId: currentSeatInfo?.seatId || null, cEmail: cAcc.email });
@@ -6130,8 +6985,18 @@ async function startBotAfterValidation(req, res, validatedData) {
         await delay(getCfg().DELAYS.AFTER_CONTINUE);
         setStep('C.clickContinue.done', { snap: await snapshotPage(pageC, 'C.afterContinue') });
 
-        // Payment / TCKN flow (best-effort; does not click final PAY)
+        // Payment / TCKN flow
         const paymentMeta = { tcAssigned: false, invoiceTcFilled: false, agreementsAccepted: false, iframeFilled: false, payClicked: false, autoPay: autoPayFinal };
+        const isCOnPaymentUrl = () => {
+            try { return /\/odeme(\b|\/|\?|#)/i.test(String(pageC.url() || '')); } catch { return false; }
+        };
+        const waitForCPaymentIframe = async (timeout = 15000) => {
+            const iframe = await pageC.waitForSelector('iframe#payment_nkolay_frame', { timeout }).catch(() => null);
+            return !!iframe;
+        };
+        if (!/^\d{11}$/.test(String(identityFinal || '').trim())) {
+            throw new Error('FINALIZE_IDENTITY_REQUIRED');
+        }
         try {
             setStep('C.payment.gotoBasket.start');
             await gotoWithRetry(pageC, 'https://www.passo.com.tr/tr/sepet', {
@@ -6145,63 +7010,107 @@ async function startBotAfterValidation(req, res, validatedData) {
             setStep('C.payment.gotoBasket.done', { url: (() => { try { return pageC.url(); } catch { return null; } })() });
         } catch {}
 
-        try {
-            if (identityFinal && String(identityFinal).trim().length === 11) {
-                setStep('C.payment.tcAssign.start');
-                const okTc = await ensureTcAssignedOnBasket(pageC, String(identityFinal).trim(), { preferAssignToMyId: true, maxAttempts: 3 });
-                paymentMeta.tcAssigned = !!okTc;
-                audit('c_payment_tc_assign', { ok: !!okTc, cEmail: cAcc.email, seatId: currentSeatInfo?.seatId || null });
-                setStep('C.payment.tcAssign.done', { ok: !!okTc });
+        setStep('C.payment.tcAssign.start');
+        const okTc = await ensureTcAssignedOnBasket(pageC, String(identityFinal).trim(), { preferAssignToMyId: true, maxAttempts: 4 });
+        paymentMeta.tcAssigned = !!okTc;
+        audit('c_payment_tc_assign', { ok: !!okTc, cEmail: cAcc.email, seatId: currentSeatInfo?.seatId || null });
+        setStep('C.payment.tcAssign.done', { ok: !!okTc });
+        if (!okTc) throw new Error('FINALIZE_TC_ASSIGN_FAILED');
+
+        setStep('C.payment.devamToOdeme.start');
+        const okContinue = await clickBasketDevamToOdeme(pageC);
+        if (!okContinue) throw new Error('FINALIZE_CONTINUE_CLICK_FAILED');
+        if (!isCOnPaymentUrl()) {
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                const didDismiss = await dismissPaymentInfoModalIfPresent(pageC).catch(() => false);
+                if (isCOnPaymentUrl()) break;
+                if (!didDismiss) {
+                    await pageC.waitForFunction(() => /\/odeme(\b|\/|\?|#)/i.test(String(location.href || '')), { timeout: 4000 }).catch(() => {});
+                }
+                if (isCOnPaymentUrl()) break;
             }
-        } catch {}
+        }
+        setStep('C.payment.devamToOdeme.done', { url: (() => { try { return pageC.url(); } catch { return null; } })(), ok: isCOnPaymentUrl() });
+        if (!isCOnPaymentUrl()) throw new Error('FINALIZE_CONTINUE_BLOCKED');
 
-        try {
-            setStep('C.payment.devamToOdeme.start');
-            await clickBasketDevamToOdeme(pageC);
-            await pageC.waitForFunction(() => /\/odeme(\b|\/|\?|#)/i.test(String(location.href || '')), { timeout: 30000 }).catch(() => {});
-            setStep('C.payment.devamToOdeme.done', { url: (() => { try { return pageC.url(); } catch { return null; } })() });
-        } catch {}
+        setStep('C.payment.dismissInfoModal.start');
+        let dismissedCount = 0;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            const didDismiss = await dismissPaymentInfoModalIfPresent(pageC).catch(() => false);
+            if (!didDismiss) break;
+            dismissedCount += 1;
+        }
+        setStep('C.payment.dismissInfoModal.done', { dismissedCount });
 
-        try {
-            setStep('C.payment.dismissInfoModal.start');
-            const didDismiss = await dismissPaymentInfoModalIfPresent(pageC);
-            setStep('C.payment.dismissInfoModal.done', { didDismiss: !!didDismiss });
-        } catch {}
-
-        try {
-            if (identityFinal && String(identityFinal).trim().length === 11) {
-                setStep('C.payment.invoiceTc.start');
-                const okInv = await fillInvoiceTcAndContinue(pageC, String(identityFinal).trim());
-                paymentMeta.invoiceTcFilled = !!okInv;
-                audit('c_payment_invoice_tc', { ok: !!okInv, cEmail: cAcc.email, seatId: currentSeatInfo?.seatId || null });
-                setStep('C.payment.invoiceTc.done', { ok: !!okInv });
+        let iframeReady = await waitForCPaymentIframe(4000);
+        if (!iframeReady) {
+            setStep('C.payment.invoiceTc.start');
+            const okInv = await fillInvoiceTcAndContinue(pageC, String(identityFinal).trim());
+            paymentMeta.invoiceTcFilled = !!okInv;
+            audit('c_payment_invoice_tc', { ok: !!okInv, cEmail: cAcc.email, seatId: currentSeatInfo?.seatId || null });
+            setStep('C.payment.invoiceTc.done', { ok: !!okInv });
+            for (let attempt = 1; attempt <= 2; attempt++) {
+                const didDismiss = await dismissPaymentInfoModalIfPresent(pageC).catch(() => false);
+                if (!didDismiss) break;
             }
-        } catch {}
+            iframeReady = await waitForCPaymentIframe(6000);
+        }
 
-        try {
+        if (!iframeReady) {
             setStep('C.payment.agreements.start');
             const okAg = await acceptAgreementsAndContinue(pageC);
             paymentMeta.agreementsAccepted = !!okAg;
             audit('c_payment_agreements', { ok: !!okAg, cEmail: cAcc.email, seatId: currentSeatInfo?.seatId || null });
             setStep('C.payment.agreements.done', { ok: !!okAg });
-        } catch {}
+            iframeReady = await waitForCPaymentIframe(12000);
+        }
 
-        try {
-            if (cardFinal.cardHolder && cardFinal.cardNumber && cardFinal.expiryMonth && cardFinal.expiryYear && cardFinal.cvv) {
-                setStep('C.payment.iframeFill.start');
-                const okFrame = await fillNkolayPaymentIframe(pageC, cardFinal, { clickPay: autoPayFinal });
-                if (autoPayFinal) {
-                    paymentMeta.iframeFilled = !!(okFrame && okFrame.ok);
-                    paymentMeta.payClicked = !!(okFrame && okFrame.payClicked);
-                } else {
-                    paymentMeta.iframeFilled = !!okFrame;
-                }
-                audit('c_payment_iframe_filled', { ok: !!paymentMeta.iframeFilled, payClicked: !!paymentMeta.payClicked, autoPay: autoPayFinal, cEmail: cAcc.email, seatId: currentSeatInfo?.seatId || null });
-                setStep('C.payment.iframeFill.done', { ok: !!paymentMeta.iframeFilled, payClicked: !!paymentMeta.payClicked, autoPay: autoPayFinal });
+        if (!iframeReady) throw new Error('FINALIZE_PAYMENT_IFRAME_NOT_READY');
+
+        if (cardFinal.cardHolder && cardFinal.cardNumber && cardFinal.expiryMonth && cardFinal.expiryYear && cardFinal.cvv) {
+            setStep('C.payment.iframeFill.start');
+            const okFrame = await fillNkolayPaymentIframe(pageC, cardFinal, { clickPay: autoPayFinal });
+            if (autoPayFinal) {
+                paymentMeta.iframeFilled = !!(okFrame && okFrame.ok);
+                paymentMeta.payClicked = !!(okFrame && okFrame.payClicked);
+            } else {
+                paymentMeta.iframeFilled = !!okFrame;
             }
-        } catch {}
+            audit('c_payment_iframe_filled', { ok: !!paymentMeta.iframeFilled, payClicked: !!paymentMeta.payClicked, autoPay: autoPayFinal, cEmail: cAcc.email, seatId: currentSeatInfo?.seatId || null });
+            setStep('C.payment.iframeFill.done', { ok: !!paymentMeta.iframeFilled, payClicked: !!paymentMeta.payClicked, autoPay: autoPayFinal });
+            if (!paymentMeta.iframeFilled) throw new Error('FINALIZE_PAYMENT_IFRAME_FILL_FAILED');
+        } else {
+            throw new Error('FINALIZE_CARD_INFO_MISSING');
+        }
 
         finalizedToCResult = { success: true, grabbedBy: cAcc.email, seatC: seatInfoC, seatId: currentSeatInfo?.seatId || null, payment: paymentMeta };
+        try {
+            const activeIdx = Math.max(1, Math.floor(Number(paymentQueueActivePairIndex || dashboardMeta.activePairIndex || fin?.cTransferPairIndex || 1)));
+            markPairPaymentState(activeIdx, {
+                paymentOwnerRole: 'C',
+                paymentEligible: false,
+                paymentState: 'finalized',
+                phase: 'C finalize tamamlandı'
+            });
+        } catch {}
+        await persistCFinalizeCompletedForPair(finalizePairIndex, {
+            holderRole: 'C',
+            paymentOwnerRole: 'C',
+            paymentSource: 'C',
+            paymentActorEmail: cAcc?.email || '',
+            paymentState: autoPayFinal && paymentMeta.payClicked ? 'c_paid' : 'c_ready',
+            finalizeState: 'completed',
+            recordStatus: 'finalized',
+            cAccountEmail: cAcc?.email || '',
+            seat: seatInfoC || currentSeatInfo,
+            category: currentCatBlock,
+            auditMeta: {
+                phase: 'c_finalize_completed',
+                cEmail: cAcc?.email || '',
+                autoPay: autoPayFinal,
+                payClicked: !!paymentMeta.payClicked
+            }
+        });
         audit('finalize_done', { grabbedBy: cAcc.email, seatId: currentSeatInfo?.seatId || null });
         return finalizedToCResult;
     };
@@ -6221,12 +7130,26 @@ async function startBotAfterValidation(req, res, validatedData) {
                 const fin = getFinalizeRequest();
                 if (!fin?.requested) return;
                 if (!fin?.cAccount?.email || !fin?.cAccount?.password) return;
+                try { bindFinalizePairFromRunState(); } catch {}
                 if (!currentSeatInfo?.seatId || !currentHolder) return;
                 const run = (async () => {
                     try {
                         return await finalizeToC();
                     } catch (e) {
                         try { audit('finalize_failed', { error: e?.message || String(e), seatId: currentSeatInfo?.seatId || null }, 'warn'); } catch {}
+                        try {
+                            const failPairIndex = Math.max(1, Math.floor(Number(dashboardMeta.activePairIndex || fin?.cTransferPairIndex || 1)));
+                            await persistFailureForPair(failPairIndex, {
+                                paymentState: 'failed',
+                                finalizeState: 'failed',
+                                recordStatus: 'failed',
+                                cAccountEmail: fin?.cAccount?.email || '',
+                                auditMeta: {
+                                    phase: 'finalize_failed',
+                                    error: e?.message || String(e)
+                                }
+                            });
+                        } catch {}
                         throw e;
                     }
                 })();
@@ -6276,11 +7199,111 @@ async function startBotAfterValidation(req, res, validatedData) {
     let dynamicTimingCheck;
     let finalizeWatch;
     let finalizeInFlight;
+    let paymentQueueWatch;
+    let paymentQueueInFlight;
+    let deferredPayableTransferWatch;
+    let deferredPayableTransferInFlight;
     let finalizedToCResult;
     let lastStep = 'init';
     const setStep = (s, meta = {}) => {
         lastStep = s;
         logger.info(`step:${s}`, meta);
+    };
+
+    const isActiveAPaymentCompleted = async (pairIndex) => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        const runtime = pairRuntimeByIndex.get(idx);
+        const p = runtime?.aCtx?.page;
+        if (!p) return false;
+        try {
+            const url = String(p.url() || '');
+            if (!url) return false;
+            return !/\/odeme(\b|\/|\?|#)/i.test(url);
+        } catch {
+            return false;
+        }
+    };
+
+    const processNextAPaymentQueue = async () => {
+        if (paymentQueueInFlight || !hasCardInfo) return paymentQueueInFlight || null;
+        const nextEntry = paymentQueueState.find((item) => (
+            item &&
+            item.paymentOwnerRole === 'A' &&
+            item.paymentEligible === true &&
+            ['queued', 'waiting'].includes(String(item.paymentState || ''))
+        ));
+        if (!nextEntry) return null;
+
+        const idx = Math.max(1, Math.floor(Number(nextEntry.pairIndex) || 1));
+        const run = (async () => {
+            markPairPaymentState(idx, {
+                paymentOwnerRole: 'A',
+                paymentEligible: true,
+                paymentState: 'preparing',
+                phase: 'A ödeme sırası aktif'
+            });
+            const seatInfoForA = await moveSeatToAForPayment(idx);
+            await preparePaymentOnA(idx, seatInfoForA);
+            paymentQueueActivePairIndex = idx;
+            dashboardMeta.activePairIndex = idx;
+            try { syncDashboardToRunStore(); } catch {}
+            return idx;
+        })();
+
+        paymentQueueInFlight = run;
+        run.finally(() => {
+            try {
+                if (paymentQueueInFlight === run) paymentQueueInFlight = null;
+            } catch {}
+        });
+        return run;
+    };
+
+    const ensurePaymentQueueWatcher = () => {
+        if (paymentQueueWatch) return;
+        paymentQueueWatch = setInterval(async () => {
+            try {
+                const stKill = runStore.get(runId);
+                if (stKill && stKill.status === 'killed') {
+                    try { clearInterval(paymentQueueWatch); } catch {}
+                    paymentQueueWatch = null;
+                    return;
+                }
+                if (finalizedToCResult || finalizeInFlight || paymentQueueInFlight) return;
+
+                const activeIdx = Math.max(0, Math.floor(Number(paymentQueueActivePairIndex) || 0));
+                if (activeIdx > 0) {
+                    const activeEntry = paymentQueueState.find((item) => Number(item?.pairIndex) === activeIdx);
+                    if (activeEntry && String(activeEntry.paymentState || '') === 'ready') {
+                        const completed = await isActiveAPaymentCompleted(activeIdx);
+                        if (completed) {
+                            markPairPaymentState(activeIdx, {
+                                paymentOwnerRole: 'A',
+                                paymentEligible: true,
+                                paymentState: 'finalized',
+                                phase: 'A ödemesi tamamlandı'
+                            });
+                            await persistAPaymentCompletedForPair(activeIdx, {
+                                paymentActorEmail: pairRuntimeByIndex.get(activeIdx)?.aCtx?.email || emailA,
+                                paymentState: 'a_paid',
+                                recordStatus: 'payment_completed',
+                                finalizeState: 'completed',
+                                auditMeta: {
+                                    phase: 'a_payment_completed',
+                                    aEmail: pairRuntimeByIndex.get(activeIdx)?.aCtx?.email || emailA
+                                }
+                            });
+                            paymentQueueActivePairIndex = null;
+                            dashboardMeta.activePairIndex = null;
+                            try { syncDashboardToRunStore(); } catch {}
+                        }
+                        return;
+                    }
+                }
+
+                await processNextAPaymentQueue();
+            } catch {}
+        }, 1500);
     };
     const snapshotPage = async (page, label) => {
         if (!page) return null;
@@ -6906,14 +7929,77 @@ async function startBotAfterValidation(req, res, validatedData) {
                     await page.waitForSelector('.basket-list-detail, .basket-list, .basket, [data-testid*="basket" i], [data-testid*="sepet" i]', { timeout: 15000 }).catch(() => {});
                     basketArrivedAtMs = Date.now();
                 } catch {}
+                const basketTimingPatch = buildBasketTimingPatch({
+                    basketArrivedAtMs,
+                    remainingSeconds: seatInfo?.remainingTime,
+                    observedAtMs: Date.now()
+                });
 
                 audit('a_hold_in_basket', { idx: i, email: acc.email, seatId: seatInfo?.seatId || null, url: (() => { try { return page.url(); } catch { return null; } })() });
+                upsertDashboardPairRow(i + 1, {
+                    aEmail: acc.email || '',
+                    bEmail: '\u2014',
+                    holder: 'A',
+                    seatId: seatInfo?.seatId ? String(seatInfo.seatId) : null,
+                    seatLabel: fmtSeatLabel(seatInfo),
+                    tribune: seatInfo?.tribune ?? null,
+                    seatRow: seatInfo?.row ?? null,
+                    seatNumber: seatInfo?.seat ?? null,
+                    phase: normalizeCanPay(acc?.canPay, true)
+                        ? (hasCardInfo ? 'A ödeme kuyruğunda' : 'Sepette tutuluyor')
+                        : 'C finalize bekliyor',
+                    paymentOwnerRole: normalizeCanPay(acc?.canPay, true) ? 'A' : 'C',
+                    paymentEligible: normalizeCanPay(acc?.canPay, true),
+                    paymentState: normalizeCanPay(acc?.canPay, true) ? (hasCardInfo ? 'queued' : 'waiting') : 'waiting',
+                    transferOk: null,
+                    unmatched: true,
+                    ...basketTimingPatch
+                });
+                pairRuntimeByIndex.set(i + 1, {
+                    pairIndex: i + 1,
+                    aCtx: {
+                        idx: i,
+                        email: acc.email,
+                        password: acc.password,
+                        browser,
+                        page,
+                        seatInfo,
+                        catBlock,
+                        canPay: normalizeCanPay(acc?.canPay, true),
+                        accountProfile: acc,
+                        ...basketTimingPatch
+                    },
+                    bCtx: null,
+                    idProfileA: aList[i] || acc || null,
+                    idProfileB: null,
+                    currentHolder: 'A',
+                    currentSeatInfo: seatInfo || null,
+                    currentCatBlock: catBlock || null,
+                    ...basketTimingPatch
+                });
+                await persistBasketRecordForPair(i + 1, {
+                    sourceRole: 'A',
+                    holderRole: 'A',
+                    paymentOwnerRole: normalizeCanPay(acc?.canPay, true) ? 'A' : 'C',
+                    paymentState: 'none',
+                    recordStatus: 'basketed',
+                    aAccountEmail: acc.email,
+                    seat: seatInfo,
+                    category: catBlock,
+                    auditMeta: {
+                        phase: 'a_hold_in_basket',
+                        seatSelectionUrl,
+                        canPay: normalizeCanPay(acc?.canPay, true)
+                    }
+                });
 
                 return {
                     idx: i,
                     label,
                     email: acc.email,
                     password: acc.password,
+                    canPay: normalizeCanPay(acc?.canPay, true),
+                    accountProfile: acc,
                     browser,
                     page,
                     seatInfo,
@@ -6947,20 +8033,61 @@ async function startBotAfterValidation(req, res, validatedData) {
                 audit('multi_a_only_mode', { aCount: aCtxList.length, hasCardInfo });
                 logger.info('A-only mod: B hesabi tanimli degil, transfer yapilmayacak');
 
-                dashboardPairs = aCtxList.map((ctx, i) => ({
-                    pairIndex: i + 1,
-                    aEmail: ctx.email || '',
-                    bEmail: '\u2014',
-                    holder: ctx?.seatInfo?.seatId ? 'A' : null,
-                    seatId: ctx?.seatInfo?.seatId ? String(ctx.seatInfo.seatId) : null,
-                    seatLabel: fmtSeatLabel(ctx?.seatInfo),
-                    phase: hasCardInfo ? '\u00d6demeye gidiliyor' : 'Sepette tutuluyor',
-                    transferOk: null,
-                    unmatched: true
-                }));
+                dashboardPairs = aCtxList.map((ctx, i) => {
+                    const pairIndex = i + 1;
+                    const runtime = pairRuntimeByIndex.get(pairIndex) || null;
+                    const basketTimingPatch = resolveRuntimeBasketTiming(runtime, 'A');
+                    return {
+                        pairIndex,
+                        aEmail: ctx.email || '',
+                        bEmail: '\u2014',
+                        holder: ctx?.seatInfo?.seatId ? 'A' : null,
+                        seatId: ctx?.seatInfo?.seatId ? String(ctx.seatInfo.seatId) : null,
+                        seatLabel: fmtSeatLabel(ctx?.seatInfo),
+                        phase: ctx?.canPay === false ? 'C finalize bekliyor' : (hasCardInfo ? 'A ödeme kuyruğunda' : 'Sepette tutuluyor'),
+                        paymentOwnerRole: ctx?.canPay === false ? 'C' : 'A',
+                        paymentEligible: ctx?.canPay !== false,
+                        paymentState: ctx?.canPay === false ? 'waiting' : (hasCardInfo ? 'queued' : 'waiting'),
+                        transferOk: null,
+                        unmatched: true,
+                        ...basketTimingPatch
+                    };
+                });
+                aCtxList.forEach((ctx, i) => {
+                    const pairIndex = i + 1;
+                    const prevRuntime = pairRuntimeByIndex.get(pairIndex) || {};
+                    const basketTimingPatch = resolveRuntimeBasketTiming(prevRuntime, 'A');
+                    pairRuntimeByIndex.set(pairIndex, {
+                        ...prevRuntime,
+                        pairIndex,
+                        aCtx: {
+                            ...(prevRuntime?.aCtx || {}),
+                            ...ctx,
+                            ...basketTimingPatch
+                        },
+                        bCtx: null,
+                        idProfileA: aList[i] || ctx?.accountProfile || null,
+                        idProfileB: null,
+                        currentHolder: ctx?.seatInfo?.seatId ? 'A' : null,
+                        currentSeatInfo: ctx?.seatInfo || null,
+                        currentCatBlock: ctx?.catBlock || null,
+                        ...basketTimingPatch
+                    });
+                    upsertPaymentQueueEntry({
+                        pairIndex,
+                        paymentOwnerRole: ctx?.canPay === false ? 'C' : 'A',
+                        paymentEligible: ctx?.canPay !== false,
+                        paymentState: ctx?.canPay === false ? 'waiting' : (hasCardInfo ? 'queued' : 'waiting'),
+                        aEmail: ctx?.email || '',
+                        bEmail: null
+                    });
+                });
                 syncDashboardToRunStore();
 
-                const primaryA = aCtxList[0];
+                const primaryA = aCtxList.find((ctx) => ctx?.canPay !== false) || aCtxList[0];
+                const primaryPairIndex = Math.max(1, (aCtxList.indexOf(primaryA) + 1) || 1);
+                dashboardMeta.activePairIndex = primaryPairIndex;
+                paymentQueueActivePairIndex = primaryPairIndex;
                 browserA = primaryA.browser;
                 pageA = primaryA.page;
                 emailA = primaryA.email;
@@ -6971,46 +8098,18 @@ async function startBotAfterValidation(req, res, validatedData) {
                 basketTimer = new BasketTimer();
                 basketTimer.start();
                 setHolder('A', seatInfoA, catBlockA);
-
-                if (hasCardInfo) {
-                    setStep('A.payment.start');
-                    audit('a_only_payment_start', { email: emailA, seatId: seatInfoA?.seatId });
-
-                    try {
-                        if (identity && String(identity).trim().length === 11) {
-                            setStep('A.payment.tcAssign.start');
-                            await ensureTcAssignedOnBasket(pageA, String(identity).trim(), { preferAssignToMyId: true, maxAttempts: 3 });
-                            setStep('A.payment.tcAssign.done');
-                        }
-                    } catch {}
-
-                    try {
-                        setStep('A.payment.devamToOdeme.start');
-                        await clickBasketDevamToOdeme(pageA);
-                        await pageA.waitForFunction(() => /\/odeme(\b|\/|\?|#)/i.test(String(location.href || '')), { timeout: 30000 }).catch(() => {});
-                        setStep('A.payment.devamToOdeme.done', { url: (() => { try { return pageA.url(); } catch { return null; } })() });
-                    } catch {}
-
-                    try { await dismissPaymentInfoModalIfPresent(pageA); } catch {}
-
-                    try {
-                        if (identity && String(identity).trim().length === 11) {
-                            await fillInvoiceTcAndContinue(pageA, String(identity).trim());
-                        }
-                    } catch {}
-
-                    try { await acceptAgreementsAndContinue(pageA); } catch {}
-
-                    try {
-                        const cardData = { cardHolder, cardNumber, expiryMonth, expiryYear, cvv };
-                        setStep('A.payment.iframeFill.start');
-                        await fillNkolayPaymentIframe(pageA, cardData, { clickPay: false });
-                        setStep('A.payment.iframeFill.done');
-                        audit('a_only_payment_ready', { email: emailA, seatId: seatInfoA?.seatId });
-                    } catch {}
-
-                    logger.info('A-only mod: Odeme sayfasi hazir, onay bekleniyor');
+                if (primaryA?.canPay !== false) {
+                    await preparePaymentOnA(primaryPairIndex, seatInfoA);
                 } else {
+                    markPairPaymentState(primaryPairIndex, {
+                        paymentOwnerRole: 'C',
+                        paymentEligible: false,
+                        paymentState: 'waiting',
+                        phase: 'C finalize bekliyor'
+                    });
+                }
+                if (hasCardInfo && primaryA?.canPay !== false) logger.info('A-only mod: Odeme sayfasi hazir, onay bekleniyor');
+                else {
                     logger.info('A-only mod: Kart bilgisi yok, sepette tutuluyor');
                     audit('a_only_holding', { email: emailA, seatId: seatInfoA?.seatId });
                 }
@@ -7040,6 +8139,9 @@ async function startBotAfterValidation(req, res, validatedData) {
                     seatId: ctx?.seatInfo?.seatId ? String(ctx.seatInfo.seatId) : null,
                     seatLabel: fmtSeatLabel(ctx?.seatInfo),
                     phase: hasA ? 'A sepette — B transfer bekleniyor' : 'A hazırlık',
+                    paymentOwnerRole: ctx?.canPay === false ? 'C' : 'A',
+                    paymentEligible: ctx?.canPay !== false,
+                    paymentState: ctx?.canPay === false ? 'waiting' : (hasCardInfo ? 'queued' : 'waiting'),
                     transferOk: null
                 };
             });
@@ -7053,9 +8155,31 @@ async function startBotAfterValidation(req, res, validatedData) {
                     holder: hasA ? 'A' : null,
                     seatId: ctx?.seatInfo?.seatId ? String(ctx.seatInfo.seatId) : null,
                     seatLabel: fmtSeatLabel(ctx?.seatInfo),
-                    phase: 'Eşleşen B hesabı yok',
+                    phase: ctx?.canPay === false ? 'C finalize bekliyor (B yok)' : 'A ödeme kuyruğunda (B yok)',
+                    paymentOwnerRole: ctx?.canPay === false ? 'C' : 'A',
+                    paymentEligible: ctx?.canPay !== false,
+                    paymentState: ctx?.canPay === false ? 'waiting' : (hasCardInfo ? 'queued' : 'waiting'),
                     transferOk: null,
                     unmatched: true
+                });
+                const pairIndex = pairCount + j + 1;
+                pairRuntimeByIndex.set(pairIndex, {
+                    pairIndex,
+                    aCtx: ctx,
+                    bCtx: null,
+                    idProfileA: aList[pairIndex - 1] || ctx?.accountProfile || null,
+                    idProfileB: null,
+                    currentHolder: hasA ? 'A' : null,
+                    currentSeatInfo: ctx?.seatInfo || null,
+                    currentCatBlock: ctx?.catBlock || null
+                });
+                upsertPaymentQueueEntry({
+                    pairIndex,
+                    paymentOwnerRole: ctx?.canPay === false ? 'C' : 'A',
+                    paymentEligible: ctx?.canPay !== false,
+                    paymentState: ctx?.canPay === false ? 'waiting' : (hasCardInfo ? 'queued' : 'waiting'),
+                    aEmail: ctx?.email || '',
+                    bEmail: null
                 });
             }
             syncDashboardToRunStore();
@@ -7071,10 +8195,81 @@ async function startBotAfterValidation(req, res, validatedData) {
                 if (!aCtx?.seatInfo?.seatId) {
                     results.push({ idx: i, ok: false, error: 'A seatId yok', seatA: aCtx?.seatInfo || null });
                     audit('transfer_pair_skip_no_seatid', { idx: i, aEmail: aCtx?.email || null, bEmail: bCtx?.email || null }, 'warn');
+                    upsertPaymentQueueEntry({
+                        pairIndex: i + 1,
+                        paymentOwnerRole: aCtx?.canPay === false ? 'C' : 'A',
+                        paymentEligible: aCtx?.canPay !== false,
+                        paymentState: 'failed',
+                        aEmail: aCtx?.email || '',
+                        bEmail: bCtx?.email || ''
+                    });
+                    await persistFailureForPair(i + 1, {
+                        paymentState: 'failed',
+                        finalizeState: 'failed',
+                        recordStatus: 'failed',
+                        aAccountEmail: aCtx?.email || '',
+                        bAccountEmail: bCtx?.email || '',
+                        seat: aCtx?.seatInfo || null,
+                        category: aCtx?.catBlock || null,
+                        auditMeta: { phase: 'transfer_pair_skip_no_seatid' }
+                    });
                     if (dashboardPairs[i]) {
-                        dashboardPairs[i] = { ...dashboardPairs[i], phase: 'Hata: A koltuk yok', transferOk: false, holder: null };
+                        dashboardPairs[i] = { ...dashboardPairs[i], phase: 'Hata: A koltuk yok', transferOk: false, holder: null, paymentState: 'failed' };
                         syncDashboardToRunStore();
                     }
+                    continue;
+                }
+
+                if (aCtx?.canPay !== false) {
+                    results.push({
+                        idx: i,
+                        ok: true,
+                        keptOnA: true,
+                        seatA: aCtx.seatInfo,
+                        seatB: null,
+                        aEmail: aCtx.email,
+                        bEmail: bCtx?.email || null
+                    });
+                    audit('payer_pair_kept_on_a', {
+                        idx: i,
+                        seatId: aCtx.seatInfo.seatId,
+                        aEmail: aCtx.email,
+                        bEmail: bCtx?.email || null,
+                        hasCardInfo
+                    });
+                    upsertDashboardPairRow(i + 1, {
+                        aEmail: aCtx.email || '',
+                        bEmail: bCtx?.email || '',
+                        holder: 'A',
+                        seatId: aCtx?.seatInfo?.seatId ? String(aCtx.seatInfo.seatId) : null,
+                        seatLabel: fmtSeatLabel(aCtx?.seatInfo),
+                        tribune: aCtx?.seatInfo?.tribune ?? null,
+                        seatRow: aCtx?.seatInfo?.row ?? null,
+                        seatNumber: aCtx?.seatInfo?.seat ?? null,
+                        phase: hasCardInfo ? 'A ödeme kuyruğunda' : 'Sepette tutuluyor',
+                        paymentOwnerRole: 'A',
+                        paymentEligible: true,
+                        paymentState: hasCardInfo ? 'queued' : 'waiting',
+                        transferOk: null
+                    });
+                    pairRuntimeByIndex.set(i + 1, {
+                        pairIndex: i + 1,
+                        aCtx,
+                        bCtx,
+                        idProfileA: aList[i] || aCtx?.accountProfile || null,
+                        idProfileB: bList[i] || null,
+                        currentHolder: 'A',
+                        currentSeatInfo: aCtx?.seatInfo || null,
+                        currentCatBlock: aCtx?.catBlock || null
+                    });
+                    upsertPaymentQueueEntry({
+                        pairIndex: i + 1,
+                        paymentOwnerRole: 'A',
+                        paymentEligible: true,
+                        paymentState: hasCardInfo ? 'queued' : 'waiting',
+                        aEmail: aCtx?.email || '',
+                        bEmail: bCtx?.email || ''
+                    });
                     continue;
                 }
 
@@ -7209,9 +8404,27 @@ async function startBotAfterValidation(req, res, validatedData) {
                         removedClicks: removeDiag?.removedClicks ?? null
                     }, 'warn');
                     if (dashboardPairs[i]) {
-                        dashboardPairs[i] = { ...dashboardPairs[i], phase: 'Hata: A sepetten kaldırılamadı', transferOk: false, holder: 'A' };
+                        dashboardPairs[i] = { ...dashboardPairs[i], phase: 'Hata: A sepetten kaldırılamadı', transferOk: false, holder: 'A', paymentState: 'failed' };
                         syncDashboardToRunStore();
                     }
+                    upsertPaymentQueueEntry({
+                        pairIndex: i + 1,
+                        paymentOwnerRole: aCtx?.canPay === false ? 'C' : 'A',
+                        paymentEligible: aCtx?.canPay !== false,
+                        paymentState: 'failed',
+                        aEmail: aCtx?.email || '',
+                        bEmail: bCtx?.email || ''
+                    });
+                    await persistFailureForPair(i + 1, {
+                        paymentState: 'failed',
+                        finalizeState: 'failed',
+                        recordStatus: 'failed',
+                        aAccountEmail: aCtx?.email || '',
+                        bAccountEmail: bCtx?.email || '',
+                        seat: aCtx?.seatInfo || null,
+                        category: aCtx?.catBlock || null,
+                        auditMeta: { phase: 'a_remove_from_basket_failed' }
+                    });
                     continue;
                 }
 
@@ -7276,9 +8489,27 @@ async function startBotAfterValidation(req, res, validatedData) {
                     results.push({ idx: i, ok: false, error: e?.message || String(e), seatA: aCtx.seatInfo });
                     audit('b_exact_pick_failed', { idx: i, bEmail: bCtx.email, seatId: aCtx.seatInfo.seatId, error: e?.message || String(e) }, 'warn');
                     if (dashboardPairs[i]) {
-                        dashboardPairs[i] = { ...dashboardPairs[i], phase: 'Hata: B koltuğu alamadı', transferOk: false, holder: null };
+                        dashboardPairs[i] = { ...dashboardPairs[i], phase: 'Hata: B koltuğu alamadı', transferOk: false, holder: null, paymentState: 'failed' };
                         syncDashboardToRunStore();
                     }
+                    upsertPaymentQueueEntry({
+                        pairIndex: i + 1,
+                        paymentOwnerRole: aCtx?.canPay === false ? 'C' : 'A',
+                        paymentEligible: aCtx?.canPay !== false,
+                        paymentState: 'failed',
+                        aEmail: aCtx?.email || '',
+                        bEmail: bCtx?.email || ''
+                    });
+                    await persistFailureForPair(i + 1, {
+                        paymentState: 'failed',
+                        finalizeState: 'failed',
+                        recordStatus: 'failed',
+                        aAccountEmail: aCtx?.email || '',
+                        bAccountEmail: bCtx?.email || '',
+                        seat: aCtx?.seatInfo || null,
+                        category: aCtx?.catBlock || null,
+                        auditMeta: { phase: 'b_exact_pick_failed', error: e?.message || String(e) }
+                    });
                     continue;
                 }
 
@@ -7290,6 +8521,11 @@ async function startBotAfterValidation(req, res, validatedData) {
                     row: seatBInfo?.row || null,
                     seat: seatBInfo?.seat || null,
                     heldSeatCount: Array.isArray(seatBInfo?.heldSeats) ? seatBInfo.heldSeats.length : (seatBInfo?.itemCount || null)
+                });
+                const basketTimingPatch = buildBasketTimingPatch({
+                    basketArrivedAtMs: Date.now(),
+                    remainingSeconds: seatBInfo?.remainingTime,
+                    observedAtMs: Date.now()
                 });
 
                 results.push({ idx: i, ok: true, seatA: aCtx.seatInfo, seatB: seatBInfo, aEmail: aCtx.email, bEmail: bCtx.email });
@@ -7309,11 +8545,53 @@ async function startBotAfterValidation(req, res, validatedData) {
                         holder: 'B',
                         seatId: seatBInfo?.seatId ? String(seatBInfo.seatId) : dashboardPairs[i].seatId,
                         seatLabel: fmtSeatLabel(seatBInfo),
-                        phase: 'B sepette (A→B transfer tamam)',
-                        transferOk: true
+                        phase: aCtx?.canPay === false ? 'B sepette — C finalize bekliyor' : 'B sepette — A ödeme kuyruğunda',
+                        paymentOwnerRole: aCtx?.canPay === false ? 'C' : 'A',
+                        paymentEligible: aCtx?.canPay !== false,
+                        paymentState: aCtx?.canPay === false ? 'waiting' : (hasCardInfo ? 'queued' : 'waiting'),
+                        transferOk: true,
+                        ...basketTimingPatch
                     };
                     syncDashboardToRunStore();
                 }
+                pairRuntimeByIndex.set(i + 1, {
+                    pairIndex: i + 1,
+                    aCtx,
+                    bCtx: {
+                        ...(bCtx || {}),
+                        ...basketTimingPatch
+                    },
+                    idProfileA: aList[i] || aCtx?.accountProfile || null,
+                    idProfileB: bList[i] || null,
+                    currentHolder: 'B',
+                    currentSeatInfo: seatBInfo || aCtx?.seatInfo || null,
+                    currentCatBlock: aCtx?.catBlock || null,
+                    ...basketTimingPatch
+                });
+                upsertPaymentQueueEntry({
+                    pairIndex: i + 1,
+                    paymentOwnerRole: aCtx?.canPay === false ? 'C' : 'A',
+                    paymentEligible: aCtx?.canPay !== false,
+                    paymentState: aCtx?.canPay === false ? 'waiting' : (hasCardInfo ? 'queued' : 'waiting'),
+                    aEmail: aCtx?.email || '',
+                    bEmail: bCtx?.email || ''
+                });
+                await persistTransferForPair(i + 1, {
+                    sourceRole: 'B',
+                    holderRole: 'B',
+                    paymentOwnerRole: aCtx?.canPay === false ? 'C' : 'A',
+                    recordStatus: 'transferred',
+                    aAccountEmail: aCtx?.email || '',
+                    bAccountEmail: bCtx?.email || '',
+                    seat: seatBInfo,
+                    category: aCtx?.catBlock || null,
+                    auditMeta: {
+                        phase: 'transfer_pair_done',
+                        aEmail: aCtx?.email || '',
+                        bEmail: bCtx?.email || '',
+                        canPay: aCtx?.canPay !== false
+                    }
+                });
             }
             setStep('MULTI.transfer.done', { resultsCount: results.length });
             audit('multi_transfer_done', { resultsCount: results.length });
@@ -7322,104 +8600,83 @@ async function startBotAfterValidation(req, res, validatedData) {
             const holdingOnly = aCtxList.slice(pairCount).map(a => ({ idx: a.idx, email: a.email, seatInfo: a.seatInfo }));
             audit('multi_holding_only', { count: holdingOnly.length, holdingOnly: holdingOnly.map(x => ({ idx: x.idx, email: x.email, seatId: x?.seatInfo?.seatId || null })) });
 
+            const successfulPairs = results.filter((r) => r && r.ok === true && r.keptOnA !== true);
+            const successfulPayablePairs = results.filter((r) => r && r.ok === true && aCtxList[r.idx]?.canPay !== false);
+            if (!results.some((r) => r && r.ok === true) && !holdingOnly.length) {
+                throw new Error('Hiç başarılı A/B transferi oluşmadı');
+            }
+
             const stRun = runStore.get(runId) || {};
             let pairWant = parseInt(String(stRun.cTransferPairIndex ?? validatedData.cTransferPairIndex ?? 1), 10);
             if (!Number.isFinite(pairWant) || pairWant < 1) pairWant = 1;
             if (pairWant > pairCount) pairWant = pairCount;
-            const pairIdx0 = pairWant - 1;
+            const chosen = successfulPairs.find((r) => r.idx === (pairWant - 1));
+            const firstSuccessful = successfulPairs[0] || null;
+            const firstPayable = successfulPayablePairs[0] || null;
 
-            const chosen = results.find((r) => r.idx === pairIdx0 && r.ok === true);
-            if (!chosen) {
-                const errMsg = `Seçilen C eşleşmesi (#${pairWant}) için başarılı transfer yok`;
-                audit('multi_c_pair_unavailable', { pairWant, pairIdx0, results }, 'warn');
-                logger.warnSafe(errMsg, { pairWant, results });
-                throw new Error(errMsg);
+            if (chosen) {
+                const aPick = aCtxList[chosen.idx];
+                const bPick = bCtxList[chosen.idx];
+                browserA = aPick.browser;
+                pageA = aPick.page;
+                browserB = bPick.browser;
+                pageB = bPick.page;
+                emailA = aPick.email;
+                passwordA = aPick.password;
+                emailB = bPick.email;
+                passwordB = bPick.password;
+                idProfileA = aList[chosen.idx] || idProfileA;
+                idProfileB = bList[chosen.idx] || idProfileB;
+                seatInfoA = chosen.seatA;
+                seatInfoB = chosen.seatB;
+                catBlockA = { ...(aPick.catBlock || { categoryText: '', blockText: '', blockVal: '' }) };
+                updatePairRuntime(pairWant, {
+                    currentHolder: 'B',
+                    currentSeatInfo: seatInfoB || seatInfoA || null,
+                    currentCatBlock: catBlockA
+                });
+                dashboardPairs = dashboardPairs.map((row) => {
+                    if (row.unmatched) return row;
+                    if (row.pairIndex === pairWant) {
+                        const base = String(row.phase || '').trim();
+                        const next = base.includes('C hedefi') ? base : (base ? `${base} · C hedefi` : 'C hedefi');
+                        return { ...row, phase: next };
+                    }
+                    return row;
+                });
+                dashboardMeta.cTargetPairIndex = pairWant;
+                dashboardMeta.activePairIndex = pairWant;
+                paymentQueueActivePairIndex = pairWant;
+                setHolder('B', seatInfoB, catBlockA);
+                basketTimer = new BasketTimer();
+                basketTimer.start();
+                audit('multi_bind_for_c', {
+                    cTransferPairIndex: pairWant,
+                    aEmail: emailA,
+                    bEmail: emailB,
+                    seatId: seatInfoB?.seatId || null
+                });
+                logger.infoSafe('Çoklu mod: C/finalize için seçilen eşleşme bağlandı', {
+                    cTransferPairIndex: pairWant,
+                    aEmail: emailA,
+                    bEmail: emailB,
+                    seatId: seatInfoB?.seatId || null
+                });
+            } else if (firstSuccessful) {
+                bindPairRuntime(firstSuccessful.idx + 1, 'first_successful_pair');
             }
 
-            const aPick = aCtxList[pairIdx0];
-            const bPick = bCtxList[pairIdx0];
-            browserA = aPick.browser;
-            pageA = aPick.page;
-            browserB = bPick.browser;
-            pageB = bPick.page;
-            emailA = aPick.email;
-            passwordA = aPick.password;
-            emailB = bPick.email;
-            passwordB = bPick.password;
-            idProfileA = aList[pairIdx0] || idProfileA;
-            idProfileB = bList[pairIdx0] || idProfileB;
-
-            seatInfoA = chosen.seatA;
-            seatInfoB = chosen.seatB;
-            catBlockA = { ...(aPick.catBlock || { categoryText: '', blockText: '', blockVal: '' }) };
-            try {
-                const cbB = await readCatBlock(pageB).catch(() => null);
-                const lastSvgBlockIdB = await pageB.evaluate(() => {
-                    try { return window.__passobotLastSvgBlockId || null; } catch { return null; }
-                }).catch(() => null);
-                const derivedSvgBlockIdB = await pageB.evaluate((sid) => {
-                    try {
-                        const seatId = String(sid || '').trim();
-                        if (!seatId) return null;
-                        const sel = [
-                            `g.g${seatId}`,
-                            `g[id="g${seatId}"]`,
-                            `#g${seatId}`,
-                            `.g${seatId}`,
-                            `.block${seatId}`,
-                            `rect.block${seatId}`,
-                            `rect[id="block${seatId}"]`,
-                            `#block${seatId}`
-                        ].join(',');
-                        const el = document.querySelector(sel);
-                        if (!el) return null;
-                        const b = el.closest('[id^="block"]');
-                        const bid = b && b.id ? String(b.id) : null;
-                        return bid && bid.startsWith('block') ? bid : null;
-                    } catch {
-                        return null;
-                    }
-                }, seatInfoB?.seatId || null).catch(() => null);
-
-                if (cbB && (cbB.categoryText || cbB.blockText || cbB.blockVal)) {
-                    catBlockA = { ...cbB, svgBlockId: derivedSvgBlockIdB || lastSvgBlockIdB || cbB.svgBlockId || catBlockA?.svgBlockId };
-                } else if (lastSvgBlockIdB) {
-                    catBlockA = { ...(catBlockA || {}), svgBlockId: derivedSvgBlockIdB || lastSvgBlockIdB };
-                } else if (derivedSvgBlockIdB) {
-                    catBlockA = { ...(catBlockA || {}), svgBlockId: derivedSvgBlockIdB };
+            if (hasCardInfo && firstPayable) {
+                paymentQueueActivePairIndex = null;
+                dashboardMeta.activePairIndex = null;
+                try { ensurePaymentQueueWatcher(); } catch {}
+                try { ensureDeferredPayableTransferWatcher(); } catch {}
+                try { await processNextAPaymentQueue(); } catch (queueErr) {
+                    audit('a_payment_queue_prepare_failed', { pairIndex: firstPayable.idx + 1, error: queueErr?.message || String(queueErr) }, 'warn');
                 }
-                if (seatInfoB && (derivedSvgBlockIdB || (catBlockA && catBlockA.svgBlockId))) {
-                    seatInfoB.svgBlockId = String(derivedSvgBlockIdB || catBlockA.svgBlockId);
-                }
-            } catch {}
-
-            dashboardPairs = dashboardPairs.map((row) => {
-                if (row.unmatched) return row;
-                if (row.pairIndex === pairWant) {
-                    const base = String(row.phase || '').trim();
-                    const next = base.includes('C hedefi') ? base : (base ? `${base} · C hedefi` : 'C hedefi');
-                    return { ...row, phase: next };
-                }
-                return row;
-            });
-
-            setHolder('B', seatInfoB, catBlockA);
-            basketTimer = new BasketTimer();
-            basketTimer.start();
+            }
             try { ensureFinalizeWatcher(); } catch {}
-
-            audit('multi_bind_for_c', {
-                cTransferPairIndex: pairWant,
-                aEmail: emailA,
-                bEmail: emailB,
-                seatId: seatInfoB?.seatId || null
-            });
-            logger.infoSafe('Çoklu mod: C/finalize için seçilen eşleşme bağlandı', {
-                cTransferPairIndex: pairWant,
-                aEmail: emailA,
-                bEmail: emailB,
-                seatId: seatInfoB?.seatId || null
-            });
+            try { syncDashboardToRunStore(); } catch {}
 
             multiPostTransferReady = true;
         }
@@ -7901,9 +9158,58 @@ async function startBotAfterValidation(req, res, validatedData) {
         }
         
         const basketStatus = basketTimer.getStatus();
+        const basketTimingPatch = buildBasketTimingPatch({
+            basketArrivedAtMs: aBasketArrivedAtMs,
+            remainingSeconds: basketStatus?.remainingSeconds ?? seatInfoA?.remainingTime,
+            observedAtMs: Date.now()
+        });
         logger.info('A hesabı koltuk seçti ve sepete eklendi', { 
             seatInfo: seatInfoA,
             basketStatus: basketStatus
+        });
+        upsertDashboardPairRow(1, {
+            aEmail: emailA,
+            bEmail: hasRealB ? emailB : '\u2014',
+            holder: 'A',
+            seatId: seatInfoA?.seatId ? String(seatInfoA.seatId) : null,
+            seatLabel: fmtSeatLabel(seatInfoA),
+            tribune: seatInfoA?.tribune ?? null,
+            seatRow: seatInfoA?.row ?? null,
+            seatNumber: seatInfoA?.seat ?? null,
+            phase: normalizeCanPay(a0?.canPay, true)
+                ? (hasCardInfo ? 'A ödeme sayfası hazırlanıyor' : 'Sepette tutuluyor')
+                : 'C finalize bekliyor',
+            paymentOwnerRole: normalizeCanPay(a0?.canPay, true) ? 'A' : 'C',
+            paymentEligible: normalizeCanPay(a0?.canPay, true),
+            paymentState: normalizeCanPay(a0?.canPay, true) ? (hasCardInfo ? 'queued' : 'waiting') : 'waiting',
+            transferOk: null,
+            unmatched: !hasRealB,
+            ...basketTimingPatch
+        });
+        pairRuntimeByIndex.set(1, {
+            pairIndex: 1,
+            aCtx: { idx: 0, email: emailA, password: passwordA, browser: browserA, page: pageA, seatInfo: seatInfoA, catBlock: catBlockA, canPay: normalizeCanPay(a0?.canPay, true), accountProfile: a0 || null, ...basketTimingPatch },
+            bCtx: null,
+            idProfileA: a0 || null,
+            idProfileB: b0 || null,
+            currentHolder: 'A',
+            currentSeatInfo: seatInfoA || null,
+            currentCatBlock: catBlockA || null,
+            ...basketTimingPatch
+        });
+        await persistBasketRecordForPair(1, {
+            sourceRole: 'A',
+            holderRole: 'A',
+            paymentOwnerRole: normalizeCanPay(a0?.canPay, true) ? 'A' : 'C',
+            paymentState: 'none',
+            recordStatus: 'basketed',
+            aAccountEmail: emailA,
+            seat: seatInfoA,
+            category: catBlockA,
+            auditMeta: {
+                phase: 'single_a_basketed',
+                basketStatus
+            }
         });
 
         // B hesabı yoksa: transfer yok, direkt ödeme veya hold
@@ -7911,7 +9217,9 @@ async function startBotAfterValidation(req, res, validatedData) {
             audit('single_a_only_mode', { email: emailA, seatId: seatInfoA?.seatId, hasCardInfo });
             logger.info('A-only mod (tekli): B hesabi yok, transfer yapilmayacak');
 
-            if (!dashboardPairs.length) {
+                if (!dashboardPairs.length) {
+                    const existingRuntime = pairRuntimeByIndex.get(1) || null;
+                    const basketTimingPatch = resolveRuntimeBasketTiming(existingRuntime, 'A');
                 dashboardPairs = [{
                     pairIndex: 1,
                     aEmail: emailA,
@@ -7919,52 +9227,61 @@ async function startBotAfterValidation(req, res, validatedData) {
                     holder: 'A',
                     seatId: seatInfoA?.seatId ? String(seatInfoA.seatId) : null,
                     seatLabel: fmtSeatLabel(seatInfoA),
-                    phase: hasCardInfo ? '\u00d6demeye gidiliyor' : 'Sepette tutuluyor',
+                    phase: a0?.canPay === false ? 'C finalize bekliyor' : (hasCardInfo ? 'A ödeme sayfası hazırlanıyor' : 'Sepette tutuluyor'),
+                    paymentOwnerRole: a0?.canPay === false ? 'C' : 'A',
+                    paymentEligible: a0?.canPay !== false,
+                    paymentState: a0?.canPay === false ? 'waiting' : (hasCardInfo ? 'queued' : 'waiting'),
                     transferOk: null,
-                    unmatched: true
+                        unmatched: true,
+                        ...basketTimingPatch
                 }];
+                pairRuntimeByIndex.set(1, {
+                        ...(existingRuntime || {}),
+                    pairIndex: 1,
+                        aCtx: {
+                            ...(existingRuntime?.aCtx || {}),
+                            idx: 0,
+                            email: emailA,
+                            password: passwordA,
+                            browser: browserA,
+                            page: pageA,
+                            seatInfo: seatInfoA,
+                            catBlock: catBlockA,
+                            canPay: normalizeCanPay(a0?.canPay, true),
+                            accountProfile: a0 || null,
+                            ...basketTimingPatch
+                        },
+                    bCtx: null,
+                    idProfileA: a0 || null,
+                    idProfileB: null,
+                    currentHolder: 'A',
+                    currentSeatInfo: seatInfoA || null,
+                        currentCatBlock: catBlockA || null,
+                        ...basketTimingPatch
+                });
+                upsertPaymentQueueEntry({
+                    pairIndex: 1,
+                    paymentOwnerRole: a0?.canPay === false ? 'C' : 'A',
+                    paymentEligible: a0?.canPay !== false,
+                    paymentState: a0?.canPay === false ? 'waiting' : (hasCardInfo ? 'queued' : 'waiting'),
+                    aEmail: emailA,
+                    bEmail: null
+                });
                 syncDashboardToRunStore();
             }
 
-            if (hasCardInfo) {
-                setStep('A.payment.start');
-                audit('a_only_payment_start', { email: emailA, seatId: seatInfoA?.seatId });
-
-                try {
-                    if (identity && String(identity).trim().length === 11) {
-                        setStep('A.payment.tcAssign.start');
-                        await ensureTcAssignedOnBasket(pageA, String(identity).trim(), { preferAssignToMyId: true, maxAttempts: 3 });
-                        setStep('A.payment.tcAssign.done');
-                    }
-                } catch {}
-
-                try {
-                    setStep('A.payment.devamToOdeme.start');
-                    await clickBasketDevamToOdeme(pageA);
-                    await pageA.waitForFunction(() => /\/odeme(\b|\/|\?|#)/i.test(String(location.href || '')), { timeout: 30000 }).catch(() => {});
-                    setStep('A.payment.devamToOdeme.done', { url: (() => { try { return pageA.url(); } catch { return null; } })() });
-                } catch {}
-
-                try { await dismissPaymentInfoModalIfPresent(pageA); } catch {}
-
-                try {
-                    if (identity && String(identity).trim().length === 11) {
-                        await fillInvoiceTcAndContinue(pageA, String(identity).trim());
-                    }
-                } catch {}
-
-                try { await acceptAgreementsAndContinue(pageA); } catch {}
-
-                try {
-                    const cardData = { cardHolder, cardNumber, expiryMonth, expiryYear, cvv };
-                    setStep('A.payment.iframeFill.start');
-                    await fillNkolayPaymentIframe(pageA, cardData, { clickPay: false });
-                    setStep('A.payment.iframeFill.done');
-                    audit('a_only_payment_ready', { email: emailA, seatId: seatInfoA?.seatId });
-                } catch {}
-
-                logger.info('A-only mod: Odeme sayfasi hazir, onay bekleniyor');
+            if (a0?.canPay !== false) {
+                await preparePaymentOnA(1, seatInfoA);
             } else {
+                markPairPaymentState(1, {
+                    paymentOwnerRole: 'C',
+                    paymentEligible: false,
+                    paymentState: 'waiting',
+                    phase: 'C finalize bekliyor'
+                });
+            }
+            if (hasCardInfo && a0?.canPay !== false) logger.info('A-only mod: Odeme sayfasi hazir, onay bekleniyor');
+            else {
                 logger.info('A-only mod: Kart bilgisi yok, sepette tutuluyor');
                 audit('a_only_holding', { email: emailA, seatId: seatInfoA?.seatId });
             }
@@ -8523,6 +9840,21 @@ async function startBotAfterValidation(req, res, validatedData) {
             }
         } catch {}
         setHolder('B', seatInfoB, catBlockA);
+        await persistTransferForPair(1, {
+            sourceRole: 'B',
+            holderRole: 'B',
+            paymentOwnerRole: 'A',
+            recordStatus: 'transferred',
+            aAccountEmail: emailA,
+            bAccountEmail: emailB,
+            seat: seatInfoB,
+            category: catBlockA,
+            auditMeta: {
+                phase: 'single_transfer_done',
+                aEmail: emailA,
+                bEmail: emailB
+            }
+        });
         }
 
         // If finalize completed during the race, stop here.
@@ -8851,6 +10183,8 @@ async function startBotAfterValidation(req, res, validatedData) {
         if (getCfg().ORDER_LOG_URL) {
             try {
                 const finalBasketStatus = basketTimer.getStatus();
+                const activePaymentEntry = paymentQueueState.find((item) => Number(item?.pairIndex) === Number(paymentQueueActivePairIndex || 0)) || null;
+                const paymentOwnerRole = activePaymentEntry?.paymentOwnerRole || (currentHolder === 'A' ? 'A' : 'C');
                 logger.debug('Harici log servisine istek gönderiliyor', { orderLogUrl: getCfg().ORDER_LOG_URL });
                 await axios.post(getCfg().ORDER_LOG_URL, {
                     link: eventAddress,
@@ -8868,7 +10202,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                         isExpired: finalBasketStatus.isExpired,
                         isNearExpiry: finalBasketStatus.isNearExpiry
                     },
-                    status: "Wait For Payment (B)"
+                    status: paymentOwnerRole === 'A' ? 'Wait For Payment (A)' : 'Wait For Finalize (C)'
                 }, {headers: {'Content-Type': 'application/json'}, timeout: getCfg().TIMEOUTS.ORDER_LOG_TIMEOUT});
                 logger.info('Harici log servisine istek gönderildi', {
                     basketStatus: finalBasketStatus
@@ -8879,17 +10213,22 @@ async function startBotAfterValidation(req, res, validatedData) {
         }
 
         const finalBasketStatus = basketTimer.getStatus();
+        const activePaymentEntry = paymentQueueState.find((item) => Number(item?.pairIndex) === Number(paymentQueueActivePairIndex || 0)) || null;
+        const paymentOwnerRole = activePaymentEntry?.paymentOwnerRole || (currentHolder === 'A' ? 'A' : 'C');
+        const paymentState = activePaymentEntry?.paymentState || null;
         logger.infoSafe('Bot başarıyla tamamlandı', {
-            grabbedBy: emailB,
+            grabbedBy: currentHolder === 'A' ? emailA : emailB,
             seatA: seatInfoA,
             seatB: seatInfoB,
             catBlockA,
-            basketStatus: finalBasketStatus
+            basketStatus: finalBasketStatus,
+            paymentOwnerRole,
+            paymentState
         });
         try {
-            runStore.upsert(runId, { status: 'completed', result: { success: true, grabbedBy: emailB, seatA: seatInfoA, seatB: seatInfoB, catBlockA } });
+            runStore.upsert(runId, { status: 'completed', result: { success: true, grabbedBy: currentHolder === 'A' ? emailA : emailB, seatA: seatInfoA, seatB: seatInfoB, catBlockA, paymentOwnerRole, paymentState } });
         } catch {}
-        return res.json({success: true, grabbedBy: emailB, seatA: seatInfoA, seatB: seatInfoB, catBlockA});
+        return res.json({success: true, grabbedBy: currentHolder === 'A' ? emailA : emailB, seatA: seatInfoA, seatB: seatInfoB, catBlockA, paymentOwnerRole, paymentState});
     } catch (err) {
         if (err && err.code === 'RUN_KILLED') {
             try {
@@ -8935,6 +10274,19 @@ async function startBotAfterValidation(req, res, validatedData) {
         try {
             runStore.upsert(runId, { status: 'error', error: errMsg, result: null });
         } catch {}
+        try {
+            const failPairIndex = Math.max(1, Math.floor(Number(dashboardMeta.activePairIndex || dashboardMeta.cTargetPairIndex || 1)));
+            await persistFailureForPair(failPairIndex, {
+                paymentState: 'failed',
+                finalizeState: 'failed',
+                recordStatus: 'failed',
+                auditMeta: {
+                    phase: 'bot_error',
+                    error: errMsg,
+                    lastStep
+                }
+            });
+        } catch {}
         return res.status(500).json({
             error: errMsg,
             basketStatus: basketStatus,
@@ -8947,6 +10299,8 @@ async function startBotAfterValidation(req, res, validatedData) {
         try { clearPassiveSessionWatch(); } catch {}
         try { if (dynamicTimingCheck) clearInterval(dynamicTimingCheck); } catch {}
         try { if (finalizeWatch) clearInterval(finalizeWatch); } catch {}
+        try { if (paymentQueueWatch) clearInterval(paymentQueueWatch); } catch {}
+        try { if (deferredPayableTransferWatch) clearInterval(deferredPayableTransferWatch); } catch {}
         // Cleanup: Tarayıcıları kapat (KEEP_BROWSERS_OPEN=true ise açık bırak)
         const shouldKeepOpen = getCfg().FLAGS.KEEP_BROWSERS_OPEN === true;
         

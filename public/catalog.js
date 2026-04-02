@@ -9,6 +9,7 @@
     credentials: [],
     selectedCategoryIds: [],
     aCredentialIds: [],
+    aPayerCredentialIds: [],
     bCredentialIds: [],
   };
 
@@ -29,6 +30,10 @@
       const hay = `${item.name || ''} ${item.slug || ''}`.toLowerCase();
       return hay.includes(q);
     });
+  }
+
+  function credentialHasValidIdentity(item) {
+    return /^\d{11}$/.test(String(item?.identity || '').trim());
   }
 
   function setNotifier(fn) {
@@ -78,6 +83,9 @@
         .filter(Boolean);
     };
     state.aCredentialIds = getValues($('aCredentialList'));
+    state.aPayerCredentialIds = Array.from((($('aCredentialList')) || document.createElement('div')).querySelectorAll('input[type="checkbox"][data-payer-credential-id]:checked'))
+      .map((input) => String(input.value || '').trim())
+      .filter((id) => state.aCredentialIds.includes(id));
     state.bCredentialIds = getValues($('bCredentialList'));
   }
 
@@ -168,39 +176,117 @@
       rootEl.innerHTML = '<div class="checkListEmpty">Önce takım seç.</div>';
       return;
     }
-    const activeCredentials = state.credentials.filter((item) => item.isActive !== false);
+    const oppositeSelectedIds = roleLabel === 'A' ? new Set(state.bCredentialIds) : new Set(state.aCredentialIds);
+    const activeCredentials = state.credentials.filter((item) => item.isActive !== false && !oppositeSelectedIds.has(String(item.id)));
     if (!activeCredentials.length) {
       rootEl.innerHTML = '<div class="checkListEmpty">Kayıtlı üyelik yok.</div>';
       return;
     }
     for (const item of activeCredentials) {
-      const wrap = document.createElement('label');
+      const wrap = document.createElement('div');
       wrap.className = 'credentialPickItem';
       const input = document.createElement('input');
       input.type = 'checkbox';
       input.value = item.id;
       input.dataset.credentialId = item.id;
       input.checked = selectedIds.includes(item.id);
-      input.addEventListener('change', () => syncSelectedCredentialIdsFromDom());
+      input.addEventListener('change', () => {
+        const id = String(item.id);
+        if (input.checked) {
+          if (roleLabel === 'A') {
+            state.bCredentialIds = state.bCredentialIds.filter((x) => String(x) !== id);
+          } else {
+            state.aCredentialIds = state.aCredentialIds.filter((x) => String(x) !== id);
+            state.aPayerCredentialIds = state.aPayerCredentialIds.filter((x) => String(x) !== id);
+          }
+        }
+        if (roleLabel === 'A') {
+          const payerInput = wrap.querySelector('input[data-payer-credential-id]');
+          if (payerInput) {
+            payerInput.disabled = !input.checked;
+            if (!input.checked) payerInput.checked = false;
+          }
+        }
+        syncSelectedCredentialIdsFromDom();
+        renderCredentialPickers();
+      });
 
       const meta = document.createElement('div');
       meta.className = 'credentialPickMeta';
-      meta.innerHTML = `<strong>${escapeHtml(item.email || `${roleLabel} üyeliği`)}</strong>
+      meta.innerHTML = `<strong>${escapeHtml(item.email || `${roleLabel === 'A' ? 'Ana hesap' : 'Tutucu hesap'} üyeliği`)}</strong>
         <span>TCKN: ${escapeHtml(item.identity || '—')} • Fan Card: ${escapeHtml(item.fanCardCode || '—')} • Sicil: ${escapeHtml(item.sicilNo || '—')} • Önc. kod: ${escapeHtml(item.priorityTicketCode || '—')}</span>`;
 
-      wrap.appendChild(input);
+      const controls = document.createElement('div');
+      controls.className = 'credentialPickControls';
+
+      const selectToggle = document.createElement('label');
+      selectToggle.className = 'credentialPickToggle';
+      selectToggle.appendChild(input);
+      selectToggle.appendChild(document.createTextNode(roleLabel === 'A' ? ' Ana hesaba ekle' : ' Tutucu hesaba ekle'));
+      controls.appendChild(selectToggle);
+
+      if (roleLabel === 'A') {
+        const hasIdentity = credentialHasValidIdentity(item);
+        const payerToggle = document.createElement('label');
+        payerToggle.className = 'credentialPickToggle';
+        const payerInput = document.createElement('input');
+        payerInput.type = 'checkbox';
+        payerInput.value = item.id;
+        payerInput.dataset.payerCredentialId = item.id;
+        payerInput.checked = state.aPayerCredentialIds.includes(item.id);
+        payerInput.disabled = !input.checked || !hasIdentity;
+        if (!hasIdentity) payerToggle.title = 'Bu hesabin T.C. Kimlik No bilgisi eksik. Once hesaba TC eklemelisin.';
+        payerInput.addEventListener('change', () => {
+          if (!hasIdentity) {
+            payerInput.checked = false;
+            notify('TC eksik oldugu icin bu hesap odeme yapabilir olarak secilemez.', { email: item.email || '', credentialId: item.id });
+            syncSelectedCredentialIdsFromDom();
+            renderCredentialPickers();
+            return;
+          }
+          if (payerInput.checked && !input.checked) input.checked = true;
+          syncSelectedCredentialIdsFromDom();
+          renderCredentialPickers();
+        });
+        payerToggle.appendChild(payerInput);
+        payerToggle.appendChild(document.createTextNode(' Bu hesap odeme yapabilir'));
+        controls.appendChild(payerToggle);
+        if (!hasIdentity) {
+          const identityWarn = document.createElement('span');
+          identityWarn.className = 'muted credentialInlineWarn';
+          identityWarn.textContent = ' TC eksik oldugu icin odeme secimi kapali';
+          controls.appendChild(identityWarn);
+        }
+      }
+
       wrap.appendChild(meta);
+      wrap.appendChild(controls);
+      wrap.addEventListener('click', (event) => {
+        if (event.target instanceof Element && event.target.closest('.credentialPickControls')) return;
+        if (event.target instanceof HTMLInputElement) return;
+        input.checked = !input.checked;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      });
       rootEl.appendChild(wrap);
     }
   }
 
   function renderCredentialPickers() {
+    syncSelectedCredentialIdsFromDom();
     fillCredentialList($('aCredentialList'), state.aCredentialIds, 'A');
     fillCredentialList($('bCredentialList'), state.bCredentialIds, 'B');
     const aCountEl = $('aCredentialCount');
     const bCountEl = $('bCredentialCount');
-    if (aCountEl) aCountEl.textContent = `${state.aCredentialIds.length} secili`;
+    if (aCountEl) aCountEl.textContent = `${state.aCredentialIds.length} secili${state.aCredentialIds.length ? ` / ${state.aPayerCredentialIds.length} odeme yetkili` : ''}`;
     if (bCountEl) bCountEl.textContent = `${state.bCredentialIds.length} secili`;
+    try {
+      window.dispatchEvent(new CustomEvent('passobot:payer-selection-changed', {
+        detail: {
+          payerCount: state.aPayerCredentialIds.length,
+          aCount: state.aCredentialIds.length,
+        },
+      }));
+    } catch {}
   }
 
   function syncTeamForm() {
@@ -378,6 +464,7 @@
       state.credentials = [];
       state.selectedCategoryIds = [];
       state.aCredentialIds = [];
+      state.aPayerCredentialIds = [];
       state.bCredentialIds = [];
       renderManageTeamList();
       renderManagerSummary();
@@ -405,7 +492,9 @@
     state.credentials = Array.isArray(credJson.credentials) ? credJson.credentials : [];
     state.selectedCategoryIds = state.selectedCategoryIds.filter((id) => state.categories.some((item) => item.id === id && item.isActive !== false));
     state.aCredentialIds = state.aCredentialIds.filter((id) => state.credentials.some((item) => item.id === id && item.isActive !== false));
+    state.aPayerCredentialIds = state.aPayerCredentialIds.filter((id) => state.credentials.some((item) => item.id === id && item.isActive !== false) && state.aCredentialIds.includes(id));
     state.bCredentialIds = state.bCredentialIds.filter((id) => state.credentials.some((item) => item.id === id && item.isActive !== false));
+    state.bCredentialIds = state.bCredentialIds.filter((id) => !state.aCredentialIds.includes(id));
     renderManageTeamList();
     renderManagerSummary();
     renderCategoryChecklist();
@@ -431,6 +520,15 @@
     syncSelectedCredentialIdsFromDom();
     if (String(role || '').toUpperCase() === 'A') return state.aCredentialIds.slice();
     return state.bCredentialIds.slice();
+  }
+
+  function selectedPayerCredentialIds() {
+    syncSelectedCredentialIdsFromDom();
+    return state.aPayerCredentialIds.slice();
+  }
+
+  function getCredentialById(credentialId) {
+    return state.credentials.find((item) => String(item.id) === String(credentialId)) || null;
   }
 
   function escapeHtml(input) {
@@ -486,6 +584,7 @@
     state.credentials = [];
     state.selectedCategoryIds = [];
     state.aCredentialIds = [];
+    state.aPayerCredentialIds = [];
     state.bCredentialIds = [];
     resetCategoryForm();
     resetCredentialForm();
@@ -737,6 +836,8 @@
   window.passobotCatalog = {
     getSelectedCategoryIds: selectedCategoryIds,
     getSelectedCredentialIds: selectedCredentialIds,
+    getSelectedPayerCredentialIds: selectedPayerCredentialIds,
+    getCredentialById,
     getSelectedTeam() {
       const team = currentTeam();
       return team ? { id: team.id, name: team.name } : null;

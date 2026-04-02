@@ -11,9 +11,22 @@ const autoScrollStatusEl = $('autoScrollStatus');
 const cTransferPairInput = $('cTransferPairIndexInput');
 const stepperItems = Array.from(document.querySelectorAll('[data-step-target]'));
 const stepPanels = Array.from(document.querySelectorAll('[data-step-panel]'));
+const setupIssuesCard = $('setupIssuesCard');
+const setupIssuesList = $('setupIssuesList');
+const setupPaymentCard = $('setupPaymentCard');
 
 let currentRunId = null;
 let es = null;
+let runStatusRefreshInFlight = null;
+let runStatusRefreshTimer = null;
+const previousPairSnapshot = new Map();
+let lastSetupIssues = [];
+
+function entryEventKey(entry, line) {
+  const metaEvent = String(entry?.meta?.event || '').trim().toLowerCase();
+  if (metaEvent) return metaEvent;
+  return String(entry?.message || line || '').trim().toLowerCase();
+}
 
 function showToast(title, msg, type = 'success', durationMs = 4500) {
   const container = $('toastContainer');
@@ -25,6 +38,126 @@ function showToast(title, msg, type = 'success', durationMs = 4500) {
   el.querySelector('.toastClose').addEventListener('click', () => removeToast(el));
   container.appendChild(el);
   setTimeout(() => removeToast(el), durationMs);
+}
+
+function normalizeIssueText(issue) {
+  if (!issue) return '';
+  if (typeof issue === 'string') return issue.trim();
+  if (typeof issue?.message === 'string') {
+    const path = String(issue.path || '').trim();
+    return path ? `${issue.message} (${path})` : issue.message.trim();
+  }
+  return String(issue).trim();
+}
+
+function renderSetupIssues(issues = []) {
+  lastSetupIssues = Array.isArray(issues)
+    ? issues.map(normalizeIssueText).filter(Boolean)
+    : [];
+  if (!setupIssuesCard || !setupIssuesList) return;
+  if (!lastSetupIssues.length) {
+    setupIssuesCard.hidden = true;
+    setupIssuesList.innerHTML = '';
+    return;
+  }
+  setupIssuesCard.hidden = false;
+  setupIssuesList.innerHTML = lastSetupIssues
+    .map((issue) => `<div class="setupIssueItem">${escapeHtml(issue)}</div>`)
+    .join('');
+}
+
+function clearSetupIssues() {
+  renderSetupIssues([]);
+}
+
+function showSetupIssues(title, issues) {
+  const list = Array.isArray(issues) ? issues.map(normalizeIssueText).filter(Boolean) : [];
+  if (!list.length) return;
+  renderSetupIssues(list);
+  showToast(title || 'Form Hatalari', list[0], 'error', 6000);
+}
+
+function syncSetupPaymentCard(forceCount = null) {
+  if (!setupPaymentCard) return;
+  const catalogApi = window.passobotCatalog || null;
+  const payerCount = forceCount != null
+    ? Math.max(0, Number(forceCount) || 0)
+    : (catalogApi && typeof catalogApi.getSelectedPayerCredentialIds === 'function'
+      ? catalogApi.getSelectedPayerCredentialIds().length
+      : 0);
+  const shouldShow = payerCount >= 1;
+  setupPaymentCard.hidden = !shouldShow;
+  const cardInputs = Array.from(setupPaymentCard.querySelectorAll('input'));
+  for (const input of cardInputs) {
+    input.required = shouldShow;
+    input.setAttribute('aria-required', shouldShow ? 'true' : 'false');
+  }
+}
+
+function digitsOnly(value) {
+  return String(value || '').replace(/\D+/g, '');
+}
+
+function bindPaymentInputMasks() {
+  const cardNumberEl = $('setupCardNumber');
+  const expiryMonthEl = $('setupExpiryMonth');
+  const expiryYearEl = $('setupExpiryYear');
+  const cvvEl = $('setupCvv');
+
+  if (cardNumberEl && !cardNumberEl.dataset.maskBound) {
+    cardNumberEl.dataset.maskBound = '1';
+    cardNumberEl.addEventListener('input', () => {
+      const digits = digitsOnly(cardNumberEl.value).slice(0, 19);
+      cardNumberEl.value = digits.replace(/(.{4})/g, '$1 ').trim();
+    });
+  }
+
+  if (expiryMonthEl && !expiryMonthEl.dataset.maskBound) {
+    expiryMonthEl.dataset.maskBound = '1';
+    expiryMonthEl.addEventListener('input', () => {
+      let digits = digitsOnly(expiryMonthEl.value).slice(0, 2);
+      if (digits.length === 1 && Number(digits) > 1) digits = `0${digits}`;
+      if (digits.length === 2) {
+        const mm = Math.min(12, Math.max(1, Number(digits) || 1));
+        digits = String(mm).padStart(2, '0');
+      }
+      expiryMonthEl.value = digits;
+    });
+  }
+
+  if (expiryYearEl && !expiryYearEl.dataset.maskBound) {
+    expiryYearEl.dataset.maskBound = '1';
+    expiryYearEl.addEventListener('input', () => {
+      expiryYearEl.value = digitsOnly(expiryYearEl.value).slice(0, 2);
+    });
+  }
+
+  if (cvvEl && !cvvEl.dataset.maskBound) {
+    cvvEl.dataset.maskBound = '1';
+    cvvEl.addEventListener('input', () => {
+      cvvEl.value = digitsOnly(cvvEl.value).slice(0, 4);
+    });
+  }
+}
+
+function maybeSurfaceSetupIssue(msg, meta) {
+  const text = String(msg || '').trim();
+  const metaErr = String(meta?.error || '').trim();
+  const hay = `${text} ${metaErr}`.toLowerCase();
+  if (!hay) return;
+  const shouldSurface =
+    hay.includes('zorunlu') ||
+    hay.includes('seç') ||
+    hay.includes('gerekli') ||
+    hay.includes('yüklenemedi') ||
+    hay.includes('hata') ||
+    hay.includes('başarısız') ||
+    hay.includes('failed') ||
+    hay.includes('error');
+  if (!shouldSurface) return;
+  const issue = metaErr ? `${text} (${metaErr})` : text;
+  const next = lastSetupIssues.includes(issue) ? lastSetupIssues : [...lastSetupIssues, issue];
+  renderSetupIssues(next);
 }
 
 function removeToast(el) {
@@ -42,13 +175,97 @@ function escapeHtml(s) {
     .replace(/"/g, '&quot;');
 }
 
+function formatCountdownSeconds(totalSeconds) {
+  const sec = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const mm = Math.floor(sec / 60);
+  const ss = sec % 60;
+  return `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+}
+
+function parseFiniteMaybe(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function computePairRemainingSeconds(source) {
+  if (!source) return null;
+  const observedRemaining = parseFiniteMaybe(source.basketRemainingSeconds);
+  const observedAtMs = source.basketObservedAt ? Date.parse(String(source.basketObservedAt)) : NaN;
+  if (observedRemaining != null && Number.isFinite(observedAtMs)) {
+    const elapsed = Math.max(0, Math.floor((Date.now() - observedAtMs) / 1000));
+    return Math.max(0, observedRemaining - elapsed);
+  }
+  const arrivedAtMs = parseFiniteMaybe(source.basketArrivedAtMs);
+  const holdingTimeSeconds = parseFiniteMaybe(source.basketHoldingTimeSeconds);
+  if (arrivedAtMs != null && arrivedAtMs > 0 && holdingTimeSeconds != null && holdingTimeSeconds > 0) {
+    const elapsed = Math.max(0, Math.floor((Date.now() - arrivedAtMs) / 1000));
+    return Math.max(0, holdingTimeSeconds - elapsed);
+  }
+  return null;
+}
+
+function pairRemainingLabel(source) {
+  const remaining = computePairRemainingSeconds(source);
+  if (!Number.isFinite(remaining)) return '—';
+  if (remaining <= 0) return 'Süre doldu';
+  return formatCountdownSeconds(remaining);
+}
+
+function pairRemainingTone(source) {
+  const remaining = computePairRemainingSeconds(source);
+  if (!Number.isFinite(remaining)) return '';
+  if (remaining <= 30) return 'danger';
+  if (remaining <= 90) return 'warn';
+  return '';
+}
+
+function refreshPairCountdowns() {
+  const nodes = document.querySelectorAll('.pairTimer');
+  for (const node of nodes) {
+    const label = pairRemainingLabel(node.dataset);
+    const tone = pairRemainingTone(node.dataset);
+    node.textContent = label;
+    node.classList.toggle('warn', tone === 'warn');
+    node.classList.toggle('danger', tone === 'danger');
+  }
+}
+
+setInterval(refreshPairCountdowns, 1000);
+
+function pairJustReachedBasket(prev, next) {
+  const prevPhase = String(prev?.phase || '').toLowerCase();
+  const nextPhase = String(next?.phase || '').toLowerCase();
+  const nextHasBasket =
+    nextPhase.includes('sepette') ||
+    nextPhase.includes('odeme sayfasi hazir') ||
+    nextPhase.includes('ödeme sayfası hazır');
+  const prevHasBasket =
+    prevPhase.includes('sepette') ||
+    prevPhase.includes('odeme sayfasi hazir') ||
+    prevPhase.includes('ödeme sayfası hazır');
+  return nextHasBasket && !prevHasBasket;
+}
+
+function shouldFlashPairCard(prev, next) {
+  if (!next) return false;
+  if (!prev) return !!(next.seatId || next.holder || next.phase);
+  if (pairJustReachedBasket(prev, next)) return true;
+  if (String(prev.seatId || '') !== String(next.seatId || '')) return true;
+  if (String(prev.holder || '') !== String(next.holder || '')) return true;
+  if (String(prev.phase || '') !== String(next.phase || '')) return true;
+  if (String(prev.paymentState || '') !== String(next.paymentState || '')) return true;
+  return false;
+}
+
 function renderPairDashboard(dash) {
   const metaEl = $('pairDashboardMeta');
   const bodyEl = $('pairDashboardBody');
   if (!metaEl || !bodyEl) return;
   if (!dash || !Array.isArray(dash.pairs) || dash.pairs.length === 0) {
     metaEl.textContent = '';
-    bodyEl.innerHTML = '<div class="pairDashEmpty">Run başlatıldığında eşleşmeler burada canlı güncellenir.</div>';
+    bodyEl.innerHTML = '<div class="pairDashEmpty">Run başlatıldığında akış kartları burada canlı güncellenir.</div>';
     return;
   }
   const pairs = dash.pairs;
@@ -56,39 +273,63 @@ function renderPairDashboard(dash) {
   const extra = pairs.length - matched;
   const mode = dash.mode === 'multi' ? 'Çoklu' : 'Tek çift';
   const cT = Math.max(1, Number(dash.cTargetPairIndex) || 1);
+  const activePairIndex = Math.max(0, Number(dash.activePairIndex) || 0);
   if (cTransferPairInput && document.activeElement !== cTransferPairInput) {
     cTransferPairInput.value = String(cT);
   }
   const t = dash.updatedAt ? new Date(dash.updatedAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
-  metaEl.textContent = `${mode} · ${pairs.length} satır (${matched} eşleşen${extra ? `, ${extra} ekstra A` : ''}) · C/finalize hedefi: #${cT}${t ? ` · ${t}` : ''}`;
+  metaEl.textContent = `${mode} · ${pairs.length} satır (${matched} eşleşen${extra ? `, ${extra} ekstra ana hesap` : ''}) · C/finalize hedefi: #${cT}${activePairIndex ? ` · aktif akış: #${activePairIndex}` : ''}${t ? ` · ${t}` : ''}`;
 
   bodyEl.innerHTML = pairs
     .map((p) => {
+      const prev = previousPairSnapshot.get(String(p.pairIndex)) || null;
       const who =
-        p.holder === 'A' ? 'A hesabında' : p.holder === 'B' ? 'B hesabında' : '—';
+        p.holder === 'A' ? 'Ana hesapta' : p.holder === 'B' ? 'Tutucu hesapta' : '—';
       const badge = p.isCTarget ? '<span class="pairDashC">C hedefi</span>' : '';
-      const um = p.unmatched ? '<span class="pairDashWarn">B yok</span>' : '';
-      const active = p.isCTarget ? ' active' : '';
+      const um = p.unmatched ? '<span class="pairDashWarn">Tutucu yok</span>' : '';
+      const active = (p.isCTarget || p.isActivePair) ? ' active' : '';
+      const flash = shouldFlashPairCard(prev, p) ? ' flash' : '';
+      const activeBadge = p.isActivePair ? '<span class="pairDashC">Aktif</span>' : '';
       const trib = p.tribune != null && String(p.tribune).trim() ? String(p.tribune).trim() : null;
       const srow = p.seatRow != null && String(p.seatRow).trim() ? String(p.seatRow).trim() : null;
       const snum = p.seatNumber != null && String(p.seatNumber).trim() ? String(p.seatNumber).trim() : null;
+      const paymentOwner =
+        p.paymentOwnerRole === 'A' ? 'Ana Hesap' : p.paymentOwnerRole === 'C' ? 'C Hesabi' : '—';
+      const paymentState = p.paymentState ? String(p.paymentState) : '—';
+      const remainingLabel = pairRemainingLabel(p);
+      const remainingTone = pairRemainingTone(p);
       const detailLines =
         trib || srow || snum
           ? `<div class="pairCardRow"><span>Tribün</span> ${escapeHtml(trib || '—')}</div>
       <div class="pairCardRow"><span>Sıra</span> ${escapeHtml(srow || '—')}</div>
       <div class="pairCardRow"><span>Koltuk no</span> ${escapeHtml(snum || '—')}</div>`
           : '';
-      return `<div class="pairCard${active}">
-      <div class="pairCardHead"><strong>#${escapeHtml(p.pairIndex)}</strong> ${badge} ${um}</div>
-      <div class="pairCardRow"><span>A</span> <code>${escapeHtml(p.aEmail || '—')}</code></div>
-      <div class="pairCardRow"><span>B</span> <code>${escapeHtml(p.bEmail || '—')}</code></div>
+      return `<div class="pairCard${active}${flash}">
+      <div class="pairCardHead"><strong>#${escapeHtml(p.pairIndex)}</strong> ${badge} ${activeBadge} ${um}</div>
+      <div class="pairCardRow"><span>Ana</span> <code>${escapeHtml(p.aEmail || '—')}</code></div>
+      <div class="pairCardRow"><span>Tutucu</span> <code>${escapeHtml(p.bEmail || '—')}</code></div>
       ${detailLines}
       <div class="pairCardRow"><span>Özet</span> ${escapeHtml(p.seatLabel || '—')} <span class="muted">(id: ${escapeHtml(p.seatId || '—')})</span></div>
       <div class="pairCardRow"><span>Tutucu</span> <strong>${escapeHtml(who)}</strong></div>
+      <div class="pairCardRow"><span>Kalan süre</span> <strong class="pairTimer${remainingTone ? ` ${remainingTone}` : ''}" data-basket-remaining-seconds="${escapeHtml(p.basketRemainingSeconds ?? '')}" data-basket-observed-at="${escapeHtml(p.basketObservedAt || '')}" data-basket-arrived-at-ms="${escapeHtml(p.basketArrivedAtMs ?? '')}" data-basket-holding-time-seconds="${escapeHtml(p.basketHoldingTimeSeconds ?? '')}">${escapeHtml(remainingLabel)}</strong></div>
+      <div class="pairCardRow"><span>Ödeme sahibi</span> <strong>${escapeHtml(paymentOwner)}</strong></div>
+      <div class="pairCardRow"><span>Ödeme durumu</span> <strong>${escapeHtml(paymentState)}</strong></div>
       <div class="pairCardPhase">${escapeHtml(p.phase || '')}</div>
     </div>`;
     })
     .join('');
+
+  previousPairSnapshot.clear();
+  for (const pair of pairs) {
+    previousPairSnapshot.set(String(pair.pairIndex), {
+      pairIndex: pair.pairIndex,
+      seatId: pair.seatId || '',
+      holder: pair.holder || '',
+      phase: pair.phase || '',
+      paymentState: pair.paymentState || '',
+    });
+  }
+  refreshPairCountdowns();
 }
 
 const state = {
@@ -128,22 +369,22 @@ const PANEL_CHECKBOX_KEYS = new Set([
 
 /** Bilet alımı — timeout / gecikme / çoklu hesap / sepet döngüsü / koltuk tarama. */
 const PANEL_FIELD_META = {
-  MULTI_A_CONCURRENCY: { label: 'Paralel A oturumu', hint: 'Aynı anda kaç A tarayıcısı.', section: 'multi' },
-  MULTI_B_CONCURRENCY: { label: 'Paralel B oturumu', hint: 'Aynı anda kaç B tarayıcısı.', section: 'multi' },
+  MULTI_A_CONCURRENCY: { label: 'Paralel ana hesap oturumu', hint: 'Aynı anda kaç ana hesap tarayıcısı.', section: 'multi' },
+  MULTI_B_CONCURRENCY: { label: 'Paralel tutucu hesap oturumu', hint: 'Aynı anda kaç tutucu hesap tarayıcısı.', section: 'multi' },
   MULTI_STAGGER_MS: { label: 'Başlatma aralığı (ms)', hint: 'Oturumlar arası gecikme.', section: 'multi' },
 
   BASKET_LOOP_ENABLED: { label: 'Sepet döngüsü (basket loop)', hint: 'Transfer döngüsü aktif.', section: 'basket', type: 'checkbox' },
   BASKET_LOOP_MAX_HOPS: { label: 'Sepet döngüsü max adım', hint: 'Maksimum hop sayısı.', section: 'basket' },
   PASSIVE_SESSION_CHECK_MS: { label: 'Pasif hesap oturum kontrolü (ms)', hint: 'Karşı taraf sepetteyken bekleyen (koltuk sayfası) hesap bu aralıkla kontrol edilir; min 10 sn.', section: 'basket' },
-  EXPERIMENTAL_A_READD_ON_THRESHOLD: { label: 'A yeniden ekleme (eşik modu)', hint: 'Deneysel: süre eşiğinde tekrar ekleme.', section: 'basket', type: 'checkbox' },
-  EXPERIMENTAL_A_READD_THRESHOLD_SECONDS: { label: 'A readd eşik (sn)', hint: 'Ne kadar süre kala tetiklensin.', section: 'basket' },
-  EXPERIMENTAL_A_READD_COOLDOWN_SECONDS: { label: 'A readd bekleme (sn)', hint: 'Tekrar arası minimum süre.', section: 'basket' },
+  EXPERIMENTAL_A_READD_ON_THRESHOLD: { label: 'Ana hesap yeniden ekleme (eşik modu)', hint: 'Deneysel: süre eşiğinde tekrar ekleme.', section: 'basket', type: 'checkbox' },
+  EXPERIMENTAL_A_READD_THRESHOLD_SECONDS: { label: 'Ana hesap yeniden ekleme eşiği (sn)', hint: 'Ne kadar süre kala tetiklensin.', section: 'basket' },
+  EXPERIMENTAL_A_READD_COOLDOWN_SECONDS: { label: 'Ana hesap yeniden ekleme bekleme (sn)', hint: 'Tekrar arası minimum süre.', section: 'basket' },
 
   TURNSTILE_DETECTION_TIMEOUT: { label: 'Turnstile algılama timeout (ms)', hint: 'Widget bekleme.', section: 'timeouts' },
   CLICK_BUY_RETRIES: { label: 'Satın al tıklama denemesi', hint: 'SATIN AL için tekrar.', section: 'timeouts' },
   CLICK_BUY_DELAY: { label: 'Satın al tıklama gecikmesi (ms)', hint: 'Denemeler arası.', section: 'timeouts' },
   SEAT_SELECTION_MAX_MS: { label: 'Koltuk seçimi max süre (ms)', hint: 'Blok başına üst süre.', section: 'timeouts' },
-  SEAT_PICK_EXACT_MAX_MS: { label: 'Tam koltuk yakalama max (ms)', hint: 'B’de hedef koltuk.', section: 'timeouts' },
+  SEAT_PICK_EXACT_MAX_MS: { label: 'Tam koltuk yakalama max (ms)', hint: 'Tutucu hesapta hedef koltuk.', section: 'timeouts' },
   NETWORK_CAPTURE_TIMEOUT: { label: 'Ağ yakalama timeout (ms)', hint: 'API yanıtı bekleme.', section: 'timeouts' },
   SWAL_CONFIRM_TIMEOUT: { label: 'SweetAlert onay timeout (ms)', hint: 'Modal onayı.', section: 'timeouts' },
   REMOVE_FROM_CART_TIMEOUT: { label: 'Sepetten çıkar timeout (ms)', hint: 'Çıkarma onayı.', section: 'timeouts' },
@@ -166,7 +407,7 @@ const PANEL_FIELD_META = {
 
 const PANEL_SECTION_TITLES = {
   multi: 'Çoklu hesap',
-  basket: 'Sepet döngüsü ve deneysel A',
+  basket: 'Sepet döngüsü ve deneysel ana hesap',
   timeouts: 'Zaman aşımları (ms)',
   delays: 'Gecikmeler (ms)',
   seat: 'Koltuk ve kategori tarama',
@@ -324,6 +565,7 @@ async function openSettingsModalFresh() {
 }
 const statusState = {
   lastText: '',
+  lastKey: '',
   lastAt: 0,
 };
 
@@ -367,9 +609,18 @@ function appendLogLine(line, entry) {
     const statusText = isStatusMessage(entry, line);
     if (statusText) {
       const now = Date.now();
-      const isDuplicate = statusState.lastText === statusText && (now - statusState.lastAt) < 2500;
+      const dedupeKey = [
+        String(entryEventKey(entry, line) || ''),
+        String(entry?.meta?.idx ?? ''),
+        String(entry?.meta?.pairIndex ?? ''),
+        String(entry?.meta?.seatId ?? entry?.meta?.seatInfo?.seatId ?? ''),
+        String(entry?.meta?.email ?? entry?.meta?.aEmail ?? entry?.meta?.bEmail ?? ''),
+        statusText,
+      ].join('|');
+      const isDuplicate = statusState.lastKey === dedupeKey && (now - statusState.lastAt) < 2500;
       if (isDuplicate) return;
       statusState.lastText = statusText;
+      statusState.lastKey = dedupeKey;
       statusState.lastAt = now;
       const sDiv = document.createElement('div');
       sDiv.textContent = statusText;
@@ -399,18 +650,20 @@ async function killSessions() {
 
 function isStatusMessage(entry, line) {
   const msg = String(entry?.message || line || '').toLowerCase();
+  const eventKey = entryEventKey(entry, line);
   const meta = entry?.meta || {};
   
   // Helper to format seat details from meta
   const formatSeatDetails = (m) => {
+    const src = m?.seatInfo || m?.seatA || m?.seatB || m || {};
     const parts = [];
     // Use combined if available (has full seat info: tribune block row seat)
-    if (m.combined) return ` (${m.combined})`;
-    if (m.tribune) parts.push(`Tribün: ${m.tribune}`);
-    if (m.block || m.blockText || m.blockName) parts.push(`Blok: ${m.block || m.blockText || m.blockName}`);
-    if (m.categoryText || m.categoryName) parts.push(`Kat: ${m.categoryText || m.categoryName}`);
-    if (m.row || m.rowNumber) parts.push(`Sıra: ${m.row || m.rowNumber}`);
-    if (m.seat || m.seatNumber || m.seatNum) parts.push(`Koltuk: ${m.seat || m.seatNumber || m.seatNum}`);
+    if (src.combined) return ` (${src.combined})`;
+    if (src.tribune) parts.push(`Tribün: ${src.tribune}`);
+    if (src.block || src.blockText || src.blockName) parts.push(`Blok: ${src.block || src.blockText || src.blockName}`);
+    if (src.categoryText || src.categoryName) parts.push(`Kat: ${src.categoryText || src.categoryName}`);
+    if (src.row || src.rowNumber) parts.push(`Sıra: ${src.row || src.rowNumber}`);
+    if (src.seat || src.seatNumber || src.seatNum) parts.push(`Koltuk: ${src.seat || src.seatNumber || src.seatNum}`);
     return parts.length > 0 ? ` (${parts.join(', ')})` : '';
   };
   
@@ -419,7 +672,7 @@ function isStatusMessage(entry, line) {
   if (msg.includes('run stopped') || msg.includes('bot başarıyla tamamlandı') || msg.includes('completed')) return '✅ Bot tamamlandı';
 
   if (msg.includes('step:a.launchandlogin.done') || msg.includes('step:b.launchandlogin.done') || msg.includes('step:c.launchandlogin.done')) {
-    const account = msg.includes('step:a.') ? 'A' : (msg.includes('step:b.') ? 'B' : (msg.includes('step:c.') ? 'C' : null));
+    const account = msg.includes('step:a.') ? 'Ana hesap' : (msg.includes('step:b.') ? 'Tutucu hesap' : (msg.includes('step:c.') ? 'C hesabi' : null));
     const email = meta?.email || '';
     return account ? `✓ ${account} Hesabı giriş yapıldı${email ? ': ' + email : ''}` : null;
   }
@@ -444,6 +697,9 @@ function isStatusMessage(entry, line) {
 
   // Only show "seat selected" on strong/confirmed seat signals.
   const seatConfirmed =
+    eventKey === 'a_hold_acquired' ||
+    eventKey === 'b_exact_pick_done' ||
+    eventKey === 'transfer_pair_done' ||
     msg.includes('seatpick:a:selected') ||
     msg.includes('seatpick:b:selected') ||
     msg.includes('seatpick:a:basket_success') ||
@@ -453,13 +709,23 @@ function isStatusMessage(entry, line) {
     msg.includes('seat_selected_a') ||
     msg.includes('seat_grabbed_b');
   if (seatConfirmed) {
-    const details = formatSeatDetails(meta?.seatInfo || meta);
+    const details = formatSeatDetails(meta);
     return `🪑 Koltuk seçildi${details}`;
   }
 
-  if (msg.includes('sepete') || msg.includes('basket_success') || msg.includes('basket_from_network')) {
-    const details = formatSeatDetails(meta?.seatInfo || meta);
-    return `🛒 Sepete koltuk eklendi${details}`;
+  if (
+    eventKey === 'a_hold_in_basket' ||
+    eventKey === 'a_only_holding' ||
+    eventKey === 'a_only_payment_ready' ||
+    eventKey === 'a_payment_ready' ||
+    msg.includes('sepete') ||
+    msg.includes('basket_success') ||
+    msg.includes('basket_from_network')
+  ) {
+    const details = formatSeatDetails(meta);
+    const pairLabel = meta?.pairIndex != null ? ` #${meta.pairIndex}` : (meta?.idx != null ? ` #${Number(meta.idx) + 1}` : '');
+    const account = meta?.email ? ` (${meta.email})` : '';
+    return `🛒 Sepete koltuk eklendi${pairLabel}${account}${details}`;
   }
 
   if (msg.includes('seat.noselectable.retry_block')) {
@@ -493,16 +759,74 @@ function isStatusMessage(entry, line) {
   return null;
 }
 
+function shouldRefreshRunStatusNow(entry, runId) {
+  if (!runId) return false;
+  const metaRunId = String(entry?.meta?.runId || '').trim();
+  if (metaRunId && metaRunId !== String(runId)) return false;
+  const eventKey = entryEventKey(entry, '');
+  const message = String(entry?.message || '').toLowerCase();
+  return [
+    'a_hold_acquired',
+    'a_hold_in_basket',
+    'b_exact_pick_done',
+    'transfer_pair_done',
+    'holder_updated',
+    'a_only_payment_ready',
+    'a_only_holding',
+    'a_payment_ready',
+    'finalize_done',
+  ].includes(eventKey) || message.includes('a hesabı koltuk seçti ve sepete eklendi');
+}
+
+async function refreshRunStatus(runId) {
+  if (!runId) return null;
+  if (runStatusRefreshInFlight) return runStatusRefreshInFlight;
+  runStatusRefreshInFlight = (async () => {
+    try {
+      const r = await fetch(`/run/${encodeURIComponent(runId)}/status`, { cache: 'no-store' });
+      const j = await r.json();
+      const st = j?.run?.status;
+      if (j?.run?.pairDashboard) renderPairDashboard(j.run.pairDashboard);
+      if (st) runStatusEl.textContent = st;
+      return j;
+    } catch {
+      return null;
+    } finally {
+      runStatusRefreshInFlight = null;
+    }
+  })();
+  return runStatusRefreshInFlight;
+}
+
+function scheduleRunStatusRefresh(runId, delayMs = 0) {
+  if (!runId) return;
+  try {
+    if (runStatusRefreshTimer) clearTimeout(runStatusRefreshTimer);
+  } catch {}
+  runStatusRefreshTimer = setTimeout(() => {
+    runStatusRefreshTimer = null;
+    refreshRunStatus(runId).catch(() => {});
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
 function clearLogs() {
   logBox.textContent = '';
   statusBox.textContent = '';
   statusState.lastText = '';
+  statusState.lastKey = '';
   statusState.lastAt = 0;
 }
 
 function infoLine(msg, meta) {
   const line = `${new Date().toISOString()} [UI]: ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}`;
   appendLogLine(line, { message: msg, level: 'info' });
+  maybeSurfaceSetupIssue(msg, meta);
+}
+
+function getCheckedCategoryIdsFromDom() {
+  return Array.from(document.querySelectorAll('#teamCategoryList input[type="checkbox"][data-category-id]:checked'))
+    .map((el) => String(el.value || '').trim())
+    .filter(Boolean);
 }
 
 function setConn(text, ok) {
@@ -535,6 +859,9 @@ function startSse() {
     try {
       const e = JSON.parse(ev.data);
       appendLogLine(fmt(e), e);
+      if (shouldRefreshRunStatusNow(e, currentRunId)) {
+        scheduleRunStatusRefresh(currentRunId, 0);
+      }
     } catch {}
   });
 
@@ -546,15 +873,10 @@ function startSse() {
 async function pollRunStatus(runId) {
   if (!runId) return;
   for (;;) {
-    try {
-      const r = await fetch(`/run/${encodeURIComponent(runId)}/status`, { cache: 'no-store' });
-      const j = await r.json();
-      const st = j?.run?.status;
-      if (j?.run?.pairDashboard) renderPairDashboard(j.run.pairDashboard);
-      if (st) runStatusEl.textContent = st;
-      if (st && st !== 'running') return;
-    } catch {}
-    await new Promise((res) => setTimeout(res, 1000));
+    const j = await refreshRunStatus(runId);
+    const st = j?.run?.status;
+    if (st && st !== 'running') return;
+    await new Promise((res) => setTimeout(res, 350));
   }
 }
 
@@ -578,9 +900,15 @@ function syncPrioritySaleUi() {
 document.getElementById('prioritySaleSelect')?.addEventListener('change', syncPrioritySaleUi);
 document.getElementById('prioritySaleCategorySelect')?.addEventListener('change', syncPrioritySaleUi);
 syncPrioritySaleUi();
+window.addEventListener('passobot:payer-selection-changed', (event) => {
+  syncSetupPaymentCard(event?.detail?.payerCount ?? null);
+});
+syncSetupPaymentCard();
+bindPaymentInputMasks();
 
 $('botForm').addEventListener('submit', async (e) => {
   e.preventDefault();
+  clearSetupIssues();
 
   const fd = new FormData(e.target);
   const body = Object.fromEntries(fd.entries());
@@ -591,30 +919,42 @@ $('botForm').addEventListener('submit', async (e) => {
   const selectedCategoryIds = catalogApi && typeof catalogApi.getSelectedCategoryIds === 'function'
     ? catalogApi.getSelectedCategoryIds()
     : [];
+  const selectedCategoryIdsFromDom = getCheckedCategoryIdsFromDom();
+  const mergedCategoryIds = Array.from(new Set([...(selectedCategoryIds || []), ...selectedCategoryIdsFromDom]));
   const aCredentialIds = catalogApi && typeof catalogApi.getSelectedCredentialIds === 'function'
     ? catalogApi.getSelectedCredentialIds('A')
     : [];
   const bCredentialIds = catalogApi && typeof catalogApi.getSelectedCredentialIds === 'function'
     ? catalogApi.getSelectedCredentialIds('B')
     : [];
+  const payerACredentialIds = catalogApi && typeof catalogApi.getSelectedPayerCredentialIds === 'function'
+    ? catalogApi.getSelectedPayerCredentialIds()
+    : [];
+  const invalidPayerCredentials = catalogApi && typeof catalogApi.getCredentialById === 'function'
+    ? payerACredentialIds
+      .map((id) => catalogApi.getCredentialById(id))
+      .filter((item) => item && !/^\d{11}$/.test(String(item.identity || '').trim()))
+    : [];
+  syncSetupPaymentCard(payerACredentialIds.length);
 
   if (!selectedTeam?.id || !selectedTeam?.name) {
-    infoLine('Bot başlatmak için önce takım seçmelisin.');
+    const issues = ['Bot başlatmak için önce takım seçmelisin.'];
+    infoLine(issues[0]);
+    showSetupIssues('Eksik form bilgisi', issues);
     return;
   }
 
   body.teamId = selectedTeam.id;
   body.team = selectedTeam.name;
-  if (selectedCategoryIds.length) body.selectedCategoryIds = selectedCategoryIds;
+  if (mergedCategoryIds.length) body.selectedCategoryIds = mergedCategoryIds;
 
   // Öncelikli satış: kapalı → false; açık → seçilen kategori metni (Passo modal eşlemesi)
   const psRaw = String(body.prioritySale || '').trim().toLowerCase();
+  const validationIssues = [];
   if (psRaw === 'on') {
     const cat = String(body.prioritySaleCategory || '').trim();
     if (!cat) {
-      infoLine('Öncelikli satış açıkken öncelik kategorisi seçmelisin.');
-      showToast('Eksik seçim', 'Öncelik kategorisinden birini seç.', 'error', 5000);
-      return;
+      validationIssues.push('Öncelikli satış açıkken öncelik kategorisi seçmelisin.');
     }
     body.prioritySale = cat;
     delete body.prioritySaleCategory;
@@ -636,16 +976,41 @@ $('botForm').addEventListener('submit', async (e) => {
 
   if (aCredentialIds.length) body.aCredentialIds = aCredentialIds;
   if (bCredentialIds.length) body.bCredentialIds = bCredentialIds;
+  if (payerACredentialIds.length) body.payerACredentialIds = payerACredentialIds;
 
-  if (!selectedCategoryIds.length && !String(body.categoryType || '').trim()) {
-    infoLine('En az 1 kayıtlı kategori seç veya fallback kategori gir.');
-    return;
+  if (!mergedCategoryIds.length && !String(body.categoryType || '').trim()) {
+    validationIssues.push('En az 1 kayıtlı kategori seç veya fallback kategori gir.');
   }
   if (!aCredentialIds.length) {
-    infoLine('En az 1 A üyeliği seçmelisin.');
+    validationIssues.push('En az 1 ana hesap üyeliği seçmelisin.');
+  }
+  if (!payerACredentialIds.length) {
+    validationIssues.push('Seçili ana hesap üyeliklerinden en az 1 tanesini "Odeme yapabilir" olarak işaretlemelisin.');
+  }
+  if (invalidPayerCredentials.length) {
+    const labels = invalidPayerCredentials.map((item) => item.email || 'hesap').join(', ');
+    validationIssues.push(`Su hesaplarda T.C. Kimlik No eksik oldugu icin odeme yapabilir secilemez: ${labels}`);
+  }
+  if (payerACredentialIds.length) {
+    const cardFields = [
+      { key: 'cardHolder', label: 'Kart sahibi adı' },
+      { key: 'cardNumber', label: 'Kart numarası' },
+      { key: 'expiryMonth', label: 'Son kullanma ayı' },
+      { key: 'expiryYear', label: 'Son kullanma yılı' },
+      { key: 'cvv', label: 'CVV' },
+    ];
+    for (const field of cardFields) {
+      if (!String(body[field.key] || '').trim()) {
+        validationIssues.push(`${field.label} zorunlu; çünkü en az 1 ana hesap "Odeme yapabilir" olarak seçildi.`);
+      }
+    }
+  }
+  if (validationIssues.length) {
+    for (const issue of validationIssues) infoLine(issue);
+    showSetupIssues('Eksik form bilgisi', validationIssues);
     return;
   }
-  // B üyeliği opsiyonel: seçilmezse A-only mod çalışır
+  // Tutucu hesap opsiyonel: seçilmezse ana hesap odaklı mod çalışır
 
   // If arrays are provided, drop legacy single-account fields to avoid confusion.
   delete body.email;
@@ -675,7 +1040,10 @@ $('botForm').addEventListener('submit', async (e) => {
     const json = await resp.json();
     if (!resp.ok) {
       appendLogLine(`${new Date().toISOString()} [ERROR]: start failed ${JSON.stringify(json)}`, { level: 'error', message: 'start failed' });
-      showToast('Baslatma Hatasi', json?.error || 'Bot baslatilirken bir hata olustu.', 'error', 6000);
+      const serverIssues = Array.isArray(json?.details) && json.details.length
+        ? json.details
+        : [json?.error || 'Bot baslatilirken bir hata olustu.'];
+      showSetupIssues('Baslatma Hatasi', serverIssues);
       return;
     }
 
@@ -684,11 +1052,13 @@ $('botForm').addEventListener('submit', async (e) => {
     runStatusEl.textContent = json.status || 'running';
     appendLogLine(`${new Date().toISOString()} [INFO]: run started ${currentRunId}`, { level: 'info', message: 'run started' });
     showToast('Bot Baslatildi', 'Islem basladi, canli takip ekranina yonlendiriliyorsunuz.', 'success', 5000);
+    clearSetupIssues();
     setActiveStep('run');
 
     pollRunStatus(currentRunId);
   } catch (err) {
     appendLogLine(`${new Date().toISOString()} [ERROR]: start request failed ${err?.message || err}`, { level: 'error', message: 'start request failed' });
+    showSetupIssues('Baslatma Hatasi', [err?.message || String(err)]);
   }
 });
 
