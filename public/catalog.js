@@ -10,6 +10,7 @@
     selectedCategoryIds: [],
     aCredentialIds: [],
     aPayerCredentialIds: [],
+    aTransferCredentialIds: [],
     bCredentialIds: [],
   };
 
@@ -82,6 +83,9 @@
     state.aPayerCredentialIds = Array.from((($('aCredentialList')) || document.createElement('div')).querySelectorAll('input[type="checkbox"][data-payer-credential-id]:checked'))
       .map((input) => String(input.value || '').trim())
       .filter((id) => state.aCredentialIds.includes(id));
+    state.aTransferCredentialIds = Array.from((($('aCredentialList')) || document.createElement('div')).querySelectorAll('input[type="checkbox"][data-transfer-credential-id]:checked'))
+      .map((input) => String(input.value || '').trim())
+      .filter((id) => state.aCredentialIds.includes(id) && !state.aPayerCredentialIds.includes(id));
     state.bCredentialIds = getValues($('bCredentialList'));
   }
 
@@ -181,6 +185,14 @@
     for (const item of activeCredentials) {
       const wrap = document.createElement('div');
       wrap.className = 'credentialPickItem';
+      const isSelectedA = roleLabel === 'A' && selectedIds.includes(item.id);
+      const isPayerA = roleLabel === 'A' && state.aPayerCredentialIds.includes(item.id);
+      const isTransferA = roleLabel === 'A' && state.aTransferCredentialIds.includes(item.id);
+      const badges = [];
+      if (isSelectedA) badges.push('<span class="credentialRoleBadge roleA">Ana</span>');
+      if (isPayerA) badges.push('<span class="credentialRoleBadge rolePayment">Odeme</span>');
+      if (isTransferA) badges.push('<span class="credentialRoleBadge roleTransfer">Transfer</span>');
+      if (isSelectedA && !isPayerA && !isTransferA) badges.push('<span class="credentialRoleBadge roleSelf">Kendimize</span>');
       const input = document.createElement('input');
       input.type = 'checkbox';
       input.value = item.id;
@@ -194,13 +206,19 @@
           } else {
             state.aCredentialIds = state.aCredentialIds.filter((x) => String(x) !== id);
             state.aPayerCredentialIds = state.aPayerCredentialIds.filter((x) => String(x) !== id);
+            state.aTransferCredentialIds = state.aTransferCredentialIds.filter((x) => String(x) !== id);
           }
         }
         if (roleLabel === 'A') {
           const payerInput = wrap.querySelector('input[data-payer-credential-id]');
+          const transferInput = wrap.querySelector('input[data-transfer-credential-id]');
           if (payerInput) {
             payerInput.disabled = !input.checked;
             if (!input.checked) payerInput.checked = false;
+          }
+          if (transferInput) {
+            transferInput.disabled = !input.checked;
+            if (!input.checked) transferInput.checked = false;
           }
         }
         syncSelectedCredentialIdsFromDom();
@@ -210,6 +228,7 @@
       const meta = document.createElement('div');
       meta.className = 'credentialPickMeta';
       meta.innerHTML = `<strong>${escapeHtml(item.email || `${roleLabel === 'A' ? 'Ana hesap' : 'Tutucu hesap'} üyeliği`)}</strong>
+        ${badges.length ? `<div class="credentialRoleBadgeRow">${badges.join('')}</div>` : ''}
         <span>TCKN: ${escapeHtml(item.identity || '—')} • Fan Card: ${escapeHtml(item.fanCardCode || '—')} • Sicil: ${escapeHtml(item.sicilNo || '—')} • Önc. kod: ${escapeHtml(item.priorityTicketCode || '—')}</span>`;
 
       const controls = document.createElement('div');
@@ -232,12 +251,33 @@
         payerInput.disabled = !input.checked;
         payerInput.addEventListener('change', () => {
           if (payerInput.checked && !input.checked) input.checked = true;
+          const transferInput = wrap.querySelector('input[data-transfer-credential-id]');
+          if (payerInput.checked && transferInput) transferInput.checked = false;
           syncSelectedCredentialIdsFromDom();
           renderCredentialPickers();
         });
         payerToggle.appendChild(payerInput);
         payerToggle.appendChild(document.createTextNode(' Bu hesap odeme yapabilir'));
         controls.appendChild(payerToggle);
+
+        const transferToggle = document.createElement('label');
+        transferToggle.className = 'credentialPickToggle';
+        const transferInput = document.createElement('input');
+        transferInput.type = 'checkbox';
+        transferInput.value = item.id;
+        transferInput.dataset.transferCredentialId = item.id;
+        transferInput.checked = state.aTransferCredentialIds.includes(item.id);
+        transferInput.disabled = !input.checked;
+        transferInput.addEventListener('change', () => {
+          if (transferInput.checked && !input.checked) input.checked = true;
+          const payerInputRef = wrap.querySelector('input[data-payer-credential-id]');
+          if (transferInput.checked && payerInputRef) payerInputRef.checked = false;
+          syncSelectedCredentialIdsFromDom();
+          renderCredentialPickers();
+        });
+        transferToggle.appendChild(transferInput);
+        transferToggle.appendChild(document.createTextNode(' Transfer amacli'));
+        controls.appendChild(transferToggle);
       }
 
       wrap.appendChild(meta);
@@ -258,12 +298,16 @@
     fillCredentialList($('bCredentialList'), state.bCredentialIds, 'B');
     const aCountEl = $('aCredentialCount');
     const bCountEl = $('bCredentialCount');
-    if (aCountEl) aCountEl.textContent = `${state.aCredentialIds.length} secili${state.aCredentialIds.length ? ` / ${state.aPayerCredentialIds.length} odeme yetkili` : ''}`;
+    if (aCountEl) {
+      const selfCount = Math.max(0, state.aCredentialIds.length - state.aPayerCredentialIds.length - state.aTransferCredentialIds.length);
+      aCountEl.textContent = `${state.aCredentialIds.length} secili${state.aCredentialIds.length ? ` / ${state.aPayerCredentialIds.length} odeme / ${selfCount} kendimize / ${state.aTransferCredentialIds.length} transfer` : ''}`;
+    }
     if (bCountEl) bCountEl.textContent = `${state.bCredentialIds.length} secili`;
     try {
       window.dispatchEvent(new CustomEvent('passobot:payer-selection-changed', {
         detail: {
           payerCount: state.aPayerCredentialIds.length,
+          transferCount: state.aTransferCredentialIds.length,
           aCount: state.aCredentialIds.length,
         },
       }));
@@ -446,6 +490,7 @@
       state.selectedCategoryIds = [];
       state.aCredentialIds = [];
       state.aPayerCredentialIds = [];
+      state.aTransferCredentialIds = [];
       state.bCredentialIds = [];
       renderManageTeamList();
       renderManagerSummary();
@@ -474,6 +519,7 @@
     state.selectedCategoryIds = state.selectedCategoryIds.filter((id) => state.categories.some((item) => item.id === id && item.isActive !== false));
     state.aCredentialIds = state.aCredentialIds.filter((id) => state.credentials.some((item) => item.id === id && item.isActive !== false));
     state.aPayerCredentialIds = state.aPayerCredentialIds.filter((id) => state.credentials.some((item) => item.id === id && item.isActive !== false) && state.aCredentialIds.includes(id));
+    state.aTransferCredentialIds = state.aTransferCredentialIds.filter((id) => state.credentials.some((item) => item.id === id && item.isActive !== false) && state.aCredentialIds.includes(id) && !state.aPayerCredentialIds.includes(id));
     state.bCredentialIds = state.bCredentialIds.filter((id) => state.credentials.some((item) => item.id === id && item.isActive !== false));
     state.bCredentialIds = state.bCredentialIds.filter((id) => !state.aCredentialIds.includes(id));
     renderManageTeamList();
@@ -506,6 +552,11 @@
   function selectedPayerCredentialIds() {
     syncSelectedCredentialIdsFromDom();
     return state.aPayerCredentialIds.slice();
+  }
+
+  function selectedTransferCredentialIds() {
+    syncSelectedCredentialIdsFromDom();
+    return state.aTransferCredentialIds.slice();
   }
 
   function getCredentialById(credentialId) {
@@ -566,6 +617,7 @@
     state.selectedCategoryIds = [];
     state.aCredentialIds = [];
     state.aPayerCredentialIds = [];
+    state.aTransferCredentialIds = [];
     state.bCredentialIds = [];
     resetCategoryForm();
     resetCredentialForm();
@@ -818,6 +870,7 @@
     getSelectedCategoryIds: selectedCategoryIds,
     getSelectedCredentialIds: selectedCredentialIds,
     getSelectedPayerCredentialIds: selectedPayerCredentialIds,
+    getSelectedTransferCredentialIds: selectedTransferCredentialIds,
     getCredentialById,
     getSelectedTeam() {
       const team = currentTeam();

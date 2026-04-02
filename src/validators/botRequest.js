@@ -9,6 +9,7 @@ const accountSchema = z.object({
   sicilNo: z.string().nullable().optional(),
   priorityTicketCode: z.string().nullable().optional(),
   canPay: z.boolean().optional(),
+  transferPurpose: z.boolean().optional(),
 });
 
 const selectedCategorySchema = z.object({
@@ -76,6 +77,7 @@ const botRequestSchema = z.object({
   aCredentialIds: z.array(z.string().min(1)).optional(),
   bCredentialIds: z.array(z.string().min(1)).optional(),
   payerACredentialIds: z.array(z.string().min(1)).optional(),
+  transferACredentialIds: z.array(z.string().min(1)).optional(),
   selectedCategoryIds: z.array(z.string().min(1)).optional(),
   selectedCategories: z.array(selectedCategorySchema).optional(),
 
@@ -134,6 +136,7 @@ const botRequestSchema = z.object({
   const aCredentialIds = Array.isArray(data.aCredentialIds) ? data.aCredentialIds : [];
   const bCredentialIds = Array.isArray(data.bCredentialIds) ? data.bCredentialIds : [];
   const payerACredentialIds = Array.isArray(data.payerACredentialIds) ? data.payerACredentialIds : [];
+  const transferACredentialIds = Array.isArray(data.transferACredentialIds) ? data.transferACredentialIds : [];
   const hasLegacyA = !!(data.email && data.password);
   const hasLegacyB = !!(data.email2 && data.password2);
 
@@ -152,6 +155,28 @@ const botRequestSchema = z.object({
         code: 'custom',
         path: ['payerACredentialIds'],
         message: 'Seçili A üyeliklerinden en az 1 tanesi ödeme yapabilir olmalıdır'
+      });
+    }
+  }
+  if (aCredentialIds.length && transferACredentialIds.length) {
+    const transferSet = new Set(transferACredentialIds.map(String));
+    const hasTransferCredential = aCredentialIds.some((id) => transferSet.has(String(id)));
+    if (!hasTransferCredential) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['transferACredentialIds'],
+        message: 'Transfer amaçlı seçimler sadece seçili A üyeliklerinden oluşmalıdır'
+      });
+    }
+  }
+  if (payerACredentialIds.length && transferACredentialIds.length) {
+    const transferSet = new Set(transferACredentialIds.map(String));
+    const overlap = payerACredentialIds.some((id) => transferSet.has(String(id)));
+    if (overlap) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['transferACredentialIds'],
+        message: 'Aynı A üyeliği hem ödeme hem transfer amaçlı olamaz'
       });
     }
   }

@@ -275,70 +275,62 @@
 
           <div class="stepGrid stepGridRunTop">
             <section class="card stepCard">
-              <h2>C Hesabı ve Hedefi</h2>
-              <div class="hint" style="margin-top:0">Bu işlemler için önce run başlatılmış olmalı.</div>
+              <div class="cFlowLayout" style="margin-top:10px">
+                <div class="cFlowMain">
+                  <h2>C Hesabi Akisi</h2>
+                  <div class="hint" style="margin-top:0">Bu islemler icin once run baslatilmis olmali. Tek butonla C hesabi kaydedilir ve transfer/finalize istegi gonderilir.</div>
+                  <div class="row2">
+                    <div class="row">
+                      <label>C Email</label>
+                      <input id="cEmail" type="email" placeholder="c@mail.com" />
+                    </div>
+                    <div class="row">
+                      <label>C Password</label>
+                      <input id="cPassword" type="password" placeholder="******" />
+                    </div>
+                  </div>
 
-              <div class="row2" style="margin-top:10px">
-                <div class="row">
-                  <label>C Email</label>
-                  <input id="cEmail" type="email" placeholder="c@mail.com" />
-                </div>
-                <div class="row">
-                  <label>C Password</label>
-                  <input id="cPassword" type="password" placeholder="******" />
-                </div>
-              </div>
+                  <div class="row">
+                    <label>C icin ana↔tutucu eslesmesi (coklu hesap)</label>
+                    <input id="cTransferPairIndexInput" name="cTransferPairIndex" type="number" min="1" max="30" value="1" />
+                    <div class="pill muted" style="margin-top:4px">1 = Ana#1↔Tutucu#1, 2 = Ana#2↔Tutucu#2… C bu ciftin guncel tutucusundan alir. Tek ciftte genelde 1.</div>
+                  </div>
 
-              <div class="row">
-                <label>C için ana↔tutucu eşleşmesi (çoklu hesap)</label>
-                <input id="cTransferPairIndexInput" name="cTransferPairIndex" type="number" min="1" max="30" value="1" />
-                <div class="pill muted" style="margin-top:4px">1 = Ana#1↔Tutucu#1, 2 = Ana#2↔Tutucu#2… Finalize/C bu çiftin güncel tutucusundan alır. Tek çiftte genelde 1.</div>
-              </div>
+                  <div class="row">
+                    <label class="chk"><input id="finNeedsPayment" type="checkbox" /> C hesabi odeme yapsin</label>
+                    <div class="hint">Kapaliysa sadece C hesabina transfer yapilir. Aciksa kart alani sag tarafta acilir ve odeme akisi calisir.</div>
+                  </div>
 
-              <div class="actions" style="margin-top:10px">
-                <button type="button" id="btnRegisterC">C Register</button>
-              </div>
-            </section>
-
-            <section class="card stepCard">
-              <h2>Finalize Kontrolleri</h2>
-              <div class="hint" style="margin-top:0">İstersen ödeme/finalize bilgilerini buradan soft request olarak gönderebilirsin.</div>
-
-              <div class="row2" style="margin-top:10px">
-                <div class="row">
-                  <label>Identity (TCKN)</label>
-                  <input id="finIdentity" type="text" inputmode="numeric" placeholder="12345678901" />
-                </div>
-                <div class="row">
-                  <label>Card Holder</label>
-                  <input id="finCardHolder" type="text" placeholder="AD SOYAD" />
-                </div>
-              </div>
-              <div class="row2">
-                <div class="row">
-                  <label>Card Number</label>
-                  <input id="finCardNumber" type="text" inputmode="numeric" placeholder="0000 0000 0000 0000" />
-                </div>
-                <div class="row">
-                  <label>Expiry (MM / YY)</label>
-                  <div class="expiryRow">
-                    <input id="finExpiryMonth" type="text" inputmode="numeric" placeholder="MM" />
-                    <input id="finExpiryYear" type="text" inputmode="numeric" placeholder="YY" />
+                  <div class="actions" style="margin-top:10px">
+                    <button type="button" id="btnFinalizeC" class="btnDanger">C Transfer / Finalize Baslat</button>
                   </div>
                 </div>
-              </div>
-              <div class="row2">
-                <div class="row">
-                  <label>CVV</label>
-                  <input id="finCvv" type="password" inputmode="numeric" placeholder="***" />
-                </div>
-                <div class="row" style="justify-content:flex-end">
-                  <label class="chk" style="margin-top:22px"><input id="finAutoPay" type="checkbox" /> autoPay</label>
-                </div>
-              </div>
 
-              <div class="actions" style="margin-top:10px">
-                <button type="button" id="btnFinalize" class="btnDanger">Finalize İste (Soft)</button>
+                <div id="finPaymentFields" class="cFlowPayment" hidden>
+                  <div class="row">
+                    <label>Identity (TCKN)</label>
+                    <input id="finIdentity" type="text" inputmode="numeric" placeholder="12345678901" />
+                  </div>
+                  <div class="row">
+                    <label>Card Holder</label>
+                    <input id="finCardHolder" type="text" placeholder="AD SOYAD" />
+                  </div>
+                  <div class="row">
+                    <label>Card Number</label>
+                    <input id="finCardNumber" type="text" inputmode="numeric" placeholder="0000 0000 0000 0000" />
+                  </div>
+                  <div class="row">
+                    <label>Expiry (MM / YY)</label>
+                    <div class="expiryRow">
+                      <input id="finExpiryMonth" type="text" inputmode="numeric" placeholder="MM" />
+                      <input id="finExpiryYear" type="text" inputmode="numeric" placeholder="YY" />
+                    </div>
+                  </div>
+                  <div class="row">
+                    <label>CVV</label>
+                    <input id="finCvv" type="password" inputmode="numeric" placeholder="***" />
+                  </div>
+                </div>
               </div>
             </section>
           </div>

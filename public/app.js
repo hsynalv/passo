@@ -14,6 +14,8 @@ const stepPanels = Array.from(document.querySelectorAll('[data-step-panel]'));
 const setupIssuesCard = $('setupIssuesCard');
 const setupIssuesList = $('setupIssuesList');
 const setupPaymentCard = $('setupPaymentCard');
+const finNeedsPaymentEl = $('finNeedsPayment');
+const finPaymentFieldsEl = $('finPaymentFields');
 
 let currentRunId = null;
 let es = null;
@@ -21,6 +23,7 @@ let runStatusRefreshInFlight = null;
 let runStatusRefreshTimer = null;
 const previousPairSnapshot = new Map();
 let lastSetupIssues = [];
+let latestPairDashboard = null;
 
 function entryEventKey(entry, line) {
   const metaEvent = String(entry?.meta?.event || '').trim().toLowerCase();
@@ -99,44 +102,60 @@ function digitsOnly(value) {
 }
 
 function bindPaymentInputMasks() {
-  const cardNumberEl = $('setupCardNumber');
-  const expiryMonthEl = $('setupExpiryMonth');
-  const expiryYearEl = $('setupExpiryYear');
-  const cvvEl = $('setupCvv');
-
-  if (cardNumberEl && !cardNumberEl.dataset.maskBound) {
-    cardNumberEl.dataset.maskBound = '1';
-    cardNumberEl.addEventListener('input', () => {
-      const digits = digitsOnly(cardNumberEl.value).slice(0, 19);
-      cardNumberEl.value = digits.replace(/(.{4})/g, '$1 ').trim();
+  const bindCardNumberMask = (el) => {
+    if (!el || el.dataset.maskBound) return;
+    el.dataset.maskBound = '1';
+    el.addEventListener('input', () => {
+      const digits = digitsOnly(el.value).slice(0, 19);
+      el.value = digits.replace(/(.{4})/g, '$1 ').trim();
     });
-  }
-
-  if (expiryMonthEl && !expiryMonthEl.dataset.maskBound) {
-    expiryMonthEl.dataset.maskBound = '1';
-    expiryMonthEl.addEventListener('input', () => {
-      let digits = digitsOnly(expiryMonthEl.value).slice(0, 2);
+  };
+  const bindMonthMask = (el) => {
+    if (!el || el.dataset.maskBound) return;
+    el.dataset.maskBound = '1';
+    el.addEventListener('input', () => {
+      let digits = digitsOnly(el.value).slice(0, 2);
       if (digits.length === 1 && Number(digits) > 1) digits = `0${digits}`;
       if (digits.length === 2) {
         const mm = Math.min(12, Math.max(1, Number(digits) || 1));
         digits = String(mm).padStart(2, '0');
       }
-      expiryMonthEl.value = digits;
+      el.value = digits;
     });
-  }
+  };
+  const bindYearMask = (el) => {
+    if (!el || el.dataset.maskBound) return;
+    el.dataset.maskBound = '1';
+    el.addEventListener('input', () => {
+      el.value = digitsOnly(el.value).slice(0, 2);
+    });
+  };
+  const bindCvvMask = (el) => {
+    if (!el || el.dataset.maskBound) return;
+    el.dataset.maskBound = '1';
+    el.addEventListener('input', () => {
+      el.value = digitsOnly(el.value).slice(0, 4);
+    });
+  };
 
-  if (expiryYearEl && !expiryYearEl.dataset.maskBound) {
-    expiryYearEl.dataset.maskBound = '1';
-    expiryYearEl.addEventListener('input', () => {
-      expiryYearEl.value = digitsOnly(expiryYearEl.value).slice(0, 2);
-    });
-  }
+  bindCardNumberMask($('setupCardNumber'));
+  bindMonthMask($('setupExpiryMonth'));
+  bindYearMask($('setupExpiryYear'));
+  bindCvvMask($('setupCvv'));
+  bindCardNumberMask($('finCardNumber'));
+  bindMonthMask($('finExpiryMonth'));
+  bindYearMask($('finExpiryYear'));
+  bindCvvMask($('finCvv'));
+}
 
-  if (cvvEl && !cvvEl.dataset.maskBound) {
-    cvvEl.dataset.maskBound = '1';
-    cvvEl.addEventListener('input', () => {
-      cvvEl.value = digitsOnly(cvvEl.value).slice(0, 4);
-    });
+function syncFinalizePaymentUi() {
+  const needsPayment = !!finNeedsPaymentEl?.checked;
+  if (finPaymentFieldsEl) finPaymentFieldsEl.hidden = !needsPayment;
+  const inputs = Array.from((finPaymentFieldsEl || document).querySelectorAll('input'));
+  for (const input of inputs) {
+    const mustHave = needsPayment && ['finIdentity', 'finCardHolder', 'finCardNumber', 'finExpiryMonth', 'finExpiryYear', 'finCvv'].includes(input.id);
+    input.required = mustHave;
+    input.setAttribute('aria-required', mustHave ? 'true' : 'false');
   }
 }
 
@@ -262,6 +281,7 @@ function shouldFlashPairCard(prev, next) {
 function renderPairDashboard(dash) {
   const metaEl = $('pairDashboardMeta');
   const bodyEl = $('pairDashboardBody');
+  latestPairDashboard = dash || null;
   if (!metaEl || !bodyEl) return;
   if (!dash || !Array.isArray(dash.pairs) || dash.pairs.length === 0) {
     metaEl.textContent = '';
@@ -272,21 +292,38 @@ function renderPairDashboard(dash) {
   const matched = pairs.filter((p) => !p.unmatched).length;
   const extra = pairs.length - matched;
   const mode = dash.mode === 'multi' ? 'Çoklu' : 'Tek çift';
+  const transferEligiblePairs = pairs
+    .filter((p) => String(p?.aIntent || '').trim().toLowerCase() === 'transfer')
+    .map((p) => Math.max(1, Number(p?.pairIndex) || 1));
   const cT = Math.max(1, Number(dash.cTargetPairIndex) || 1);
   const activePairIndex = Math.max(0, Number(dash.activePairIndex) || 0);
+  const effectiveCTarget = transferEligiblePairs.includes(cT)
+    ? cT
+    : (transferEligiblePairs[0] || cT);
   if (cTransferPairInput && document.activeElement !== cTransferPairInput) {
-    cTransferPairInput.value = String(cT);
+    cTransferPairInput.value = String(effectiveCTarget);
   }
   const t = dash.updatedAt ? new Date(dash.updatedAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
-  metaEl.textContent = `${mode} · ${pairs.length} satır (${matched} eşleşen${extra ? `, ${extra} ekstra ana hesap` : ''}) · C/finalize hedefi: #${cT}${activePairIndex ? ` · aktif akış: #${activePairIndex}` : ''}${t ? ` · ${t}` : ''}`;
+  const transferHint = transferEligiblePairs.length
+    ? ` · C transfer ciftleri: ${transferEligiblePairs.map((n) => `#${n}`).join(', ')}`
+    : ' · C transfer cifti yok';
+  metaEl.textContent = `${mode} · ${pairs.length} satır (${matched} eşleşen${extra ? `, ${extra} ekstra ana hesap` : ''}) · C/finalize hedefi: #${effectiveCTarget}${transferHint}${activePairIndex ? ` · aktif akış: #${activePairIndex}` : ''}${t ? ` · ${t}` : ''}`;
 
   bodyEl.innerHTML = pairs
     .map((p) => {
       const prev = previousPairSnapshot.get(String(p.pairIndex)) || null;
+      const aIntent = String(p.aIntent || 'self').trim().toLowerCase();
+      const intentBadge =
+        aIntent === 'payment'
+          ? '<span class="pairDashRole payment">Odeme</span>'
+          : aIntent === 'transfer'
+            ? '<span class="pairDashRole transfer">Transfer</span>'
+            : '<span class="pairDashRole self">Kendimize</span>';
       const who =
         p.holder === 'A' ? 'Ana hesapta' : p.holder === 'B' ? 'Tutucu hesapta' : '—';
       const badge = p.isCTarget ? '<span class="pairDashC">C hedefi</span>' : '';
       const um = p.unmatched ? '<span class="pairDashWarn">Tutucu yok</span>' : '';
+      const basketBadge = p.basketPresent === false ? '<span class="pairDashWarn">Sepetten dustu</span>' : '';
       const active = (p.isCTarget || p.isActivePair) ? ' active' : '';
       const flash = shouldFlashPairCard(prev, p) ? ' flash' : '';
       const activeBadge = p.isActivePair ? '<span class="pairDashC">Aktif</span>' : '';
@@ -296,6 +333,7 @@ function renderPairDashboard(dash) {
       const paymentOwner =
         p.paymentOwnerRole === 'A' ? 'Ana Hesap' : p.paymentOwnerRole === 'C' ? 'C Hesabi' : '—';
       const paymentState = p.paymentState ? String(p.paymentState) : '—';
+      const basketStateLabel = p.basketPresent === false ? 'Bilet görünmüyor' : (p.basketPresent === true ? 'Bilet görünüyor' : 'Kontrol ediliyor');
       const remainingLabel = pairRemainingLabel(p);
       const remainingTone = pairRemainingTone(p);
       const detailLines =
@@ -304,13 +342,14 @@ function renderPairDashboard(dash) {
       <div class="pairCardRow"><span>Sıra</span> ${escapeHtml(srow || '—')}</div>
       <div class="pairCardRow"><span>Koltuk no</span> ${escapeHtml(snum || '—')}</div>`
           : '';
-      return `<div class="pairCard${active}${flash}">
-      <div class="pairCardHead"><strong>#${escapeHtml(p.pairIndex)}</strong> ${badge} ${activeBadge} ${um}</div>
+      return `<div class="pairCard intent-${escapeHtml(aIntent || 'self')}${active}${flash}">
+      <div class="pairCardHead"><strong>#${escapeHtml(p.pairIndex)}</strong> ${intentBadge} ${badge} ${activeBadge} ${um} ${basketBadge}</div>
       <div class="pairCardRow"><span>Ana</span> <code>${escapeHtml(p.aEmail || '—')}</code></div>
       <div class="pairCardRow"><span>Tutucu</span> <code>${escapeHtml(p.bEmail || '—')}</code></div>
       ${detailLines}
       <div class="pairCardRow"><span>Özet</span> ${escapeHtml(p.seatLabel || '—')} <span class="muted">(id: ${escapeHtml(p.seatId || '—')})</span></div>
       <div class="pairCardRow"><span>Tutucu</span> <strong>${escapeHtml(who)}</strong></div>
+      <div class="pairCardRow"><span>Sepet</span> <strong>${escapeHtml(basketStateLabel)}</strong></div>
       <div class="pairCardRow"><span>Kalan süre</span> <strong class="pairTimer${remainingTone ? ` ${remainingTone}` : ''}" data-basket-remaining-seconds="${escapeHtml(p.basketRemainingSeconds ?? '')}" data-basket-observed-at="${escapeHtml(p.basketObservedAt || '')}" data-basket-arrived-at-ms="${escapeHtml(p.basketArrivedAtMs ?? '')}" data-basket-holding-time-seconds="${escapeHtml(p.basketHoldingTimeSeconds ?? '')}">${escapeHtml(remainingLabel)}</strong></div>
       <div class="pairCardRow"><span>Ödeme sahibi</span> <strong>${escapeHtml(paymentOwner)}</strong></div>
       <div class="pairCardRow"><span>Ödeme durumu</span> <strong>${escapeHtml(paymentState)}</strong></div>
@@ -844,6 +883,8 @@ function statusTextFromAudit(eventKey, meta = {}) {
   if (event === 'deferred_payer_transfer_start') return `↔️ ${prefix}süre eşiği nedeniyle tutucuya transfer başladı`;
   if (event === 'deferred_payer_transfer_done') return `↔️ ${prefix}süre eşiği transferi tamamlandı`;
   if (event === 'deferred_payer_transfer_triggered') return `↔️ ${prefix}süre eşiği transferi tetiklendi`;
+  if (event === 'basket_presence_lost') return `⚠️ ${prefix}sepette bilet artık görünmüyor`;
+  if (event === 'basket_presence_restored') return `✅ ${prefix}sepette bilet tekrar göründü`;
   if (event === 'holder_updated') return `↔️ ${prefix}tutucu güncellendi: ${meta?.holder || '—'}`;
   return null;
 }
@@ -958,6 +999,8 @@ function shouldRefreshRunStatusNow(entry, runId) {
     'b_exact_pick_done',
     'transfer_pair_done',
     'holder_updated',
+    'basket_presence_lost',
+    'basket_presence_restored',
     'a_only_payment_ready',
     'a_only_holding',
     'a_payment_ready',
@@ -1092,6 +1135,8 @@ window.addEventListener('passobot:payer-selection-changed', (event) => {
 });
 syncSetupPaymentCard();
 bindPaymentInputMasks();
+syncFinalizePaymentUi();
+finNeedsPaymentEl?.addEventListener('change', syncFinalizePaymentUi);
 
 $('botForm').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -1116,6 +1161,9 @@ $('botForm').addEventListener('submit', async (e) => {
     : [];
   const payerACredentialIds = catalogApi && typeof catalogApi.getSelectedPayerCredentialIds === 'function'
     ? catalogApi.getSelectedPayerCredentialIds()
+    : [];
+  const transferACredentialIds = catalogApi && typeof catalogApi.getSelectedTransferCredentialIds === 'function'
+    ? catalogApi.getSelectedTransferCredentialIds()
     : [];
   syncSetupPaymentCard(payerACredentialIds.length);
 
@@ -1159,6 +1207,7 @@ $('botForm').addEventListener('submit', async (e) => {
   if (aCredentialIds.length) body.aCredentialIds = aCredentialIds;
   if (bCredentialIds.length) body.bCredentialIds = bCredentialIds;
   if (payerACredentialIds.length) body.payerACredentialIds = payerACredentialIds;
+  if (transferACredentialIds.length) body.transferACredentialIds = transferACredentialIds;
 
   if (!mergedCategoryIds.length && !String(body.categoryType || '').trim()) {
     validationIssues.push('En az 1 kayıtlı kategori seç veya fallback kategori gir.');
@@ -1265,35 +1314,60 @@ try {
     });
   }
 
-  $('btnRegisterC').addEventListener('click', async () => {
+  $('btnFinalizeC').addEventListener('click', async () => {
     const runId = requireRunId();
     if (!runId) return;
     const email = String($('cEmail').value || '').trim();
     const password = String($('cPassword').value || '').trim();
+    const paymentRequired = !!$('finNeedsPayment')?.checked;
+    const requestedPairIndex = parseInt(String($('cTransferPairIndexInput')?.value || '1').trim(), 10) || 1;
+    const transferEligiblePairs = Array.isArray(latestPairDashboard?.pairs)
+      ? latestPairDashboard.pairs
+          .filter((p) => String(p?.aIntent || '').trim().toLowerCase() === 'transfer')
+          .map((p) => Math.max(1, Number(p?.pairIndex) || 1))
+      : [];
     if (!email || !password) {
-      infoLine('C register için email/password gerekli');
+      infoLine('C hesabi icin email/password gerekli');
       return;
     }
-    try {
-      const res = await apiPost(`/run/${encodeURIComponent(runId)}/c/register`, { email, password });
-      infoLine('C register ok', res);
-    } catch (e) {
-      infoLine('C register failed', { error: e?.message || String(e) });
+    if (!transferEligiblePairs.length) {
+      infoLine('C hesabi sadece transfer amacli ciftlerde calisir; uygun cift yok');
+      return;
     }
-  });
-
-  $('btnFinalize').addEventListener('click', async () => {
-    const runId = requireRunId();
-    if (!runId) return;
+    if (!transferEligiblePairs.includes(requestedPairIndex)) {
+      infoLine('C hesabi sadece transfer amacli ciftlerden secilebilir', { allowedPairs: transferEligiblePairs, requestedPairIndex });
+      return;
+    }
     const payload = {
+      email,
+      password,
+      cTransferPairIndex: requestedPairIndex,
+      paymentRequired,
       identity: String($('finIdentity').value || '').trim() || null,
       cardHolder: String($('finCardHolder').value || '').trim() || null,
       cardNumber: String($('finCardNumber').value || '').trim() || null,
       expiryMonth: String($('finExpiryMonth').value || '').trim() || null,
       expiryYear: String($('finExpiryYear').value || '').trim() || null,
       cvv: String($('finCvv').value || '').trim() || null,
-      autoPay: !!$('finAutoPay').checked,
+      autoPay: paymentRequired,
     };
+
+    if (paymentRequired) {
+      const requiredFields = [
+        ['identity', 'C odemesi icin TCKN gerekli'],
+        ['cardHolder', 'C odemesi icin kart sahibi gerekli'],
+        ['cardNumber', 'C odemesi icin kart numarasi gerekli'],
+        ['expiryMonth', 'C odemesi icin son kullanma ayi gerekli'],
+        ['expiryYear', 'C odemesi icin son kullanma yili gerekli'],
+        ['cvv', 'C odemesi icin CVV gerekli'],
+      ];
+      for (const [key, message] of requiredFields) {
+        if (!String(payload[key] || '').trim()) {
+          infoLine(message);
+          return;
+        }
+      }
+    }
 
     // Remove nulls to keep request clean
     for (const k of Object.keys(payload)) {
@@ -1302,9 +1376,9 @@ try {
 
     try {
       const res = await apiPost(`/run/${encodeURIComponent(runId)}/finalize`, payload);
-      infoLine('Finalize request sent', res);
+      infoLine(paymentRequired ? 'C odeme/finalize istegi gonderildi' : 'C transfer istegi gonderildi', res);
     } catch (e) {
-      infoLine('Finalize request failed', { error: e?.message || String(e) });
+      infoLine('C akisi istegi basarisiz', { error: e?.message || String(e) });
     }
   });
 

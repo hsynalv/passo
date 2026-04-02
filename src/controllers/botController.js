@@ -959,10 +959,28 @@ function normalizeCanPay(value, fallback = true) {
     return !!fallback;
 }
 
+function normalizeTransferPurpose(value, fallback = false) {
+    if (value === true || value === false) return value;
+    if (typeof value === 'string') {
+        const v = value.trim().toLowerCase();
+        if (['1', 'true', 'on', 'yes', 'evet'].includes(v)) return true;
+        if (['0', 'false', 'off', 'no', 'hayir', 'hayır'].includes(v)) return false;
+    }
+    return !!fallback;
+}
+
+function resolveAIntent(account) {
+    const canPay = normalizeCanPay(account?.canPay, false);
+    const transferPurpose = normalizeTransferPurpose(account?.transferPurpose, false);
+    if (canPay) return 'payment';
+    if (transferPurpose) return 'transfer';
+    return 'self';
+}
+
 async function buildCredentialBackedAccountLists(validatedData) {
     const {
         teamId,
-        aCredentialIds, bCredentialIds, payerACredentialIds,
+        aCredentialIds, bCredentialIds, payerACredentialIds, transferACredentialIds,
         aAccounts, bAccounts,
         email, password, email2, password2,
         identity, fanCardCode, sicilNo, priorityTicketCode,
@@ -975,7 +993,11 @@ async function buildCredentialBackedAccountLists(validatedData) {
             ? payerACredentialIds.map((id) => String(id).trim()).filter(Boolean)
             : []
     );
-    const hasExplicitPayerAIds = payerACredentialIdSet.size > 0;
+    const transferACredentialIdSet = new Set(
+        Array.isArray(transferACredentialIds)
+            ? transferACredentialIds.map((id) => String(id).trim()).filter(Boolean)
+            : []
+    );
 
     let aAccountsFromTeam = [];
     if (teamId && aCredentialIdsSafe.length) {
@@ -991,7 +1013,8 @@ async function buildCredentialBackedAccountLists(validatedData) {
             sicilNo: item.sicilNo || null,
             priorityTicketCode: item.priorityTicketCode || null,
             categoryIds: Array.isArray(item.categoryIds) ? item.categoryIds.map(String) : [],
-            canPay: hasExplicitPayerAIds ? payerACredentialIdSet.has(String(item.id || '')) : true
+            canPay: payerACredentialIdSet.has(String(item.id || '')),
+            transferPurpose: transferACredentialIdSet.has(String(item.id || ''))
         }));
     }
 
@@ -1023,11 +1046,12 @@ async function buildCredentialBackedAccountLists(validatedData) {
             fanCardCode: (a && Object.prototype.hasOwnProperty.call(a, 'fanCardCode')) ? a.fanCardCode : null,
             sicilNo: (a && Object.prototype.hasOwnProperty.call(a, 'sicilNo')) ? a.sicilNo : null,
             priorityTicketCode: (a && Object.prototype.hasOwnProperty.call(a, 'priorityTicketCode')) ? a.priorityTicketCode : null,
-            canPay: normalizeCanPay(a?.canPay, true)
+            transferPurpose: normalizeTransferPurpose(a?.transferPurpose, false),
+            canPay: normalizeTransferPurpose(a?.transferPurpose, false) ? false : normalizeCanPay(a?.canPay, false)
         }))
         : (aAccountsFromTeam.length
             ? aAccountsFromTeam
-            : [{ email: (a0Raw?.email || email || '').toString(), password: (a0Raw?.password || password || '').toString(), identity: identity ?? null, fanCardCode: fanCardCode ?? null, sicilNo: sicilNo ?? null, priorityTicketCode: priorityTicketCode ?? null, canPay: normalizeCanPay(a0Raw?.canPay, true) }]);
+            : [{ email: (a0Raw?.email || email || '').toString(), password: (a0Raw?.password || password || '').toString(), identity: identity ?? null, fanCardCode: fanCardCode ?? null, sicilNo: sicilNo ?? null, priorityTicketCode: priorityTicketCode ?? null, transferPurpose: normalizeTransferPurpose(a0Raw?.transferPurpose, false), canPay: normalizeTransferPurpose(a0Raw?.transferPurpose, false) ? false : normalizeCanPay(a0Raw?.canPay, false) }]);
     const bList = (Array.isArray(bAccounts) && bAccounts.length)
         ? bAccounts.map(b => ({
             email: String(b.email || ''),
@@ -1241,11 +1265,22 @@ async function registerCAccount(req, res) {
     if (!email || !password) return res.status(400).json({ error: 'email/password required' });
     const cur = runStore.get(runId);
     if (!cur) return res.status(404).json({ error: 'runId not found' });
+    const transferEligiblePairIndices = Array.isArray(cur?.pairDashboard?.pairs)
+        ? cur.pairDashboard.pairs
+            .filter((pair) => String(pair?.aIntent || '').trim().toLowerCase() === 'transfer')
+            .map((pair) => Math.max(1, Math.floor(Number(pair?.pairIndex) || 1)))
+        : [];
     const rawPair = req?.body?.cTransferPairIndex ?? req?.body?.pairIndex;
     const patch = { cAccount: { email, password } };
     if (rawPair !== undefined && rawPair !== null && String(rawPair).trim() !== '') {
         const n = parseInt(String(rawPair).trim(), 10);
         if (Number.isFinite(n) && n >= 1) patch.cTransferPairIndex = n;
+    }
+    if (transferEligiblePairIndices.length && !transferEligiblePairIndices.includes(Number(patch.cTransferPairIndex || 1))) {
+        return res.status(400).json({
+            error: 'C hesabi sadece transfer amaçlı çiftlerden seçilebilir',
+            allowedPairIndices: transferEligiblePairIndices
+        });
     }
     runStore.upsert(runId, patch);
     return res.json({ success: true, runId });
@@ -1256,12 +1291,24 @@ async function requestFinalize(req, res) {
     if (!runId) return res.status(400).json({ error: 'Invalid runId' });
     const cur = runStore.get(runId);
     if (!cur) return res.status(404).json({ error: 'runId not found' });
+    const transferEligiblePairIndices = Array.isArray(cur?.pairDashboard?.pairs)
+        ? cur.pairDashboard.pairs
+            .filter((pair) => String(pair?.aIntent || '').trim().toLowerCase() === 'transfer')
+            .map((pair) => Math.max(1, Math.floor(Number(pair?.pairIndex) || 1)))
+        : [];
+    const email = req?.body?.email != null ? String(req.body.email).trim() : '';
+    const password = req?.body?.password != null ? String(req.body.password).trim() : '';
     const identity = req?.body?.identity != null ? String(req.body.identity).trim() : null;
     const cardHolder = req?.body?.cardHolder != null ? String(req.body.cardHolder).trim() : null;
     const cardNumber = req?.body?.cardNumber != null ? String(req.body.cardNumber).trim() : null;
     const expiryMonth = req?.body?.expiryMonth != null ? String(req.body.expiryMonth).trim() : null;
     const expiryYear = req?.body?.expiryYear != null ? String(req.body.expiryYear).trim() : null;
     const cvv = req?.body?.cvv != null ? String(req.body.cvv).trim() : null;
+    const paymentRequired = (() => {
+        const v = req?.body?.paymentRequired;
+        if (v === true || v === 'true' || v === 1 || v === '1' || v === 'on') return true;
+        return false;
+    })();
     const autoPay = (() => {
         const v = req?.body?.autoPay;
         if (v === true || v === 'true' || v === 1 || v === '1' || v === 'on') return true;
@@ -1277,13 +1324,26 @@ async function requestFinalize(req, res) {
             expiryMonth: expiryMonth || null,
             expiryYear: expiryYear || null,
             cvv: cvv || null,
+            paymentRequired,
             autoPay
         }
     };
+    if (email && password) {
+        patch.cAccount = { email, password };
+    }
     const rawPair = req?.body?.cTransferPairIndex ?? req?.body?.pairIndex;
     if (rawPair !== undefined && rawPair !== null && String(rawPair).trim() !== '') {
         const n = parseInt(String(rawPair).trim(), 10);
         if (Number.isFinite(n) && n >= 1) patch.cTransferPairIndex = n;
+    }
+    if (!transferEligiblePairIndices.length) {
+        return res.status(400).json({ error: 'C hesabi sadece transfer amaçlı çiftlerde çalışır; uygun çift yok' });
+    }
+    if (!transferEligiblePairIndices.includes(Number(patch.cTransferPairIndex || 1))) {
+        return res.status(400).json({
+            error: 'C hesabi sadece transfer amaçlı çiftlerden seçilebilir',
+            allowedPairIndices: transferEligiblePairIndices
+        });
     }
     runStore.upsert(runId, patch);
     return res.json({ success: true, runId });
@@ -6096,8 +6156,16 @@ async function startBotAfterValidation(req, res, validatedData) {
         const pairIndices = dashboardPairs
             .map((p) => Number(p.pairIndex))
             .filter((n) => Number.isFinite(n) && n >= 1);
+        const transferEligiblePairIndices = dashboardPairs
+            .filter((p) => String(p?.aIntent || '').trim().toLowerCase() === 'transfer')
+            .map((p) => Number(p.pairIndex))
+            .filter((n) => Number.isFinite(n) && n >= 1);
         const maxPair = pairIndices.length ? Math.max(...pairIndices) : 1;
-        if (dashboardPairs.length === 1) {
+        if (transferEligiblePairIndices.length) {
+            if (!transferEligiblePairIndices.includes(cTarget)) {
+                cTarget = transferEligiblePairIndices[0];
+            }
+        } else if (dashboardPairs.length === 1) {
             cTarget = Number(dashboardPairs[0].pairIndex) || 1;
         } else if (cTarget > maxPair) {
             cTarget = maxPair;
@@ -6118,6 +6186,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                 const runtime = pairRuntimeByIndex.get(idx) || null;
                 const runtimeTiming = resolveRuntimeBasketTiming(runtime, p?.holder || runtime?.currentHolder || '');
                 const row = { ...runtimeTiming, ...p, isCTarget: isTarget, isActivePair };
+                try {
+                    const aIntentSource = runtime?.aCtx || runtime?.idProfileA || {};
+                    row.aIntent = row.aIntent || resolveAIntent(aIntentSource);
+                } catch {}
                 if (isActivePair || (!activePair && isTarget)) {
                     row.holder = currentHolder;
                     row.seatLabel = fmtSeatLabel(currentSeatInfo) || row.seatLabel || '—';
@@ -6336,6 +6408,10 @@ async function startBotAfterValidation(req, res, validatedData) {
     const bindFinalizePairFromRunState = () => {
         const fin = getFinalizeRequest();
         const idx = Math.max(1, Math.floor(Number(fin?.cTransferPairIndex) || 1));
+        const runtime = pairRuntimeByIndex.get(idx) || null;
+        if (runtime && resolveAIntent(runtime?.aCtx || runtime?.idProfileA || {}) !== 'transfer') {
+            throw new Error(`FINALIZE_PAIR_NOT_TRANSFER_ELIGIBLE:${idx}`);
+        }
         return bindPairRuntime(idx, 'finalize');
     };
 
@@ -6598,6 +6674,158 @@ async function startBotAfterValidation(req, res, validatedData) {
         const elapsedSec = Math.max(0, Math.floor((Date.now() - arrivedAt) / 1000));
         return Math.max(0, holdSec - elapsedSec);
     };
+    const isBasketLikeRuntimeUrl = (u) => {
+        try {
+            return /\/(sepet|basket|cart|odeme|payment)(\b|\/|\?|#)/i.test(String(u || ''));
+        } catch {
+            return false;
+        }
+    };
+    const isStrictBasketRuntimeUrl = (u) => {
+        try {
+            return /\/(sepet|basket|cart)(\b|\/|\?|#)/i.test(String(u || ''));
+        } catch {
+            return false;
+        }
+    };
+    const readPairBasketHeartbeat = async (pairIndex) => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        const runtime = pairRuntimeByIndex.get(idx) || null;
+        if (!runtime) return null;
+        const holder = String(runtime.currentHolder || '').toUpperCase();
+        if (holder !== 'A' && holder !== 'B') return null;
+        const ctx = holder === 'B' ? runtime?.bCtx : runtime?.aCtx;
+        const page = ctx?.page || null;
+        if (!page) return null;
+        const currentUrl = (() => { try { return String(page.url() || ''); } catch { return ''; } })();
+        if (!isBasketLikeRuntimeUrl(currentUrl)) return null;
+        const [basketData, uiStatus] = await Promise.all([
+            readBasketData(page).catch(() => null),
+            checkBasketTimeoutFromPage(page).catch(() => null)
+        ]);
+        const itemCount = Math.max(0, Number(basketData?.itemCount || 0));
+        const hasSeatData = !!(
+            basketData?.seatId ||
+            basketData?.seat ||
+            basketData?.row ||
+            basketData?.tribune ||
+            basketData?.block ||
+            (basketData?.combined && String(basketData.combined).trim())
+        );
+        const basketPresent = basketData
+            ? !!(itemCount > 0 || hasSeatData)
+            : (isStrictBasketRuntimeUrl(currentUrl) ? false : null);
+        const remainingSeconds = Number.isFinite(Number(uiStatus?.remainingSeconds))
+            ? Math.max(0, Math.floor(Number(uiStatus.remainingSeconds)))
+            : null;
+        return {
+            pairIndex: idx,
+            holder,
+            url: currentUrl,
+            basketPresent,
+            basketItemCount: itemCount,
+            remainingSeconds,
+            basketData,
+            uiStatus
+        };
+    };
+    const syncPairBasketHeartbeat = async (pairIndex) => {
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        const runtime = pairRuntimeByIndex.get(idx) || null;
+        if (!runtime) return null;
+        const heartbeat = await readPairBasketHeartbeat(idx);
+        if (!heartbeat) return null;
+        const holderKey = heartbeat.holder === 'B' ? 'bCtx' : 'aCtx';
+        const prevCtx = runtime?.[holderKey] || {};
+        const prevPresent = prevCtx?.basketPresent;
+        const prevRemaining = prevCtx?.basketRemainingSeconds ?? runtime?.basketRemainingSeconds ?? null;
+        const basketTimingPatch = buildBasketTimingPatch({
+            basketArrivedAtMs: prevCtx?.basketArrivedAtMs ?? runtime?.basketArrivedAtMs ?? null,
+            remainingSeconds: heartbeat.remainingSeconds != null ? heartbeat.remainingSeconds : prevRemaining,
+            observedAtMs: Date.now()
+        });
+        updatePairRuntime(idx, {
+            [holderKey]: {
+                ...prevCtx,
+                basketPresent: heartbeat.basketPresent,
+                basketItemCount: heartbeat.basketItemCount,
+                basketLastCheckedAt: new Date().toISOString(),
+                ...basketTimingPatch
+            },
+            basketPresent: heartbeat.basketPresent,
+            basketItemCount: heartbeat.basketItemCount,
+            basketLastCheckedAt: new Date().toISOString(),
+            ...basketTimingPatch
+        });
+        upsertDashboardPairRow(idx, {
+            basketPresent: heartbeat.basketPresent,
+            basketItemCount: heartbeat.basketItemCount,
+            basketLastCheckedAt: new Date().toISOString(),
+            ...basketTimingPatch
+        });
+        if (heartbeat.remainingSeconds != null && basketTimer && idx === Math.max(1, Math.floor(Number(dashboardMeta.activePairIndex || resolveDashboardCTarget() || 1)))) {
+            try { basketTimer.syncFromRemainingSeconds(heartbeat.remainingSeconds); } catch {}
+        }
+        if (heartbeat.basketPresent === false && prevPresent !== false) {
+            try {
+                audit('basket_presence_lost', {
+                    pairIndex: idx,
+                    holder: heartbeat.holder,
+                    seatId: runtime?.currentSeatInfo?.seatId || runtime?.aCtx?.seatInfo?.seatId || null,
+                    aEmail: runtime?.aCtx?.email || null,
+                    bEmail: runtime?.bCtx?.email || null,
+                    url: heartbeat.url,
+                    basketItemCount: heartbeat.basketItemCount
+                }, 'warn');
+            } catch {}
+            logger.warn('Basket heartbeat: sepetten düştü', {
+                runId,
+                pairIndex: idx,
+                holder: heartbeat.holder,
+                url: heartbeat.url,
+                basketItemCount: heartbeat.basketItemCount
+            });
+        }
+        if (heartbeat.basketPresent === true && prevPresent === false) {
+            try {
+                audit('basket_presence_restored', {
+                    pairIndex: idx,
+                    holder: heartbeat.holder,
+                    seatId: runtime?.currentSeatInfo?.seatId || runtime?.aCtx?.seatInfo?.seatId || null,
+                    aEmail: runtime?.aCtx?.email || null,
+                    bEmail: runtime?.bCtx?.email || null,
+                    url: heartbeat.url,
+                    basketItemCount: heartbeat.basketItemCount
+                });
+            } catch {}
+            logger.info('Basket heartbeat: sepet yeniden göründü', {
+                runId,
+                pairIndex: idx,
+                holder: heartbeat.holder,
+                url: heartbeat.url,
+                basketItemCount: heartbeat.basketItemCount
+            });
+        }
+        return heartbeat;
+    };
+    const ensureBasketHeartbeatWatcher = () => {
+        if (basketHeartbeatWatch) return;
+        const ms = Math.max(10000, Number(getCfg()?.BASKET?.HEARTBEAT_CHECK_MS) || 10000);
+        basketHeartbeatWatch = setInterval(async () => {
+            try {
+                const stKill = runStore.get(runId);
+                if (stKill && stKill.status === 'killed') {
+                    try { clearInterval(basketHeartbeatWatch); } catch {}
+                    basketHeartbeatWatch = null;
+                    return;
+                }
+                const entries = Array.from(pairRuntimeByIndex.entries());
+                for (const [pairIndex] of entries) {
+                    await syncPairBasketHeartbeat(pairIndex).catch(() => null);
+                }
+            } catch {}
+        }, ms);
+    };
 
     const transferSeatToBForHold = async (pairIndex, reason = 'threshold') => {
         const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
@@ -6827,7 +7055,8 @@ async function startBotAfterValidation(req, res, validatedData) {
             expiryYear: (finMeta?.expiryYear != null && String(finMeta.expiryYear).trim()) ? String(finMeta.expiryYear).trim() : (expiryYear != null ? String(expiryYear).trim() : null),
             cvv: (finMeta?.cvv != null && String(finMeta.cvv).trim()) ? String(finMeta.cvv).trim() : (cvv != null ? String(cvv).trim() : null)
         };
-        const autoPayFinal = !!(finMeta && finMeta.autoPay === true);
+        const paymentRequiredFinal = !!(finMeta && (finMeta.paymentRequired === true || finMeta.autoPay === true));
+        const autoPayFinal = paymentRequiredFinal && !!(finMeta && finMeta.autoPay === true);
 
         await persistCFinalizeReadyForPair(finalizePairIndex, {
             holderRole: currentHolder || 'B',
@@ -6844,6 +7073,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 phase: 'c_finalize_ready',
                 cEmail: cAcc?.email || '',
                 holder: currentHolder || null,
+                paymentRequired: paymentRequiredFinal,
                 autoPay: autoPayFinal
             }
         });
@@ -7060,7 +7290,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         setStep('C.clickContinue.done', { snap: await snapshotPage(pageC, 'C.afterContinue') });
 
         // Payment / TCKN flow
-        const paymentMeta = { tcAssigned: false, invoiceTcFilled: false, agreementsAccepted: false, iframeFilled: false, payClicked: false, autoPay: autoPayFinal };
+        const paymentMeta = { paymentRequired: paymentRequiredFinal, transferredOnly: !paymentRequiredFinal, tcAssigned: false, invoiceTcFilled: false, agreementsAccepted: false, iframeFilled: false, payClicked: false, autoPay: autoPayFinal };
         const isCOnPaymentUrl = () => {
             try { return /\/odeme(\b|\/|\?|#)/i.test(String(pageC.url() || '')); } catch { return false; }
         };
@@ -7068,6 +7298,38 @@ async function startBotAfterValidation(req, res, validatedData) {
             const iframe = await pageC.waitForSelector('iframe#payment_nkolay_frame', { timeout }).catch(() => null);
             return !!iframe;
         };
+        if (!paymentRequiredFinal) {
+            finalizedToCResult = { success: true, grabbedBy: cAcc.email, seatC: seatInfoC, seatId: currentSeatInfo?.seatId || null, payment: paymentMeta };
+            try {
+                const activeIdx = Math.max(1, Math.floor(Number(paymentQueueActivePairIndex || dashboardMeta.activePairIndex || fin?.cTransferPairIndex || 1)));
+                markPairPaymentState(activeIdx, {
+                    paymentOwnerRole: 'C',
+                    paymentEligible: false,
+                    paymentState: 'c_ready',
+                    phase: 'C hesabina transfer tamamlandi'
+                });
+            } catch {}
+            await persistCFinalizeCompletedForPair(finalizePairIndex, {
+                holderRole: 'C',
+                paymentOwnerRole: 'C',
+                paymentSource: 'C',
+                paymentActorEmail: cAcc?.email || '',
+                paymentState: 'c_ready',
+                finalizeState: 'completed',
+                recordStatus: 'finalized',
+                cAccountEmail: cAcc?.email || '',
+                seat: seatInfoC || currentSeatInfo,
+                category: currentCatBlock,
+                auditMeta: {
+                    phase: 'c_finalize_completed',
+                    cEmail: cAcc?.email || '',
+                    paymentRequired: false,
+                    transferredOnly: true
+                }
+            });
+            audit('finalize_done', { grabbedBy: cAcc.email, seatId: currentSeatInfo?.seatId || null, paymentRequired: false, transferredOnly: true });
+            return finalizedToCResult;
+        }
         if (!/^\d{11}$/.test(String(identityFinal || '').trim())) {
             throw new Error('FINALIZE_IDENTITY_REQUIRED');
         }
@@ -7181,11 +7443,12 @@ async function startBotAfterValidation(req, res, validatedData) {
             auditMeta: {
                 phase: 'c_finalize_completed',
                 cEmail: cAcc?.email || '',
+                paymentRequired: paymentRequiredFinal,
                 autoPay: autoPayFinal,
                 payClicked: !!paymentMeta.payClicked
             }
         });
-        audit('finalize_done', { grabbedBy: cAcc.email, seatId: currentSeatInfo?.seatId || null });
+        audit('finalize_done', { grabbedBy: cAcc.email, seatId: currentSeatInfo?.seatId || null, paymentRequired: paymentRequiredFinal, payClicked: !!paymentMeta.payClicked });
         return finalizedToCResult;
     };
 
@@ -7267,6 +7530,7 @@ async function startBotAfterValidation(req, res, validatedData) {
     let multiBrowsers = [];
     let basketTimer;
     let basketMonitor;
+    let basketHeartbeatWatch;
     let passiveSessionWatch = null;
     let passiveSessionEarlyTimer = null;
     let passiveSeatTouchBusy = false;
@@ -7609,6 +7873,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         transferTargetEmail: transferTargetEmail || null,
         cTransferPairIndex: validatedData.cTransferPairIndex ?? 1
     });
+    ensureBasketHeartbeatWatcher();
 
     try {
         const eventPathIncludes = (() => {
@@ -8066,6 +8331,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 upsertDashboardPairRow(i + 1, {
                     aEmail: acc.email || '',
                     bEmail: '\u2014',
+                    aIntent: resolveAIntent(acc),
                     holder: 'A',
                     seatId: seatInfo?.seatId ? String(seatInfo.seatId) : null,
                     seatLabel: fmtSeatLabel(seatInfo),
@@ -8093,6 +8359,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                         seatInfo,
                         catBlock,
                         canPay: normalizeCanPay(acc?.canPay, true),
+                        transferPurpose: normalizeTransferPurpose(acc?.transferPurpose, false),
                         accountProfile: acc,
                         ...basketTimingPatch
                     },
@@ -8169,6 +8436,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                         pairIndex,
                         aEmail: ctx.email || '',
                         bEmail: '\u2014',
+                        aIntent: resolveAIntent(ctx),
                         holder: ctx?.seatInfo?.seatId ? 'A' : null,
                         seatId: ctx?.seatInfo?.seatId ? String(ctx.seatInfo.seatId) : null,
                         seatLabel: fmtSeatLabel(ctx?.seatInfo),
@@ -9298,6 +9566,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         upsertDashboardPairRow(1, {
             aEmail: emailA,
             bEmail: hasRealB ? emailB : '\u2014',
+            aIntent: resolveAIntent(a0 || {}),
             holder: 'A',
             seatId: seatInfoA?.seatId ? String(seatInfoA.seatId) : null,
             seatLabel: fmtSeatLabel(seatInfoA),
@@ -9316,7 +9585,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         });
         pairRuntimeByIndex.set(1, {
             pairIndex: 1,
-            aCtx: { idx: 0, email: emailA, password: passwordA, browser: browserA, page: pageA, seatInfo: seatInfoA, catBlock: catBlockA, canPay: normalizeCanPay(a0?.canPay, true), accountProfile: a0 || null, ...basketTimingPatch },
+            aCtx: { idx: 0, email: emailA, password: passwordA, browser: browserA, page: pageA, seatInfo: seatInfoA, catBlock: catBlockA, canPay: normalizeCanPay(a0?.canPay, true), transferPurpose: normalizeTransferPurpose(a0?.transferPurpose, false), accountProfile: a0 || null, ...basketTimingPatch },
             bCtx: null,
             idProfileA: a0 || null,
             idProfileB: b0 || null,
@@ -10424,6 +10693,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         });
     } finally {
         try { if (basketMonitor) clearInterval(basketMonitor); } catch {}
+        try { if (basketHeartbeatWatch) clearInterval(basketHeartbeatWatch); } catch {}
         try { clearPassiveSessionWatch(); } catch {}
         try { if (dynamicTimingCheck) clearInterval(dynamicTimingCheck); } catch {}
         try { if (finalizeWatch) clearInterval(finalizeWatch); } catch {}

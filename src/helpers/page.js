@@ -240,13 +240,11 @@ async function dismissPaymentInfoModalIfPresent(page) {
 
 async function fillInvoiceTcAndContinue(page, identity) {
   if (!page) return false;
-  const tc = identity != null ? String(identity).trim() : '';
-  if (!/^\d{11}$/.test(tc)) return false;
 
   try {
     const alreadyAtIframe = await evaluateSafe(page, () => !!document.querySelector('iframe#payment_nkolay_frame')).catch(() => false);
     if (alreadyAtIframe) return true;
-    const result = await evaluateSafe(page, (tcValue) => {
+    const result = await evaluateSafe(page, () => {
       const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
       const isVisible = (el) => {
         try {
@@ -258,38 +256,16 @@ async function fillInvoiceTcAndContinue(page, identity) {
           return false;
         }
       };
-      const setInputValue = (inp, value) => {
-        try {
-          const proto = Object.getPrototypeOf(inp);
-          const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-          if (desc && typeof desc.set === 'function') desc.set.call(inp, value);
-          else inp.value = value;
-        } catch {
-          try { inp.value = value; } catch {}
-        }
-        try { inp.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
-        try { inp.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
-        try { inp.dispatchEvent(new Event('blur', { bubbles: true })); } catch {}
-      };
-
       const membershipBox = document.querySelector('#checksend-invoice-my-membership');
-      if (membershipBox && !membershipBox.checked && !membershipBox.disabled) {
+      const membershipLabel = document.querySelector('label[for="checksend-invoice-my-membership"]');
+      let membershipChecked = false;
+      if (membershipBox && !membershipBox.disabled && !membershipBox.checked) {
         try { membershipBox.click(); } catch {}
       }
-
-      const personalRadio = document.querySelector('#rbPersonal');
-      if (personalRadio && !personalRadio.checked && !personalRadio.disabled) {
-        try { personalRadio.click(); } catch {}
+      if (membershipBox && !membershipBox.checked && membershipLabel && isVisible(membershipLabel)) {
+        try { membershipLabel.click(); } catch {}
       }
-
-      const inputs = Array.from(document.querySelectorAll('quick-input input.form-control[placeholder="T.C. Kimlik No"], input.form-control[placeholder="T.C. Kimlik No"][maxlength="11"]'))
-        .filter(isVisible);
-      if (inputs.length) {
-        const inp = inputs[0];
-        try { inp.focus(); } catch {}
-        setInputValue(inp, '');
-        setInputValue(inp, tcValue);
-      }
+      membershipChecked = !!membershipBox?.checked;
 
       const btns = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
         .filter((b) => {
@@ -305,9 +281,10 @@ async function fillInvoiceTcAndContinue(page, identity) {
         || btns.find(b => norm(b.innerText || b.textContent || b.value || '') === 'devam')
         || null;
       if (!cand) return { ok: false, reason: 'continue_missing' };
+      if (membershipBox && !membershipChecked) return { ok: false, reason: 'membership_checkbox_not_checked' };
       try { cand.click(); } catch {}
-      return { ok: true };
-    }, tc);
+      return { ok: true, usedMembership: !!membershipBox };
+    });
     if (result && result.ok) {
       await delay(1200);
       return true;
