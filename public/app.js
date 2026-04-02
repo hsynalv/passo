@@ -930,11 +930,6 @@ $('botForm').addEventListener('submit', async (e) => {
   const payerACredentialIds = catalogApi && typeof catalogApi.getSelectedPayerCredentialIds === 'function'
     ? catalogApi.getSelectedPayerCredentialIds()
     : [];
-  const invalidPayerCredentials = catalogApi && typeof catalogApi.getCredentialById === 'function'
-    ? payerACredentialIds
-      .map((id) => catalogApi.getCredentialById(id))
-      .filter((item) => item && !/^\d{11}$/.test(String(item.identity || '').trim()))
-    : [];
   syncSetupPaymentCard(payerACredentialIds.length);
 
   if (!selectedTeam?.id || !selectedTeam?.name) {
@@ -983,13 +978,6 @@ $('botForm').addEventListener('submit', async (e) => {
   }
   if (!aCredentialIds.length) {
     validationIssues.push('En az 1 ana hesap üyeliği seçmelisin.');
-  }
-  if (!payerACredentialIds.length) {
-    validationIssues.push('Seçili ana hesap üyeliklerinden en az 1 tanesini "Odeme yapabilir" olarak işaretlemelisin.');
-  }
-  if (invalidPayerCredentials.length) {
-    const labels = invalidPayerCredentials.map((item) => item.email || 'hesap').join(', ');
-    validationIssues.push(`Su hesaplarda T.C. Kimlik No eksik oldugu icin odeme yapabilir secilemez: ${labels}`);
   }
   if (payerACredentialIds.length) {
     const cardFields = [

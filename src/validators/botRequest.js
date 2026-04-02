@@ -144,27 +144,6 @@ const botRequestSchema = z.object({
       message: 'En az 1 A hesabı zorunludur (aAccounts, aCredentialIds veya email/password)'
     });
   }
-  if (aList.length) {
-    const hasExplicitCanPay = aList.some((item) => item && Object.prototype.hasOwnProperty.call(item, 'canPay'));
-    if (hasExplicitCanPay) {
-      const hasPayerA = aList.some((item) => item && item.canPay === true);
-      if (!hasPayerA) {
-        ctx.addIssue({
-          code: 'custom',
-          path: ['aAccounts'],
-          message: 'A hesaplarında en az 1 adet `canPay=true` hesap bulunmalıdır'
-        });
-      }
-      const payerWithoutIdentity = aList.find((item) => item && item.canPay === true && !/^\d{11}$/.test(String(item.identity || '').trim()));
-      if (payerWithoutIdentity) {
-        ctx.addIssue({
-          code: 'custom',
-          path: ['aAccounts'],
-          message: 'Odeme yapabilir secilen her A hesabinda gecerli bir T.C. Kimlik No bulunmalidir'
-        });
-      }
-    }
-  }
   if (aCredentialIds.length && payerACredentialIds.length) {
     const payerSet = new Set(payerACredentialIds.map(String));
     const hasPayerCredential = aCredentialIds.some((id) => payerSet.has(String(id)));

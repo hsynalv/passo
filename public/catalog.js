@@ -32,10 +32,6 @@
     });
   }
 
-  function credentialHasValidIdentity(item) {
-    return /^\d{11}$/.test(String(item?.identity || '').trim());
-  }
-
   function setNotifier(fn) {
     if (typeof fn === 'function') notify = fn;
   }
@@ -226,7 +222,6 @@
       controls.appendChild(selectToggle);
 
       if (roleLabel === 'A') {
-        const hasIdentity = credentialHasValidIdentity(item);
         const payerToggle = document.createElement('label');
         payerToggle.className = 'credentialPickToggle';
         const payerInput = document.createElement('input');
@@ -234,16 +229,8 @@
         payerInput.value = item.id;
         payerInput.dataset.payerCredentialId = item.id;
         payerInput.checked = state.aPayerCredentialIds.includes(item.id);
-        payerInput.disabled = !input.checked || !hasIdentity;
-        if (!hasIdentity) payerToggle.title = 'Bu hesabin T.C. Kimlik No bilgisi eksik. Once hesaba TC eklemelisin.';
+        payerInput.disabled = !input.checked;
         payerInput.addEventListener('change', () => {
-          if (!hasIdentity) {
-            payerInput.checked = false;
-            notify('TC eksik oldugu icin bu hesap odeme yapabilir olarak secilemez.', { email: item.email || '', credentialId: item.id });
-            syncSelectedCredentialIdsFromDom();
-            renderCredentialPickers();
-            return;
-          }
           if (payerInput.checked && !input.checked) input.checked = true;
           syncSelectedCredentialIdsFromDom();
           renderCredentialPickers();
@@ -251,12 +238,6 @@
         payerToggle.appendChild(payerInput);
         payerToggle.appendChild(document.createTextNode(' Bu hesap odeme yapabilir'));
         controls.appendChild(payerToggle);
-        if (!hasIdentity) {
-          const identityWarn = document.createElement('span');
-          identityWarn.className = 'muted credentialInlineWarn';
-          identityWarn.textContent = ' TC eksik oldugu icin odeme secimi kapali';
-          controls.appendChild(identityWarn);
-        }
       }
 
       wrap.appendChild(meta);
