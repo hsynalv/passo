@@ -890,6 +890,31 @@ const runStore = (() => {
     return { get, upsert, remove, safeRunId, list, listRunning, killAllRunning };
 })();
 
+const runLogBufferStore = (() => {
+    const buffers = new Map();
+    const MAX_LOGS = 2000;
+    const get = (runId) => {
+        const key = runStore.safeRunId(runId);
+        if (!key) return [];
+        return buffers.get(key) || [];
+    };
+    const append = (runId, entry) => {
+        const key = runStore.safeRunId(runId);
+        if (!key || !entry) return [];
+        const list = buffers.get(key) || [];
+        list.push(entry);
+        while (list.length > MAX_LOGS) list.shift();
+        buffers.set(key, list);
+        return list.slice();
+    };
+    const remove = (runId) => {
+        const key = runStore.safeRunId(runId);
+        if (!key) return false;
+        return buffers.delete(key);
+    };
+    return { get, append, remove };
+})();
+
 /** Panel "aktif oturumları kapat" — tüm Puppeteer oturumlarını buradan kapatır */
 const passobotActiveBrowsers = new Set();
 
@@ -1098,13 +1123,11 @@ async function startBotAsync(req, res) {
 
     res.json({ success: true, runId, status: 'running' });
 
-    const capturedRunLogs = [];
     const pushCapturedRunLog = (entry) => {
         try {
             const entryRunId = String(entry?.runId || entry?.meta?.runId || '').trim();
             if (!entryRunId || entryRunId !== runId) return;
-            capturedRunLogs.push(entry);
-            while (capturedRunLogs.length > 2000) capturedRunLogs.shift();
+            const capturedRunLogs = runLogBufferStore.append(runId, entry);
             runStore.upsert(runId, {
                 logCount: capturedRunLogs.length,
                 logTail: capturedRunLogs.slice(-120)
@@ -1116,11 +1139,38 @@ async function startBotAsync(req, res) {
     const persistRunFailureLogs = async (errorText) => {
         try {
             if (failureLogsPersisted) return;
+            const capturedRunLogs = runLogBufferStore.get(runId);
             if (!capturedRunLogs.length) return;
-            await orderRecordRepo.attachSessionLogsToRun(runId, {
+            const attached = await orderRecordRepo.attachSessionLogsToRun(runId, {
                 failureReason: errorText,
                 sessionLogs: capturedRunLogs
             });
+            if (!Array.isArray(attached) || !attached.length) {
+                await orderRecordRepo.markFailed(`${runId}:run_failure`, {
+                    recordKey: `${runId}:run_failure`,
+                    runId,
+                    teamId: validatedData?.teamId || '',
+                    teamName: validatedData?.team || '',
+                    eventUrl: validatedData?.eventAddress || '',
+                    ticketType: validatedData?.ticketType || '',
+                    pairIndex: 0,
+                    sourceRole: 'RUN',
+                    holderRole: '',
+                    paymentOwnerRole: '',
+                    paymentState: 'failed',
+                    finalizeState: 'failed',
+                    recordStatus: 'failed',
+                    aAccountEmail: builtLists?.aList?.[0]?.email || '',
+                    bAccountEmail: builtLists?.bList?.[0]?.email || '',
+                    failureReason: errorText,
+                    auditMeta: {
+                        phase: 'run_failure',
+                        error: errorText
+                    },
+                    sessionLogs: capturedRunLogs,
+                    basketStatus: 'failed'
+                });
+            }
             failureLogsPersisted = true;
         } catch (error) {
             logger.warnSafe('order_record_attach_run_logs_failed', { runId, error: error?.message || String(error) });
@@ -1179,6 +1229,7 @@ async function startBotAsync(req, res) {
                 }
             } catch {}
             try { detachRunLogCapture && detachRunLogCapture(); } catch {}
+            try { runLogBufferStore.remove(runId); } catch {}
         });
 }
 
@@ -6179,7 +6230,9 @@ async function startBotAfterValidation(req, res, validatedData) {
             seat,
             category,
             basketStatus: extra.basketStatus || 'in_basket',
-            auditMeta: extra.auditMeta || {}
+            auditMeta: extra.auditMeta || {},
+            failureReason: extra.failureReason || '',
+            sessionLogs: Array.isArray(extra.sessionLogs) ? extra.sessionLogs : []
         };
     };
 
@@ -6223,7 +6276,11 @@ async function startBotAfterValidation(req, res, validatedData) {
     };
 
     const persistFailureForPair = async (pairIndex, extra = {}) => {
-        const payload = buildOrderRecordPayload(pairIndex, extra);
+        const payload = buildOrderRecordPayload(pairIndex, {
+            ...extra,
+            failureReason: extra.failureReason || extra?.auditMeta?.error || '',
+            sessionLogs: Array.isArray(extra?.sessionLogs) ? extra.sessionLogs : runLogBufferStore.get(runId)
+        });
         return safePersistOrderRecord('failed', () => orderRecordRepo.markFailed(payload.recordKey, payload));
     };
 

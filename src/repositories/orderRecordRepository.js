@@ -340,7 +340,15 @@ async function markFailed(recordKey, payload = {}) {
   const now = new Date().toISOString();
   const sessionLogs = sanitizeSessionLogs(payload.sessionLogs);
   return upsertByRecordKey(recordKey, {
+    $setOnInsert: {
+      recordKey: safeString(recordKey),
+      createdAt: now,
+      'basketState.addedAt': safeIso(payload?.basketState?.addedAt) || now,
+    },
     $set: {
+      ...buildBaseSet(payload, now),
+      'basketState.lastSeenAt': now,
+      'basketState.status': safeString(payload.basketStatus || payload?.basketState?.status || 'failed'),
       paymentState: safeString(payload.paymentState || 'failed'),
       finalizeState: safeString(payload.finalizeState || 'failed'),
       recordStatus: safeString(payload.recordStatus || 'failed'),
@@ -353,7 +361,7 @@ async function markFailed(recordKey, payload = {}) {
     $push: {
       auditTrail: buildAuditEntry('record_failed', payload.auditMeta || {}),
     },
-  }, { upsert: false });
+  }, { upsert: true });
 }
 
 async function attachSessionLogsToRun(runId, payload = {}) {
