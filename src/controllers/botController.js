@@ -3745,6 +3745,69 @@ async function reloginIfRedirected(page, email, password) {
 
 async function clickBuy(page, eventAddress = null) {
     const retries = Number.isFinite(getCfg().TIMEOUTS.CLICK_BUY_RETRIES) ? getCfg().TIMEOUTS.CLICK_BUY_RETRIES : 12;
+    const readyWaitMs = Number.isFinite(getCfg().TIMEOUTS.CLICK_BUY_READY_WAIT_MS) ? getCfg().TIMEOUTS.CLICK_BUY_READY_WAIT_MS : 12000;
+
+    const buyReady = await page.waitForFunction(() => {
+        const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+        const strip = (s) => {
+            try {
+                return String(s || '').normalize('NFD').replace(/\p{Diacritic}+/gu, '');
+            } catch {
+                return String(s || '');
+            }
+        };
+        const norm2 = (s) => norm(strip(s));
+        const isVisible = (el) => {
+            try {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                const r = el.getBoundingClientRect();
+                return !!(r && r.width > 1 && r.height > 1);
+            } catch {
+                return false;
+            }
+        };
+        const looksLikeBuyText = (txt) => {
+            const t = norm2(txt);
+            if (!t) return false;
+            if ((t.includes('satin') && t.includes('al')) || t === 'satin al') return true;
+            if (t.includes('bilet') && (t.includes('al') || t.includes('sat'))) return true;
+            if (t.includes('hemen') && t.includes('al')) return true;
+            return false;
+        };
+
+        if (!['interactive', 'complete'].includes(String(document.readyState || '').toLowerCase())) return false;
+
+        const candidates = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"]'));
+        return candidates.some((el) => {
+            if (!isVisible(el) || el.disabled) return false;
+            const txt = el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '';
+            return looksLikeBuyText(txt);
+        });
+    }, { timeout: readyWaitMs }).then(() => true).catch(() => false);
+
+    if (!buyReady) {
+        let diag = null;
+        try {
+            diag = await page.evaluate(() => {
+                const buttons = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"]'));
+                return {
+                    readyState: document.readyState,
+                    title: document.title || '',
+                    buttonCount: buttons.length,
+                    bodyHtmlLen: document.body?.innerHTML?.length || 0,
+                    url: location.href
+                };
+            });
+        } catch {}
+        logger.warn('clickBuy: sayfa hazır olmadan tiklama engellendi, hazirlik timeout', {
+            readyWaitMs,
+            currentUrl: (() => { try { return page.url(); } catch { return null; } })(),
+            diag
+        });
+    }
+
     for (let i = 0; i < retries; i++) {
         const found = await page.evaluate(() => {
             const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
