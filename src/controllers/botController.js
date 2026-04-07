@@ -4956,7 +4956,11 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
             const found = await page.evaluate(() => {
                 const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
                 const els = Array.from(document.querySelectorAll('button, a, [role="button"], div[role="button"], input[type="button"], input[type="submit"]'));
-                const el = els.find(x => norm(x.innerText || x.textContent || x.value || '').includes('kendim seçmek istiyorum'));
+                const byId = document.getElementById('custom_seat_button');
+                const el = byId || els.find(x => {
+                    const t = norm(x.innerText || x.textContent || x.value || '');
+                    return t.includes('kendim seçmek istiyorum') || t.includes('secimi degistir') || t.includes('seçimi değiştir');
+                });
                 if (!el) return { ok: false, reason: 'not_found' };
                 try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
                 const r = el.getBoundingClientRect();
@@ -4978,8 +4982,12 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
             try {
                 await page.evaluate(() => {
                     const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+                    const byId = document.getElementById('custom_seat_button');
                     const btns = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
-                    const b = btns.find(x => norm(x.innerText || x.textContent || x.value || '').includes('kendim seçmek istiyorum'));
+                    const b = byId || btns.find(x => {
+                        const t = norm(x.innerText || x.textContent || x.value || '');
+                        return t.includes('kendim seçmek istiyorum') || t.includes('secimi degistir') || t.includes('seçimi değiştir');
+                    });
                     try { b?.click(); } catch {}
                 });
             } catch {}
@@ -5336,11 +5344,26 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                 // This intermediate screen sometimes ignores programmatic clicks. Force a real mouse click and retry.
                 let layoutOk = false;
                 for (let s = 0; s < 3; s++) {
-                    // Only click if blocks are not already present; avoid toggling UI unnecessarily.
-                    const blocksExist = await page.evaluate(() => {
-                        return document.querySelectorAll('svg.svgLayout g.block, svg.svgLayout .svgBlock, .svgLayout g.block, .svgLayout .svgBlock').length > 0;
-                    }).catch(() => false);
-                    if (!blocksExist) await clickSelfSelectAny();
+                    const uiState = await page.evaluate(() => {
+                        const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+                        const blocksExist = document.querySelectorAll('svg.svgLayout g.block, svg.svgLayout .svgBlock, .svgLayout g.block, .svgLayout .svgBlock').length > 0;
+                        const els = Array.from(document.querySelectorAll('button, a, [role="button"], div[role="button"], input[type="button"], input[type="submit"]'));
+                        const hasSelfSelect = !!document.getElementById('custom_seat_button') || els.some((x) => {
+                            const t = norm(x.innerText || x.textContent || x.value || '');
+                            return t.includes('kendim seçmek istiyorum') || t.includes('secimi degistir') || t.includes('seçimi değiştir');
+                        });
+                        return { blocksExist, hasSelfSelect };
+                    }).catch(() => ({ blocksExist: false, hasSelfSelect: false }));
+                    if (!uiState.blocksExist || uiState.hasSelfSelect) {
+                        const clickedSelfSelect = await clickSelfSelectAny();
+                        logger.info('categoryBlock:svg_self_select_guard', {
+                            attempt,
+                            subAttempt: s + 1,
+                            blocksExist: !!uiState.blocksExist,
+                            hasSelfSelect: !!uiState.hasSelfSelect,
+                            clickedSelfSelect
+                        });
+                    }
                     layoutOk = await page.waitForSelector('svg.svgLayout, svg .svgLayout, svg[class*="svgLayout"], .svgLayout', { timeout: 6000 })
                         .then(() => true)
                         .catch(() => false);
