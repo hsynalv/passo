@@ -111,8 +111,28 @@
                 <select name="prioritySaleCategory" id="prioritySaleCategorySelect">
                   <option value="">Seçin…</option>
                   <option value="Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler">Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler</option>
+                  <option value="GS PLUS Premium">GS PLUS Premium</option>
+                  <option value="GSPara Öncelik">GSPara Öncelik</option>
                 </select>
               </div>
+
+              <details class="details divanPriorityFields" id="gsPlusPriorityFieldsDetails" hidden style="margin-top:10px">
+                <summary class="detailsTitle" style="cursor:pointer;user-select:none">GS PLUS Premium: cep telefonu</summary>
+                <div class="hint" style="margin-top:8px">Passo bu öncelikte telefon doğrulaması ister; tüm seçili hesap oturumlarında aynı numara kullanılır (üyelikte yoksa buradan).</div>
+                <div class="row" style="margin-top:8px">
+                  <label>Cep telefonu</label>
+                  <input name="priorityPhone" id="priorityPhoneInput" type="tel" inputmode="tel" autocomplete="tel" placeholder="5XX XXX XX XX veya 05XX…" />
+                </div>
+              </details>
+
+              <details class="details divanPriorityFields" id="gsParaPriorityFieldsDetails" hidden style="margin-top:10px">
+                <summary class="detailsTitle" style="cursor:pointer;user-select:none">GSPara Öncelik: TCKN</summary>
+                <div class="hint" style="margin-top:8px">Passo bu öncelikte TCKN ister; tüm seçili hesap oturumlarında aynı numara kullanılır (üyelikte yoksa buradan gir — GS PLUS telefonu gibi).</div>
+                <div class="row" style="margin-top:8px">
+                  <label>T.C. kimlik no</label>
+                  <input name="priorityTckn" id="priorityTcknInput" type="text" inputmode="numeric" autocomplete="off" placeholder="11 hane" maxlength="11" />
+                </div>
+              </details>
 
               <details class="details divanPriorityFields" id="divanPriorityFieldsDetails" hidden style="margin-top:10px">
                 <summary class="detailsTitle" style="cursor:pointer;user-select:none">Divan: Sicil No / öncelikli bilet kodu (üyelikte yoksa)</summary>

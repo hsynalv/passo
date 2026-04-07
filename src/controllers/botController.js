@@ -1,7 +1,6 @@
 const { connect: realBrowserConnect } = require('puppeteer-real-browser');
 const rebrowserPuppeteer = require('rebrowser-puppeteer-core');
 const axios = require('axios');
-const ac = require('@antiadmin/anticaptchaofficial');
 const { randomUUID } = require('crypto');
 const fs = require('fs');
 const { PNG } = require('pngjs');
@@ -13,6 +12,7 @@ const credentialRepo = require('../repositories/credentialRepository');
 const orderRecordRepo = require('../repositories/orderRecordRepository');
 const teamRepo = require('../repositories/teamRepository');
 const { withRunCfg, getCfg } = require('../runCfg');
+const { buildProviderChain, hasCaptchaSolverCredentials, solveTurnstileProxyless, solveRecaptchaV2Proxyless } = require('../services/captchaSolver');
 const delay = require('../utils/delay');
 const { evaluateSafe, waitForFunctionSafe } = require('../utils/browserEval');
 const { decryptSecret } = require('../utils/credentialCrypto');
@@ -22,19 +22,6 @@ const { BasketTimer, checkBasketTimeoutFromPage } = require('../utils/basketTime
 const {confirmSwalYes, clickRemoveFromCartAndConfirm} = require('../helpers/swal');
 const { captureSeatIdFromNetwork, readBasketData, readCatBlock, setCatBlockOnB, openSeatMapStrict, clickContinueInsidePage, gotoWithRetry, ensureUrlContains, isHomeUrl, SEAT_NODE_SELECTOR, ensureTcAssignedOnBasket, clickBasketDevamToOdeme, dismissPaymentInfoModalIfPresent, fillInvoiceTcAndContinue, acceptAgreementsAndContinue, fillNkolayPaymentIframe } = require('../helpers/page');
 const { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware, applyTicketQuantityDropdown } = require('../helpers/seat');
-
-function applyAnticaptchaFromCfg(c) {
-    ac.setAPIKey(c.ANTICAPTCHA_KEY || '');
-    try {
-        if (typeof ac.settings === 'object' && ac.settings) {
-            const first = Number(c.ANTICAPTCHA_FIRST_POLL_SEC);
-            const normal = Number(c.ANTICAPTCHA_POLL_SEC);
-            if (Number.isFinite(first) && first > 0) ac.settings.firstAttemptWaitingInterval = first;
-            if (Number.isFinite(normal) && normal > 0) ac.settings.normalWaitingInterval = normal;
-        }
-    } catch {}
-}
-applyAnticaptchaFromCfg(configRoot);
 
 function normalizeSelectedCategory(item, fallbackMode = 'scan') {
     if (!item || typeof item !== 'object') return null;
@@ -215,6 +202,22 @@ function getSvgCategoryMatchScore(tooltipText, categoryTexts = []) {
     return best;
 }
 
+/** Haritadan örneklenen renk ile lejant rengi arasındaki mesafeyi 0–120 “uygunluk” skoruna çevirir. */
+function svgLegendColorFitScore(distance) {
+    if (!Number.isFinite(distance) || distance === Number.POSITIVE_INFINITY) return 0;
+    return Math.max(0, 120 - Math.min(120, distance * 1.35));
+}
+
+/**
+ * SVG: hedef kategori (lejant satırı başlığı eşlemesi) + blok renginin lejant rengine yakınlığı.
+ * İkisi de zayıfsa skor 0 — yalnız blok adı veya yalnız rastgele renk tek başına kazanmasın.
+ */
+function svgCategoryColorCombinedScore(legendTitleScore, colorDistance) {
+    const colorFit = svgLegendColorFitScore(colorDistance);
+    if (!legendTitleScore || !colorFit) return 0;
+    return Math.round((legendTitleScore * colorFit) / 100);
+}
+
 function parseRgbColorString(value) {
     const m = String(value || '').match(/rgba?\(\s*(\d{1,3})\s*[, ]\s*(\d{1,3})\s*[, ]\s*(\d{1,3})(?:\s*[,/]\s*([0-9.]+))?\s*\)/i);
     if (!m) return null;
@@ -266,7 +269,7 @@ function samplePngPatchColor(png, x, y, radius = 3) {
 }
 
 function sanitizeStartRequestForLog(value) {
-    const secretKeyRe = /^(password|password2|cvv|proxyPassword|fanCardCode|identity|sicilNo|priorityTicketCode|cardNumber|encryptedPassword)$/i;
+    const secretKeyRe = /^(password|password2|cvv|proxyPassword|fanCardCode|identity|sicilNo|priorityTicketCode|priorityPhone|priorityTckn|cardNumber|encryptedPassword|ANTICAPTCHA_KEY|CAPSOLVER_KEY|TWOCAPTCHA_KEY)$/i;
 
     const visit = (input, keyName = '') => {
         if (input == null) return input;
@@ -1093,6 +1096,43 @@ function validateDivanPriorityAccounts(aList, bList, hasRealB, prioritySale, sic
     return null;
 }
 
+function normalizePriorityFormDigits(s) {
+    return String(s || '').replace(/\D/g, '');
+}
+
+function validateGsPlusPremiumAccounts(aList, bList, hasRealB, prioritySale, priorityPhone) {
+    if (typeof prioritySale !== 'string' || !isGsPlusPremiumPriorityCategory(prioritySale)) return null;
+    void aList;
+    void bList;
+    void hasRealB;
+    const d = normalizePriorityFormDigits(priorityPhone);
+    if (d.length < 10) {
+        return 'GS PLUS Premium önceliği: başlatma formunda geçerli cep telefonu gerekir (en az 10 hane).';
+    }
+    return null;
+}
+
+function validateGsParaPriorityAccounts(aList, bList, hasRealB, prioritySale, identity, priorityTckn) {
+    if (typeof prioritySale !== 'string' || !isGsParaPriorityCategory(prioritySale)) return null;
+    const reqId = normalizePriorityFormDigits(priorityTckn) || normalizePriorityFormDigits(identity);
+    for (const acc of aList) {
+        const id = normalizePriorityFormDigits(acc.identity) || reqId;
+        if (!/^\d{11}$/.test(id)) {
+            return 'GSPara Öncelik: her A hesabı için üyelikte TCKN veya formdaki GSPara / ortak TCKN alanı (11 hane) gerekir.';
+        }
+    }
+    if (hasRealB) {
+        for (const acc of bList) {
+            if (!(String(acc.email || '').trim() && String(acc.password || '').trim())) continue;
+            const id = normalizePriorityFormDigits(acc.identity) || reqId;
+            if (!/^\d{11}$/.test(id)) {
+                return 'GSPara Öncelik: her B hesabı için üyelikte TCKN veya formdaki GSPara / ortak TCKN alanı (11 hane) gerekir.';
+            }
+        }
+    }
+    return null;
+}
+
 async function startBotAsync(req, res) {
     let validatedData;
     try {
@@ -1123,6 +1163,27 @@ async function startBotAsync(req, res) {
     );
     if (divanPreflightErr) {
         return res.status(400).json({ error: divanPreflightErr });
+    }
+    const gsPlusPreflightErr = validateGsPlusPremiumAccounts(
+        builtLists.aList,
+        builtLists.bList,
+        builtLists.hasRealB,
+        validatedData.prioritySale,
+        validatedData.priorityPhone
+    );
+    if (gsPlusPreflightErr) {
+        return res.status(400).json({ error: gsPlusPreflightErr });
+    }
+    const gsParaPreflightErr = validateGsParaPriorityAccounts(
+        builtLists.aList,
+        builtLists.bList,
+        builtLists.hasRealB,
+        validatedData.prioritySale,
+        validatedData.identity,
+        validatedData.priorityTckn
+    );
+    if (gsParaPreflightErr) {
+        return res.status(400).json({ error: gsParaPreflightErr });
     }
     accountListsWarmCache.set(validatedData, {
         aList: builtLists.aList,
@@ -1807,12 +1868,13 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
                 });
             }
 
-            if (!effectiveSiteKey || !getCfg().ANTICAPTCHA_KEY) {
+            if (!effectiveSiteKey || !hasCaptchaSolverCredentials(getCfg())) {
                 logger.warn('turnstile:cannot_solve_missing_keys', {
                     email,
                     label,
                     hasSiteKey: !!effectiveSiteKey,
-                    hasAntiCaptchaKey: !!getCfg().ANTICAPTCHA_KEY
+                    hasSolverCredentials: hasCaptchaSolverCredentials(getCfg()),
+                    providers: buildProviderChain(getCfg())
                 });
                 return { attempted: false, state, missingKeys: true };
             }
@@ -1836,14 +1898,21 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
                 }
 
                 let tok;
+                let provider = 'unknown';
                 try {
                     const solveTimeoutMs = Math.max(15000, Number(getCfg()?.TIMEOUTS?.TURNSTILE_SOLVE_TIMEOUT) || 120000);
-                    tok = await Promise.race([
-                        ac.solveTurnstileProxyless(String(effectiveUrl), String(effectiveSiteKey)),
+                    const solved = await Promise.race([
+                        solveTurnstileProxyless({
+                            url: String(effectiveUrl),
+                            siteKey: String(effectiveSiteKey),
+                            cfg: getCfg()
+                        }),
                         delay(solveTimeoutMs).then(() => {
                             throw new Error(`TURNSTILE_SOLVE_TIMEOUT_${solveTimeoutMs}`);
                         })
                     ]);
+                    tok = solved?.token || '';
+                    provider = solved?.provider || provider;
                 } finally {
                     getTurnstileSolveSem().release();
                 }
@@ -1857,6 +1926,7 @@ async function ensureTurnstileTokenOnPage(page, email, label, options) {
                     attempt,
                     solveMs: Date.now() - solveStart,
                     tokenLength: tok ? String(tok).length : 0,
+                    provider,
                     siteKey: String(effectiveSiteKey || '').slice(0, 80),
                     url: String(effectiveUrl || '').slice(0, 200)
                 });
@@ -2009,16 +2079,24 @@ async function ensureRecaptchaV2OnPage(page, email, label, options) {
                     const solveStart = Date.now();
                     await getTurnstileSolveSem().acquire();
                     let tok;
+                    let provider = 'unknown';
                     try {
                         const solveTimeoutMs = Math.max(15000, Number(getCfg()?.TIMEOUTS?.TURNSTILE_SOLVE_TIMEOUT) || 120000);
-                        tok = await Promise.race([
-                            ac.solveRecaptchaV2Proxyless(String(pageUrl), String(recaptchaSiteKey)),
+                        const solved = await Promise.race([
+                            solveRecaptchaV2Proxyless({
+                                url: String(pageUrl),
+                                siteKey: String(recaptchaSiteKey),
+                                invisible: false,
+                                cfg: getCfg()
+                            }),
                             delay(solveTimeoutMs).then(() => { throw new Error(`RECAPTCHA_SOLVE_TIMEOUT_${solveTimeoutMs}`); })
                         ]);
+                        tok = solved?.token || '';
+                        provider = solved?.provider || provider;
                     } finally {
                         getTurnstileSolveSem().release();
                     }
-                    logger.info('recaptcha:solve_result', { email, label, solveMs: Date.now() - solveStart, tokenLength: tok ? String(tok).length : 0 });
+                    logger.info('recaptcha:solve_result', { email, label, solveMs: Date.now() - solveStart, tokenLength: tok ? String(tok).length : 0, provider });
                     await injectRecaptchaToken(page, tok);
                     return { attempted: true, type: 'recaptcha', tokenLength: tok ? String(tok).length : 0 };
                 } catch (e) {
@@ -2038,14 +2116,22 @@ async function ensureRecaptchaV2OnPage(page, email, label, options) {
 
         let tok = null;
         let solveType = 'v2';
+        let provider = 'unknown';
         for (const invisible of [true, false]) {
             try {
                 await getTurnstileSolveSem().acquire();
                 try {
-                    tok = await Promise.race([
-                        ac.solveRecaptchaV2Proxyless(String(pageUrl), String(recaptchaSiteKey), invisible),
+                    const solved = await Promise.race([
+                        solveRecaptchaV2Proxyless({
+                            url: String(pageUrl),
+                            siteKey: String(recaptchaSiteKey),
+                            invisible,
+                            cfg: getCfg()
+                        }),
                         delay(solveTimeoutMs).then(() => { throw new Error(`RECAPTCHA_SOLVE_TIMEOUT_${solveTimeoutMs}`); })
                     ]);
+                    tok = solved?.token || '';
+                    provider = solved?.provider || provider;
                     solveType = invisible ? 'v2-invisible' : 'v2';
                 } finally {
                     getTurnstileSolveSem().release();
@@ -2061,7 +2147,7 @@ async function ensureRecaptchaV2OnPage(page, email, label, options) {
             }
         }
 
-        logger.info('recaptcha:solve_result', { email, label, solveMs: Date.now() - solveStart, tokenLength: tok ? String(tok).length : 0, siteKey: recaptchaSiteKey, solveType });
+        logger.info('recaptcha:solve_result', { email, label, solveMs: Date.now() - solveStart, tokenLength: tok ? String(tok).length : 0, siteKey: recaptchaSiteKey, solveType, provider });
 
         await injectRecaptchaToken(page, tok);
         return { attempted: true, type: 'recaptcha', tokenLength: tok ? String(tok).length : 0, solveType };
@@ -3746,6 +3832,23 @@ function isDivanPrioritySaleCategory(desired) {
     return a === b || a.includes(b) || b.includes(a);
 }
 
+const GS_PLUS_PREMIUM_PRIORITY_TITLE = 'GS PLUS Premium';
+const GSPARA_PRIORITY_TITLE = 'GSPara Öncelik';
+
+function isGsPlusPremiumPriorityCategory(desired) {
+    const a = normKeyPrioritySaleTitle(GS_PLUS_PREMIUM_PRIORITY_TITLE);
+    const b = normKeyPrioritySaleTitle(desired);
+    if (!b) return false;
+    return a === b || a.includes(b) || b.includes(a);
+}
+
+function isGsParaPriorityCategory(desired) {
+    const a = normKeyPrioritySaleTitle(GSPARA_PRIORITY_TITLE);
+    const b = normKeyPrioritySaleTitle(desired);
+    if (!b) return false;
+    return a === b || a.includes(b) || b.includes(a);
+}
+
 /**
  * Divan öncelik modalı: label "Sicil No:" / "Öncelikli Bilet Kodu:" (docs/fenerbahçe divan.md).
  * Yalnızca isDivanPrioritySaleCategory true iken çağrılmalı.
@@ -3826,17 +3929,109 @@ async function fillDivanPrioritySaleModalFields(page, sicilVal, priorityCodeVal)
     }
 }
 
+/**
+ * GS PLUS Premium öncelik modalı: telefon alanı (label / placeholder / type=tel).
+ * Yalnızca isGsPlusPremiumPriorityCategory true iken çağrılmalı.
+ */
+async function fillGsPlusPremiumModalFields(page, phoneVal) {
+    const raw = String(phoneVal || '').trim();
+    if (!raw) return false;
+    try {
+        return await page.evaluate((phoneStr) => {
+            const isVisible = (el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || '1') === 0)) return false;
+                const r = el.getBoundingClientRect?.();
+                if (!r) return true;
+                return r.width > 4 && r.height > 4;
+            };
+
+            const pickRoot = () => {
+                const byClass = document.querySelector('.modal.priority-sale-modal.show')
+                    || document.querySelector('.modal.show.priority-sale-modal');
+                if (byClass && isVisible(byClass)) return byClass;
+                const shown = Array.from(document.querySelectorAll('.modal.show, .modal.fade.show')).filter(isVisible);
+                return shown.find((m) => m.classList.contains('priority-sale-modal') || !!m.querySelector('.priority-sale-select-item')) || shown[0] || null;
+            };
+
+            const root = pickRoot();
+            if (!root) return false;
+
+            const setNativeValue = (input, v) => {
+                try {
+                    const proto = window.HTMLInputElement.prototype;
+                    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (desc && desc.set) desc.set.call(input, String(v || ''));
+                    else input.value = String(v || '');
+                } catch {
+                    try { input.value = String(v || ''); } catch {}
+                }
+                try { input.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
+                try { input.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+                try { input.dispatchEvent(new Event('blur', { bubbles: true })); } catch {}
+            };
+
+            const labels = Array.from(root.querySelectorAll('label'));
+            const inputByLabel = (needles) => {
+                const n = needles.map((x) => String(x).toLowerCase());
+                for (const lbl of labels) {
+                    const t = String(lbl.innerText || lbl.textContent || '').toLowerCase().replace(/\s+/g, ' ');
+                    if (!n.every((needle) => t.includes(needle))) continue;
+                    const fg = lbl.closest('.form-group') || lbl.parentElement;
+                    const inp = fg?.querySelector('input:not([type="hidden"])');
+                    if (inp && isVisible(inp)) return inp;
+                }
+                return null;
+            };
+
+            let phoneInp = inputByLabel(['telefon'])
+                || inputByLabel(['gsm'])
+                || inputByLabel(['cep'])
+                || inputByLabel(['phone'])
+                || inputByLabel(['mobile'])
+                || inputByLabel(['iletisim']);
+
+            if (!phoneInp) {
+                const inputs = Array.from(root.querySelectorAll('input:not([type="hidden"])')).filter(isVisible);
+                phoneInp = inputs.find((i) => String(i.getAttribute('type') || '').toLowerCase() === 'tel')
+                    || inputs.find((i) => {
+                        const ph = String(i.getAttribute('placeholder') || '').toLowerCase();
+                        const al = String(i.getAttribute('aria-label') || '').toLowerCase();
+                        const blob = `${ph} ${al}`;
+                        return blob.includes('telefon') || blob.includes('gsm') || blob.includes('cep') || blob.includes('phone');
+                    })
+                    || null;
+            }
+
+            if (!phoneInp) return false;
+
+            setNativeValue(phoneInp, phoneStr);
+            return true;
+        }, raw);
+    } catch {
+        return false;
+    }
+}
+
 async function handlePrioritySaleModal(page, opts = null) {
     const o = opts && typeof opts === 'object' ? opts : {};
     const prioritySale = o.prioritySale;
     const fanCardCode = o.fanCardCode;
-    const identity = o.identity;
+    let identity = o.identity;
     const sicilNo = o.sicilNo;
     const priorityTicketCode = o.priorityTicketCode;
+    const priorityPhone = o.priorityPhone;
+    const priorityTckn = o.priorityTckn;
 
     const desired = (typeof prioritySale === 'string' ? String(prioritySale).trim() : '');
     const shouldTry = prioritySale === true || desired.length > 0;
     if (!shouldTry) return false;
+
+    if (isGsParaPriorityCategory(desired)) {
+        const merged = String(identity || '').trim() || String(priorityTckn || '').trim();
+        identity = merged || null;
+    }
 
     const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
 
@@ -4023,7 +4218,9 @@ async function handlePrioritySaleModal(page, opts = null) {
 
         const hint = norm(`${placeholder} ${labelText} ${name} ${id}`);
         let value = '';
-        if (hint.includes('t.c') || hint.includes('tc') || hint.includes('tckn') || hint.includes('kimlik')) value = String(identity || '').trim();
+        if (hint.includes('telefon') || hint.includes('gsm') || hint.includes('cep') || hint.includes('phone') || hint.includes('mobile') || (hint.includes('tel') && !hint.includes('kart'))) {
+            value = String(priorityPhone || '').trim();
+        } else if (hint.includes('t.c') || hint.includes('tc') || hint.includes('tckn') || hint.includes('kimlik')) value = String(identity || '').trim();
         else if (hint.includes('sicil') || hint.includes('kayıt') || hint.includes('kayit')) value = String(sicilNo || '').trim();
         else if ((hint.includes('öncelik') || hint.includes('oncelik')) && (hint.includes('bilet') || hint.includes('kod'))) value = String(priorityTicketCode || '').trim();
         else if (hint.includes('fan') && hint.includes('card')) value = String(fanCardCode || '').trim();
@@ -4400,6 +4597,7 @@ async function handlePrioritySaleModal(page, opts = null) {
             }
             if (selInfo?.ok) {
                 const divan = isDivanPrioritySaleCategory(desired);
+                const gsPlus = isGsPlusPremiumPriorityCategory(desired);
                 if (divan) {
                     const s = String(sicilNo || '').trim();
                     const p = String(priorityTicketCode || '').trim();
@@ -4419,6 +4617,19 @@ async function handlePrioritySaleModal(page, opts = null) {
                         return false;
                     }
                     try { logger.info('prioritySale.divan.filled', { desired }); } catch {}
+                    try { await delay(250); } catch {}
+                } else if (gsPlus) {
+                    const ph = String(priorityPhone || '').trim();
+                    if (!ph) {
+                        try { logger.warn('prioritySale.gsplus.missing_phone', { desired }); } catch {}
+                        return false;
+                    }
+                    const filled = await fillGsPlusPremiumModalFields(page, ph);
+                    if (!filled) {
+                        try { logger.warn('prioritySale.gsplus.fill_failed', { desired }); } catch {}
+                        return false;
+                    }
+                    try { logger.info('prioritySale.gsplus.filled', { desired }); } catch {}
                     try { await delay(250); } catch {}
                 } else if (selInfo?.hasInput) {
                     await fillInputIfNeeded(selInfo);
@@ -4833,10 +5044,17 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                     return { ok: true, id: blockId, tag: asEl.tagName, x, y, width: rect.width || 0, height: rect.height || 0, method: 'getBoundingClientRect', top };
                 }, targetId).catch(() => ({ ok: false, id: targetId, reason: 'eval_failed' }));
             };
-            const enrichSvgCandidatesWithLegendColors = async (candidates, legendEntries) => {
+            const enrichSvgCandidatesWithLegendColors = async (candidates, legendEntries, legendCategoryTexts = []) => {
                 const base = Array.isArray(candidates) ? candidates : [];
+                const catTexts = Array.isArray(legendCategoryTexts) ? legendCategoryTexts : [];
                 const legend = (Array.isArray(legendEntries) ? legendEntries : [])
-                    .map((entry) => ({ ...entry, rgb: parseRgbColorString(entry?.color || '') }))
+                    .map((entry) => {
+                        const rgb = parseRgbColorString(entry?.color || '');
+                        const legendMatchScore = Number.isFinite(Number(entry?.score))
+                            ? Number(entry.score)
+                            : getSvgCategoryMatchScore(entry?.title || '', catTexts);
+                        return { ...entry, rgb, legendMatchScore };
+                    })
                     .filter((entry) => !!entry.rgb);
                 if (!base.length) return [];
 
@@ -4851,6 +5069,8 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                         sampledColor: null,
                         colorDistance: Number.POSITIVE_INFINITY,
                         colorScore: 0,
+                        legendCombinedScore: 0,
+                        legendNameScore: 0,
                         legendTitle: null,
                         legendColor: null
                     }));
@@ -4868,6 +5088,8 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                         sampledColor: null,
                         colorDistance: Number.POSITIVE_INFINITY,
                         colorScore: 0,
+                        legendCombinedScore: 0,
+                        legendNameScore: 0,
                         legendTitle: null,
                         legendColor: null
                     }));
@@ -4881,6 +5103,8 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                             sampledColor: null,
                             colorDistance: Number.POSITIVE_INFINITY,
                             colorScore: 0,
+                            legendCombinedScore: 0,
+                            legendNameScore: 0,
                             legendTitle: null,
                             legendColor: null
                         };
@@ -4897,12 +5121,19 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                     let bestColor = null;
                     let bestLegend = null;
                     let bestDistance = Number.POSITIVE_INFINITY;
+                    let bestCombined = 0;
                     for (const pt of samplePoints) {
                         const sampled = samplePngPatchColor(png, pt.x, pt.y, 3);
                         if (!sampled) continue;
                         for (const entry of legend) {
                             const dist = colorDistance(sampled, entry.rgb);
-                            if (dist < bestDistance) {
+                            const nameSc = Number(entry.legendMatchScore || 0);
+                            const combined = svgCategoryColorCombinedScore(nameSc, dist);
+                            const better = combined > bestCombined
+                                || (combined === bestCombined && combined > 0 && dist < bestDistance)
+                                || (bestCombined === 0 && combined === 0 && dist < bestDistance);
+                            if (better) {
+                                bestCombined = combined;
                                 bestDistance = dist;
                                 bestColor = sampled;
                                 bestLegend = entry;
@@ -4912,19 +5143,23 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                     const colorScore = Number.isFinite(bestDistance)
                         ? Math.max(0, 240 - Math.min(240, bestDistance * 2.1))
                         : 0;
+                    const legendNameScore = Number(bestLegend?.legendMatchScore || 0);
                     return {
                         ...item,
                         sampledColor: bestColor,
                         colorDistance: bestDistance,
                         colorScore,
+                        legendCombinedScore: bestCombined,
+                        legendNameScore,
                         legendTitle: bestLegend?.title || null,
                         legendColor: bestLegend?.color || null
                     };
                 });
             };
-            const probeSvgCandidate = async (candidate, categoryTexts) => {
+            const probeSvgCandidate = async (candidate, categoryTexts, preferLegendCategoryColor = false) => {
                 if (!candidate?.id) return { ...(candidate || {}), ok: false, tooltipText: '', matchScore: 0 };
-                if (svgProbeCache.has(candidate.id)) return svgProbeCache.get(candidate.id);
+                const probeCacheKey = `${candidate.id}|${preferLegendCategoryColor ? 'cc' : 'leg'}`;
+                if (svgProbeCache.has(probeCacheKey)) return svgProbeCache.get(probeCacheKey);
                 const clickPoint = await readClickPoint(candidate.id);
                 let tooltipText = '';
                 if (clickPoint?.ok && Number.isFinite(clickPoint.x) && Number.isFinite(clickPoint.y)) {
@@ -4966,9 +5201,15 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                 }
                 const tooltipScore = getSvgCategoryMatchScore(tooltipText, categoryTexts);
                 const colorScore = Number(candidate?.colorScore || 0);
-                const matchScore = Math.max(colorScore, tooltipScore);
+                const legendCombined = Number(candidate?.legendCombinedScore || 0);
+                let matchScore;
+                if (preferLegendCategoryColor && legendCombined > 0) {
+                    matchScore = legendCombined + Math.min(22, Math.round(tooltipScore * 0.18));
+                } else {
+                    matchScore = Math.max(colorScore, tooltipScore);
+                }
                 const result = { ...candidate, clickPoint, tooltipText, tooltipScore, matchScore };
-                svgProbeCache.set(candidate.id, result);
+                svgProbeCache.set(probeCacheKey, result);
                 return result;
             };
             const requestedSvgTexts = [cat, alt].filter(Boolean);
@@ -5053,13 +5294,26 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                     const relevantLegendEntries = matchedLegendEntries.length
                         ? matchedLegendEntries
                         : svgLegendEntries.filter((entry) => svgDesiredTexts.includes(entry.title));
-                    const coloredCandidates = await enrichSvgCandidatesWithLegendColors(remaining, relevantLegendEntries);
-                    for (const candidate of coloredCandidates) {
-                        const probed = await probeSvgCandidate(candidate, svgDesiredTexts);
-                        if (probed.matchScore > 0) matchedCandidates.push(probed);
+                    const coloredCandidates = await enrichSvgCandidatesWithLegendColors(remaining, relevantLegendEntries, requestedSvgTexts);
+                    const hasLegendRgb = (Array.isArray(relevantLegendEntries) ? relevantLegendEntries : []).some((e) => !!parseRgbColorString(e?.color || ''));
+                    const preferLegendCategoryColor = matchedLegendEntries.length > 0 && hasLegendRgb;
+                    const runProbes = async (preferCc) => {
+                        const out = [];
+                        for (const candidate of coloredCandidates) {
+                            const probed = await probeSvgCandidate(candidate, svgDesiredTexts, preferCc);
+                            if (probed.matchScore > 0) out.push(probed);
+                        }
+                        return out;
+                    };
+                    matchedCandidates = await runProbes(preferLegendCategoryColor);
+                    if (!matchedCandidates.length && preferLegendCategoryColor) {
+                        matchedCandidates = await runProbes(false);
                     }
                     matchedCandidates.sort((a, b) => {
                         if ((b.matchScore || 0) !== (a.matchScore || 0)) return (b.matchScore || 0) - (a.matchScore || 0);
+                        if ((b.legendCombinedScore || 0) !== (a.legendCombinedScore || 0)) {
+                            return (b.legendCombinedScore || 0) - (a.legendCombinedScore || 0);
+                        }
                         if ((b.colorScore || 0) !== (a.colorScore || 0)) return (b.colorScore || 0) - (a.colorScore || 0);
                         return String(a.id || '').localeCompare(String(b.id || ''));
                     });
@@ -5072,6 +5326,8 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                         blockId: pick.id,
                         legendTitle: pick.legendTitle || null,
                         legendColor: pick.legendColor || null,
+                        legendNameScore: pick.legendNameScore || 0,
+                        legendCombinedScore: pick.legendCombinedScore || 0,
                         sampledColor: pick.sampledColor || null,
                         colorDistance: Number.isFinite(pick.colorDistance) ? pick.colorDistance : null,
                         colorScore: pick.colorScore || 0,
@@ -5915,7 +6171,6 @@ async function startBot(req, res) {
 
     const runCfg = configRoot.createRunConfigFromOverrides(validatedData.panelSettings);
     return withRunCfg(runCfg, async () => {
-        applyAnticaptchaFromCfg(getCfg());
         return startBotAfterValidation(req, res, validatedData);
     });
 }
@@ -5929,7 +6184,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         transferTargetEmail,
         ticketCount = 1,
         extendWhenRemainingSecondsBelow,
-        prioritySale, fanCardCode, identity, sicilNo, priorityTicketCode,
+        prioritySale, fanCardCode, identity, sicilNo, priorityTicketCode, priorityPhone, priorityTckn,
         email, password,
         cardHolder = null, cardNumber = null, expiryMonth = null, expiryYear = null, cvv = null,
         proxyHost, proxyPort, proxyUsername, proxyPassword,
@@ -6004,6 +6259,14 @@ async function startBotAfterValidation(req, res, validatedData) {
         const divanMess = validateDivanPriorityAccounts(aList, bList, hasRealB, validatedData.prioritySale, validatedData.sicilNo, validatedData.priorityTicketCode);
         if (divanMess) {
             return res.status(400).json({ error: divanMess });
+        }
+        const gsPlusMess = validateGsPlusPremiumAccounts(aList, bList, hasRealB, validatedData.prioritySale, validatedData.priorityPhone);
+        if (gsPlusMess) {
+            return res.status(400).json({ error: gsPlusMess });
+        }
+        const gsParaMess = validateGsParaPriorityAccounts(aList, bList, hasRealB, validatedData.prioritySale, validatedData.identity, validatedData.priorityTckn);
+        if (gsParaMess) {
+            return res.status(400).json({ error: gsParaMess });
         }
     }
 
@@ -6419,7 +6682,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
         if (!pageA) throw new Error(`A_PAYMENT_PAGE_MISSING:${idx}`);
         const runtime = pairRuntimeByIndex.get(idx) || null;
-        const paymentIdentity = String(runtime?.idProfileA?.identity || idProfileA?.identity || identity || '').trim();
+        const paymentIdentity = String(runtime?.idProfileA?.identity || idProfileA?.identity || identity || priorityTckn || '').trim();
         const isOnPaymentUrl = () => {
             try { return /\/odeme(\b|\/|\?|#)/i.test(String(pageA.url() || '')); } catch { return false; }
         };
@@ -6580,7 +6843,9 @@ async function startBotAfterValidation(req, res, validatedData) {
             fanCardCode: aFanCard,
             identity: aIdentity,
             sicilNo: aSicilNo,
-            priorityTicketCode: aPriorityTicketCode
+            priorityTicketCode: aPriorityTicketCode,
+            priorityPhone,
+            priorityTckn
         });
         await ensureUrlContains(pageA, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
         await pageA.waitForSelector('.custom-select-box, .ticket-type-title, #custom_seat_button', { timeout: 12000 }).catch(() => {});
@@ -7047,7 +7312,13 @@ async function startBotAfterValidation(req, res, validatedData) {
         try { clearPassiveSessionWatch(); } catch {}
 
         // Prefer finalize payload sensitive fields (identity/card) over initial request values.
-        const identityFinal = (finMeta?.identity != null && String(finMeta.identity).trim()) ? String(finMeta.identity).trim() : (identity != null ? String(identity).trim() : null);
+        const identityFinal = (finMeta?.identity != null && String(finMeta.identity).trim())
+            ? String(finMeta.identity).trim()
+            : (() => {
+                const i = identity != null ? String(identity).trim() : '';
+                const p = priorityTckn != null ? String(priorityTckn).trim() : '';
+                return i || p || null;
+            })();
         const cardFinal = {
             cardHolder: (finMeta?.cardHolder != null && String(finMeta.cardHolder).trim()) ? String(finMeta.cardHolder).trim() : (cardHolder != null ? String(cardHolder).trim() : null),
             cardNumber: (finMeta?.cardNumber != null && String(finMeta.cardNumber).trim()) ? String(finMeta.cardNumber).trim() : (cardNumber != null ? String(cardNumber).trim() : null),
@@ -7123,7 +7394,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         await clickBuy(pageC, eventAddress);
         setStep('C.clickBuy.done');
 
-        await handlePrioritySaleModal(pageC, { prioritySale, fanCardCode, identity, sicilNo, priorityTicketCode });
+        await handlePrioritySaleModal(pageC, { prioritySale, fanCardCode, identity, sicilNo, priorityTicketCode, priorityPhone, priorityTckn });
 
         await ensureUrlContains(pageC, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
         try { await reloginIfRedirected(pageC, cAcc.email, cAcc.password); } catch {}
@@ -7964,7 +8235,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.clickBuy.done`);
                 audit('account_click_buy_done', { role: 'B', idx: i, email: acc.email, url: (() => { try { return page.url(); } catch { return null; } })() });
 
-                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode });
+                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
 
                 setStep(`${label}.postBuy.ensureUrl.start`);
                 await ensureUrlContains(page, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
@@ -7976,7 +8247,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.postBuy.reloginCheck.done`, { snap: await snapshotPage(page, `${label}.afterReloginCheck`) });
 
                 // Priority sale modal can appear after redirect/login on /koltuk-secim as well.
-                const ps2 = await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode });
+                const ps2 = await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
                 if (ps2) {
                     try { await ensureUrlContains(page, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 }); } catch {}
                 }
@@ -8129,7 +8400,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.clickBuy.done`);
                 audit('account_click_buy_done', { role: 'A', idx: i, email: acc.email, url: (() => { try { return page.url(); } catch { return null; } })() });
 
-                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode });
+                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
 
                 setStep(`${label}.postBuy.ensureUrl.start`);
                 await ensureUrlContains(page, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
@@ -8141,7 +8412,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.postBuy.reloginCheck.done`, { snap: await snapshotPage(page, `${label}.afterReloginCheck`) });
 
                 // Priority sale modal can appear after redirect/login on /koltuk-secim as well.
-                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode });
+                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
 
                 // Guard: session drift may leave us on / or /giris; ensure we are back on seat selection.
                 try {
@@ -9130,7 +9401,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         setStep('A.clickBuy.done');
         audit('account_click_buy_done', { role: 'A', idx: 0, email: emailA, url: (() => { try { return pageA.url(); } catch { return null; } })() });
 
-        await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity, sicilNo: a0?.sicilNo ?? sicilNo, priorityTicketCode: a0?.priorityTicketCode ?? priorityTicketCode });
+        await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity, sicilNo: a0?.sicilNo ?? sicilNo, priorityTicketCode: a0?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
         logger.info('A hesabı SATIN AL butonuna tıkladı');
 
         setStep('A.waitNavAfterBuy.start');
@@ -9156,7 +9427,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         const aRelog = await reloginIfRedirected(pageA, emailA, passwordA);
         setStep('A.postBuy.reloginCheck.done', { relogged: aRelog, snap: await snapshotPage(pageA, 'A.afterReloginCheck') });
 
-        const psA2 = await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity, sicilNo: a0?.sicilNo ?? sicilNo, priorityTicketCode: a0?.priorityTicketCode ?? priorityTicketCode });
+        const psA2 = await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity, sicilNo: a0?.sicilNo ?? sicilNo, priorityTicketCode: a0?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
         if (psA2) {
             try { await ensureUrlContains(pageA, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 }); } catch {}
         }
@@ -9723,7 +9994,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         setStep('B.clickBuy.done');
         logger.info('B hesabı SATIN AL butonuna tıkladı');
 
-        await handlePrioritySaleModal(pageB, { prioritySale, fanCardCode: b0?.fanCardCode ?? fanCardCode, identity: b0?.identity ?? identity, sicilNo: b0?.sicilNo ?? sicilNo, priorityTicketCode: b0?.priorityTicketCode ?? priorityTicketCode });
+        await handlePrioritySaleModal(pageB, { prioritySale, fanCardCode: b0?.fanCardCode ?? fanCardCode, identity: b0?.identity ?? identity, sicilNo: b0?.sicilNo ?? sicilNo, priorityTicketCode: b0?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
 
         setStep('B.waitNavAfterBuy.start');
         const bPreUrl = (() => { try { return pageB.url(); } catch { return null; } })();
@@ -9747,7 +10018,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         const bRelog = await reloginIfRedirected(pageB, emailB, passwordB);
         setStep('B.postBuy.reloginCheck.done', { relogged: bRelog, snap: await snapshotPage(pageB, 'B.afterReloginCheck') });
 
-        const psB2 = await handlePrioritySaleModal(pageB, { prioritySale, fanCardCode: b0?.fanCardCode ?? fanCardCode, identity: b0?.identity ?? identity, sicilNo: b0?.sicilNo ?? sicilNo, priorityTicketCode: b0?.priorityTicketCode ?? priorityTicketCode });
+        const psB2 = await handlePrioritySaleModal(pageB, { prioritySale, fanCardCode: b0?.fanCardCode ?? fanCardCode, identity: b0?.identity ?? identity, sicilNo: b0?.sicilNo ?? sicilNo, priorityTicketCode: b0?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
         if (psB2) {
             try { await ensureUrlContains(pageB, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 }); } catch {}
         }
@@ -10349,7 +10620,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                                 const toFan = (toRole === 'A') ? (idProfileA?.fanCardCode ?? fanCardCode) : (idProfileB?.fanCardCode ?? fanCardCode);
                                 const toSicil = (toRole === 'A') ? (idProfileA?.sicilNo ?? sicilNo) : (idProfileB?.sicilNo ?? sicilNo);
                                 const toPriorityTicket = (toRole === 'A') ? (idProfileA?.priorityTicketCode ?? priorityTicketCode) : (idProfileB?.priorityTicketCode ?? priorityTicketCode);
-                                await handlePrioritySaleModal(toPage, { prioritySale, fanCardCode: toFan, identity: toIdentity, sicilNo: toSicil, priorityTicketCode: toPriorityTicket });
+                                await handlePrioritySaleModal(toPage, { prioritySale, fanCardCode: toFan, identity: toIdentity, sicilNo: toSicil, priorityTicketCode: toPriorityTicket, priorityPhone, priorityTckn });
 
                                 await ensureUrlContains(toPage, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
                                 const u = (() => { try { return String(toPage.url()); } catch { return ''; } })();

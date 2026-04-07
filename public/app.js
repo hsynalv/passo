@@ -1111,19 +1111,30 @@ async function pollRunStatus(runId) {
 }
 
 const DIVAN_PRIORITY_CATEGORY_VALUE = 'Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler';
+const GS_PLUS_PREMIUM_CATEGORY_VALUE = 'GS PLUS Premium';
+const GSPARA_PRIORITY_CATEGORY_VALUE = 'GSPara Öncelik';
 
 function syncPrioritySaleUi() {
   const main = document.getElementById('prioritySaleSelect');
   const row = document.getElementById('prioritySaleCategoryRow');
   const divanDetails = document.getElementById('divanPriorityFieldsDetails');
+  const gsPlusDetails = document.getElementById('gsPlusPriorityFieldsDetails');
+  const gsParaDetails = document.getElementById('gsParaPriorityFieldsDetails');
   const cat = document.getElementById('prioritySaleCategorySelect');
   if (main && row) {
     row.hidden = String(main.value || '') !== 'on';
   }
-  if (divanDetails && main) {
-    const on = String(main.value || '') === 'on';
-    const divan = on && cat && String(cat.value || '') === DIVAN_PRIORITY_CATEGORY_VALUE;
+  const on = main && String(main.value || '') === 'on';
+  const catVal = cat ? String(cat.value || '') : '';
+  if (divanDetails) {
+    const divan = on && catVal === DIVAN_PRIORITY_CATEGORY_VALUE;
     divanDetails.hidden = !divan;
+  }
+  if (gsPlusDetails) {
+    gsPlusDetails.hidden = !(on && catVal === GS_PLUS_PREMIUM_CATEGORY_VALUE);
+  }
+  if (gsParaDetails) {
+    gsParaDetails.hidden = !(on && catVal === GSPARA_PRIORITY_CATEGORY_VALUE);
   }
 }
 
@@ -1188,6 +1199,18 @@ $('botForm').addEventListener('submit', async (e) => {
     }
     body.prioritySale = cat;
     delete body.prioritySaleCategory;
+    if (cat === GS_PLUS_PREMIUM_CATEGORY_VALUE) {
+      const ph = String(body.priorityPhone || '').replace(/\D/g, '');
+      if (ph.length < 10) {
+        validationIssues.push('GS PLUS Premium için geçerli cep telefonu gir (en az 10 hane).');
+      }
+    }
+    if (cat === GSPARA_PRIORITY_CATEGORY_VALUE) {
+      const tckn = String(body.priorityTckn || body.identity || '').replace(/\D/g, '');
+      if (!/^\d{11}$/.test(tckn)) {
+        validationIssues.push('GSPara Öncelik için yukarıdaki TCKN alanına 11 haneli kimlik numarası gir (veya alttaki ortak TCKN / her üyelikte TCKN olsun).');
+      }
+    }
   } else {
     body.prioritySale = false;
     delete body.prioritySaleCategory;

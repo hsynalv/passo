@@ -65,6 +65,10 @@ const botRequestSchema = z.object({
   identity: z.string().nullable().optional(),
   sicilNo: z.string().nullable().optional(),
   priorityTicketCode: z.string().nullable().optional(),
+  /** GS PLUS Premium öncelik modalı için cep telefonu (form yedeği). */
+  priorityPhone: z.string().nullable().optional(),
+  /** GSPara Öncelik modalı için TCKN (form; üyelikten bağımsız). */
+  priorityTckn: z.string().nullable().optional(),
   // Legacy single-account fields (backward compatible)
   email: z.string().email('Geçerli bir email adresi giriniz').optional(),
   password: z.string().min(1, 'Şifre zorunludur').optional(),
