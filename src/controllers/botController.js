@@ -602,8 +602,24 @@ function createCategoryChooser(selectedCategories, fallbackCategoryType, fallbac
         .filter(Boolean);
     let nextIndex = 0;
 
+    const peekNext = () => {
+        const chosen = normalized[nextIndex] || normalized[0] || null;
+        if (chosen) return chosen;
+        const fallbackType = String(fallbackCategoryType || '').trim();
+        const fallbackAlt = String(fallbackAlternativeCategory || '').trim();
+        if (!fallbackType && !fallbackAlt) return null;
+        return {
+            id: null,
+            label: fallbackType || fallbackAlt,
+            categoryType: fallbackType || null,
+            alternativeCategory: fallbackAlt || null,
+            selectionModeHint: String(defaultMode || 'scan').trim().toLowerCase()
+        };
+    };
+
     return {
         list: normalized,
+        peekNext,
         getRoamTexts: () => buildCategoryRoamTexts(normalized, fallbackCategoryType, fallbackAlternativeCategory),
         async choose(page, categoryType, alternativeCategory, selectionMode) {
             if (!normalized.length) {
@@ -8579,7 +8595,13 @@ async function startBotAfterValidation(req, res, validatedData) {
                     categorySelectionMode
                 );
                 let ticketQuantityPrimed = false;
-                setStep(`${label}.categoryBlock.select.start`, { categorySelectionMode });
+                const targetCategory = accountCategoryChooser.peekNext ? accountCategoryChooser.peekNext() : null;
+                setStep(`${label}.categoryBlock.select.start`, {
+                    categorySelectionMode,
+                    categoryLabel: targetCategory?.label || null,
+                    categoryType: targetCategory?.categoryType || resolvedCategoryType || null,
+                    alternativeCategory: targetCategory?.alternativeCategory || resolvedAlternativeCategory || null
+                });
                 const cbStart = Date.now();
                 const cbRes = await accountCategoryChooser.choose(page, resolvedCategoryType, resolvedAlternativeCategory, categorySelectionMode);
                 setStep(`${label}.categoryBlock.select.done`, { snap: await snapshotPage(page, `${label}.afterCategoryBlock`) });
@@ -9805,7 +9827,13 @@ async function startBotAfterValidation(req, res, validatedData) {
             categorySelectionMode
         );
         let ticketQuantityPrimedA = false;
-        setStep('A.categoryBlock.select.start', { categoryType: resolvedCategoryType, alternativeCategory: resolvedAlternativeCategory, categorySelectionMode });
+        const singleTargetCategoryA = singleCategoryChooserA.peekNext ? singleCategoryChooserA.peekNext() : null;
+        setStep('A.categoryBlock.select.start', {
+            categoryType: singleTargetCategoryA?.categoryType || resolvedCategoryType || null,
+            alternativeCategory: singleTargetCategoryA?.alternativeCategory || resolvedAlternativeCategory || null,
+            categoryLabel: singleTargetCategoryA?.label || null,
+            categorySelectionMode
+        });
         const cbResA = await singleCategoryChooserA.choose(pageA, resolvedCategoryType, resolvedAlternativeCategory, categorySelectionMode);
         if (cbResA && cbResA.svgBlockId) {
             try { catBlockA = { ...catBlockA, svgBlockId: cbResA.svgBlockId }; } catch {}

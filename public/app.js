@@ -857,8 +857,18 @@ function statusTextFromStep(entry, meta = {}) {
   if (!stepInfo) return null;
   const actor = formatStatusActor(stepInfo, meta);
   const label = compactStepStageLabel(stepInfo.stageKey);
+  const stageKey = String(stepInfo.stageKey || '').toLowerCase();
   if (!label) return actor ? `ℹ️ ${actor} · ${stepInfo.stageKey}` : `ℹ️ ${stepInfo.stageKey}`;
   const extras = [];
+  if (stageKey === 'categoryblock.select.start') {
+    const categoryLabel = String(meta?.categoryLabel || '').trim();
+    const categoryType = String(meta?.categoryType || '').trim();
+    const alternativeCategory = String(meta?.alternativeCategory || '').trim();
+    const categoryHint = categoryLabel || categoryType || alternativeCategory;
+    if (categoryHint) {
+      extras.push(`kategori: ${categoryHint}`);
+    }
+  }
   if (meta?.ok === false) extras.push('başarısız');
   else if (meta?.ok === true && /\.done$/i.test(stepInfo.stageKey)) extras.push('ok');
   if (meta?.attempt != null) extras.push(`deneme ${meta.attempt}`);
