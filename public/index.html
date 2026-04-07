@@ -161,6 +161,9 @@
                   <input name="alternativeCategory" type="text" placeholder="Kale Arkası" />
                 </div>
               </div>
+              <div class="setupStartActions">
+                <button type="submit" id="btnStart">Botu Başlat</button>
+              </div>
             </section>
 
             <section class="card stepCard">
@@ -235,51 +238,8 @@
               </div>
             </section>
 
-            <section class="card stepCard">
-              <h2>Proxy Ayarları</h2>
-              <div class="hint" style="margin-top:0">İstersen bu run için manuel proxy girebilirsin. Boş bırakırsan Proxy Havuzu'ndan otomatik seçim yapılır.</div>
-              <div class="row2" style="margin-top:10px">
-                <div class="row">
-                  <label>Proxy Host</label>
-                  <input name="proxyHost" type="text" placeholder="proxy.example.com veya http://1.2.3.4" />
-                </div>
-                <div class="row">
-                  <label>Proxy Port</label>
-                  <input name="proxyPort" type="text" placeholder="8080" />
-                </div>
-              </div>
-              <div class="row2">
-                <div class="row">
-                  <label>Proxy Username (opsiyonel)</label>
-                  <input name="proxyUsername" type="text" placeholder="kullanici" />
-                </div>
-                <div class="row">
-                  <label>Proxy Password (opsiyonel)</label>
-                  <input name="proxyPassword" type="password" placeholder="sifre" />
-                </div>
-              </div>
-            </section>
-
-            <section class="card stepCard">
-              <h2>Öncelikli Satış Bilgileri</h2>
-              <div class="hint" style="margin-top:0">Bu alanlar opsiyoneldir. Gerekliyse start isteğine dahil edilir.</div>
-              <div class="row2" style="margin-top:10px">
-                <div class="row">
-                  <label>TCKN (identity)</label>
-                  <input name="identity" type="text" inputmode="numeric" placeholder="12345678901" />
-                </div>
-                <div class="row">
-                  <label>Fan Card</label>
-                  <input name="fanCardCode" type="text" placeholder="" />
-                </div>
-              </div>
-            </section>
-
           </div>
 
-          <div class="stepPanelActions">
-            <button type="submit" id="btnStart">Start (Async)</button>
-          </div>
         </section>
 
         <section class="stepPanel" id="stepRunPanel" data-step-panel="run" hidden>
