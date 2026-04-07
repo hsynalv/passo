@@ -114,6 +114,15 @@ button:active{transform:translateY(1px)}
 .managerGridContent{grid-template-columns:repeat(2,minmax(0,1fr))}
 .managerSection{border:1px solid rgba(27,42,75,0.75);border-radius:10px;padding:10px;background:rgba(255,255,255,0.02)}
 .managerSection h3{margin:0 0 8px 0;font-size:12px;color:#dbeafe}
+.proxyFormSection .row{display:grid;grid-template-columns:92px minmax(0,1fr);align-items:center;gap:10px}
+.proxyFormSection .row2{gap:10px}
+.proxyFormSection .row label{margin:0}
+.proxyFormSection .row .chk{grid-column:1 / -1;justify-self:start}
+.proxyFormSection input,
+.proxyFormSection select,
+.proxyImportSection select,
+.proxyImportSection textarea{width:100%;min-width:0;box-sizing:border-box}
+.proxyImportSection textarea{display:block;resize:vertical}
 .managerFormStack{display:flex;flex-direction:column;gap:10px;margin-top:10px}
 .managerFormStack .row{margin:0}
 .managerFormStack input,
@@ -259,6 +268,7 @@ input#teamSearchInput{min-height:38px}
 @media (min-width:900px){
   .managerSection .row2{gap:12px}
   .managerSection .row{margin-bottom:10px}
+  .proxyFormSection .row2 .row{grid-template-columns:70px minmax(0,1fr)}
 }
 @media (max-width:1200px){
   .managerWorkspace{grid-template-columns:1fr}
@@ -267,4 +277,8 @@ input#teamSearchInput{min-height:38px}
   .recordsSummary{grid-template-columns:repeat(2,minmax(0,1fr))}
   .recordsLayout{grid-template-columns:1fr}
   .recordDetailGrid{grid-template-columns:1fr}
+}
+@media (max-width:640px){
+  .proxyFormSection .row,
+  .proxyFormSection .row2 .row{grid-template-columns:1fr}
 }

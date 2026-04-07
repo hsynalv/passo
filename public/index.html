@@ -568,7 +568,7 @@
       <div class="modalBody">
         <div class="managerWorkspace">
           <aside class="managerSidebar">
-            <section class="managerSection">
+            <section class="managerSection proxyFormSection">
               <h3>Proxy Formu</h3>
               <input id="proxyEditId" type="hidden" />
               <div class="row">
@@ -590,15 +590,13 @@
                   </select>
                 </div>
               </div>
-              <div class="row2">
-                <div class="row">
-                  <label>Username</label>
-                  <input id="proxyUsernameInput" type="text" placeholder="opsiyonel" />
-                </div>
-                <div class="row">
-                  <label>Password</label>
-                  <input id="proxyPasswordInput" type="password" placeholder="opsiyonel" />
-                </div>
+              <div class="row">
+                <label>Username</label>
+                <input id="proxyUsernameInput" type="text" placeholder="opsiyonel" />
+              </div>
+              <div class="row">
+                <label>Password</label>
+                <input id="proxyPasswordInput" type="password" placeholder="opsiyonel" />
               </div>
               <div class="row">
                 <label class="chk"><input id="proxyActiveInput" type="checkbox" checked /> Aktif</label>
@@ -610,7 +608,7 @@
               </div>
             </section>
 
-            <section class="managerSection">
+            <section class="managerSection proxyImportSection">
               <h3>Toplu Import</h3>
               <div class="hint" style="margin-top:0">Satır formatı: <code>host port username password</code> veya <code>host:port:user:pass</code>. Protocol seçimi default uygulanır.</div>
               <div class="row">
