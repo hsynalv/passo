@@ -945,6 +945,20 @@ function isStatusMessage(entry, line) {
     return id ? `🗺️ SVG blok tıklandı: ${id}` : '🗺️ SVG blok tıklandı';
   }
 
+  if (msg.includes('categoryblock:selected_category_candidate')) {
+    const label = String(meta?.label || meta?.categoryType || meta?.alternativeCategory || '').trim() || '—';
+    const total = Number.isFinite(Number(meta?.total)) ? Number(meta.total) : null;
+    const nextIndex = Number.isFinite(Number(meta?.nextIndex)) ? Number(meta.nextIndex) : null;
+    const currentIndex = (total && nextIndex != null) ? (((nextIndex + total - 1) % total) + 1) : null;
+    const ordinal = (currentIndex && total) ? ` (${currentIndex}/${total})` : '';
+    return `🎯 Aranan kategori: ${label}${ordinal}`;
+  }
+
+  if (msg.includes('categoryblock:svg_targets')) {
+    const desired = Array.isArray(meta?.desiredTexts) ? meta.desiredTexts.filter(Boolean).join(', ') : '';
+    return desired ? `🔎 SVG hedef kategori(ler): ${desired}` : '🔎 SVG hedef kategori aranıyor';
+  }
+
   // Only show "seat selected" on strong/confirmed seat signals.
   const seatConfirmed =
     eventKey === 'a_hold_acquired' ||
@@ -997,6 +1011,17 @@ function isStatusMessage(entry, line) {
   }
   if (msg.includes('seatpick:a:diag') || msg.includes('seatpick:b:diag')) {
     return null; // too noisy for customer status panel
+  }
+
+  if (msg.includes('seatpick:a:not_selected_after_click') || msg.includes('seatpick:b:not_selected_after_click')) {
+    const miss = Number.isFinite(Number(meta?.lockedMiss)) ? Number(meta.lockedMiss) : null;
+    const seatId = meta?.seatId ? ` · seat ${meta.seatId}` : '';
+    const missText = miss != null ? ` (${miss}/3)` : '';
+    return `🧪 Koltuk ekleme denemesi başarısız${missText}${seatId}`;
+  }
+  if (msg.includes('seatpick:a:lock_reset') || msg.includes('seatpick:b:lock_reset')) {
+    const seatId = meta?.seatId ? ` · seat ${meta.seatId}` : '';
+    return `♻️ Koltuk adayı sıfırlandı${seatId}`;
   }
 
   if (msg.includes('finalize') || msg.includes('payment') || msg.includes('ödeme')) return `💳 ${rawMsg}`;
