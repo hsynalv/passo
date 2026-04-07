@@ -2826,6 +2826,18 @@ async function launchAndLogin(options) {
         currentUrl: (() => { try { return page.url(); } catch { return null; } })()
     });
 
+    const currentLoginUrl = (() => { try { return String(page.url() || ''); } catch { return ''; } })();
+    const isChromeErrorPage = /^chrome-error:\/\//i.test(currentLoginUrl);
+    if (!gotoRes?.ok || isChromeErrorPage) {
+        logger.warn('launchAndLogin: login sayfasına erişilemedi, akış fail ediliyor', {
+            email,
+            goto: gotoRes,
+            currentUrl: currentLoginUrl,
+            isChromeErrorPage
+        });
+        throw new Error(`Login sayfasina erisilemedi (${isChromeErrorPage ? 'chrome_error' : 'goto_failed'})`);
+    }
+
     try {
         logger.info('launchAndLogin: login document response', { email, doc: lastLoginDoc });
     } catch {}
@@ -2971,6 +2983,9 @@ async function launchAndLogin(options) {
     let loginCtx = await ensureLoginFormWithReload();
     if (!loginCtx) {
         const u = (() => { try { return page.url(); } catch { return ''; } })();
+        if (/^chrome-error:\/\//i.test(String(u || ''))) {
+            throw new Error('Login sayfasina erisilemedi (chrome_error)');
+        }
         if (!/\/giris(\?|$)/i.test(u)) {
             logger.warn('launchAndLogin: login formu bulunamadı, zaten girişli/redirect kabul ediliyor', { email, url: u });
             return { browser, page };
