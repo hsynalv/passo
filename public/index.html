@@ -85,7 +85,11 @@
                   <input name="ticketCount" type="number" min="1" max="10" value="1" />
                   <div class="hint">Hesap başına sepete atılacak bilet sayısı. Varsayılan 1.</div>
                 </div>
-                <div class="row"></div>
+                <div class="row" style="justify-content:flex-end">
+                  <label>Proxy Ayarı</label>
+                  <label class="chk"><input id="useProxyPoolInput" name="useProxyPool" type="checkbox" checked /> Proxy kullan</label>
+                  <div class="hint">Açıkken Proxy Havuzu kullanılır, kapalıysa proxysiz çalışır.</div>
+                </div>
               </div>
 
               <div class="row2">
@@ -254,8 +258,43 @@
             </div>
           </div>
 
-          <div class="stepGrid stepGridRunTop">
-            <section class="card stepCard">
+          <div class="stepGrid stepGridRunBottom">
+            <section class="card logs">
+              <div class="logsHeader">
+                <h2>Durum & Bilgilendirme</h2>
+                <div class="logsControls">
+                  <button type="button" id="btnKillSessions" class="btnDanger" style="margin-right:10px;padding:4px 8px;font-size:12px">Aktif Oturumları Kapat</button>
+                  <button type="button" id="btnClear" class="btnMuted">Clear Logs</button>
+                  <label class="chk"><input id="autoScrollStatus" type="checkbox" checked /> auto-scroll</label>
+                </div>
+              </div>
+              <pre id="statusBox" class="logBox statusBox"></pre>
+
+              <div class="logsHeader" style="margin-top:12px;border-top:1px dashed var(--border);padding-top:8px">
+                <h2>Tüm Loglar</h2>
+                <div class="logsControls">
+                  <input id="logFilter" type="text" placeholder="Filter (text)" />
+                  <label class="chk"><input id="autoScroll" type="checkbox" checked /> auto-scroll</label>
+                </div>
+              </div>
+              <pre id="logBox" class="logBox"></pre>
+            </section>
+
+            <section class="card stepCard pairDashboardCard">
+              <div class="logsHeader">
+                <h2>Eşleşmeler & bilet tutucu</h2>
+                <div id="pairDashboardMeta" class="pairDashMeta muted"></div>
+              </div>
+              <div class="pairDashboard" id="pairDashboard">
+                <div id="pairDashboardBody" class="pairDashBody">
+                  <div class="pairDashEmpty">Run başlatıldığında eşleşmeler burada canlı güncellenir.</div>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <div class="stepGrid stepGridRunC">
+            <section class="card stepCard" id="cFlowCard" hidden>
               <div class="cFlowLayout" style="margin-top:10px">
                 <div class="cFlowMain">
                   <h2>C Hesabi Akisi</h2>
@@ -311,41 +350,6 @@
                     <label>CVV</label>
                     <input id="finCvv" type="password" inputmode="numeric" placeholder="***" />
                   </div>
-                </div>
-              </div>
-            </section>
-          </div>
-
-          <div class="stepGrid stepGridRunBottom">
-            <section class="card logs">
-              <div class="logsHeader">
-                <h2>Durum & Bilgilendirme</h2>
-                <div class="logsControls">
-                  <button type="button" id="btnKillSessions" class="btnDanger" style="margin-right:10px;padding:4px 8px;font-size:12px">Aktif Oturumları Kapat</button>
-                  <button type="button" id="btnClear" class="btnMuted">Clear Logs</button>
-                  <label class="chk"><input id="autoScrollStatus" type="checkbox" checked /> auto-scroll</label>
-                </div>
-              </div>
-              <pre id="statusBox" class="logBox statusBox"></pre>
-
-              <div class="logsHeader" style="margin-top:12px;border-top:1px dashed var(--border);padding-top:8px">
-                <h2>Tüm Loglar</h2>
-                <div class="logsControls">
-                  <input id="logFilter" type="text" placeholder="Filter (text)" />
-                  <label class="chk"><input id="autoScroll" type="checkbox" checked /> auto-scroll</label>
-                </div>
-              </div>
-              <pre id="logBox" class="logBox"></pre>
-            </section>
-
-            <section class="card stepCard pairDashboardCard">
-              <div class="logsHeader">
-                <h2>Eşleşmeler & bilet tutucu</h2>
-                <div id="pairDashboardMeta" class="pairDashMeta muted"></div>
-              </div>
-              <div class="pairDashboard" id="pairDashboard">
-                <div id="pairDashboardBody" class="pairDashBody">
-                  <div class="pairDashEmpty">Run başlatıldığında eşleşmeler burada canlı güncellenir.</div>
                 </div>
               </div>
             </section>

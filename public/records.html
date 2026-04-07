@@ -20,28 +20,24 @@
     </header>
 
     <section class="card recordsToolbar">
-      <div class="row2">
-        <div class="row">
+      <div class="recordsFilterGrid">
+        <div class="row recordsField recordsFieldWide">
           <label>Arama</label>
           <input id="filterQuery" type="text" placeholder="takim, hesap, seat id, blok..." />
         </div>
-        <div class="row">
+        <div class="row recordsField">
           <label>Takim</label>
           <input id="filterTeam" type="text" placeholder="Galatasaray" />
         </div>
-      </div>
-      <div class="row2">
-        <div class="row">
+        <div class="row recordsField recordsFieldWide">
           <label>Event URL</label>
           <input id="filterEventUrl" type="text" placeholder="https://www.passo.com.tr/..." />
         </div>
-        <div class="row">
+        <div class="row recordsField">
           <label>Hesap (Ana/Tutucu/C)</label>
           <input id="filterAccountEmail" type="text" placeholder="hesap@mail.com" />
         </div>
-      </div>
-      <div class="row2">
-        <div class="row">
+        <div class="row recordsField">
           <label>Odeme Kaynagi</label>
           <select id="filterPaymentSource">
             <option value="">Hepsi</option>
@@ -49,7 +45,7 @@
             <option value="C">C</option>
           </select>
         </div>
-        <div class="row">
+        <div class="row recordsField">
           <label>Odeme Durumu</label>
           <select id="filterPaymentState">
             <option value="">Hepsi</option>
@@ -61,7 +57,7 @@
             <option value="failed">failed</option>
           </select>
         </div>
-        <div class="row">
+        <div class="row recordsField">
           <label>Kayit Durumu</label>
           <select id="filterRecordStatus">
             <option value="">Hepsi</option>
@@ -74,13 +70,11 @@
             <option value="failed">failed</option>
           </select>
         </div>
-      </div>
-      <div class="row2">
-        <div class="row">
+        <div class="row recordsField">
           <label>Baslangic Tarihi</label>
           <input id="filterFrom" type="datetime-local" />
         </div>
-        <div class="row">
+        <div class="row recordsField">
           <label>Bitis Tarihi</label>
           <input id="filterTo" type="datetime-local" />
         </div>

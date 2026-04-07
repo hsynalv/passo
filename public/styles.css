@@ -219,25 +219,34 @@ select[multiple]{min-height:140px;line-height:1.35;padding:8px}
 .credentialInlineWarn{font-size:9px;line-height:1.25;opacity:.8}
 @keyframes pairCardFlash{0%{transform:translateY(0);box-shadow:0 0 0 0 rgba(250,204,21,0)}25%{transform:translateY(-2px);box-shadow:0 0 0 1px rgba(250,204,21,0.45),0 0 26px rgba(250,204,21,0.18)}100%{transform:translateY(0);box-shadow:0 0 0 0 rgba(250,204,21,0)}}
 .recordsToolbar{margin-bottom:12px}
+.recordsFilterGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.recordsField{margin-bottom:0!important}
+.recordsFieldWide{grid-column:span 2}
+.recordsToolbar .actions{margin-top:12px;justify-content:flex-end}
+.recordsToolbar label{font-size:11px;color:#c7d2fe}
+.recordsToolbar input,.recordsToolbar select{width:100%;min-width:0}
 .recordsSummary{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:12px}
 .summaryCard{display:flex;flex-direction:column;gap:4px;padding:12px 14px;border:1px solid rgba(27,42,75,0.75);border-radius:12px;background:rgba(255,255,255,0.03)}
 .summaryCard strong{font-size:18px;color:#dbeafe}
 .summaryCard span{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
 .recordsLayout{display:grid;grid-template-columns:minmax(420px,0.95fr) minmax(420px,1.05fr);gap:12px;align-items:start}
 .recordsListPanel,.recordsDetailPanel{min-width:0}
-.recordsListBody{display:flex;flex-direction:column;gap:8px;max-height:calc(100vh - 300px);overflow:auto}
-.recordRow{display:flex;flex-direction:column;gap:6px;width:100%;text-align:left;padding:10px 12px;border:1px solid rgba(27,42,75,0.72);border-radius:12px;background:rgba(255,255,255,0.03);color:var(--text)}
+.recordsListBody{display:flex;flex-direction:column;gap:10px;max-height:calc(100vh - 300px);overflow:auto;padding-right:4px}
+.recordRow{display:flex;flex-direction:column;align-items:stretch;gap:8px;width:100%;text-align:left;padding:12px 14px;border:1px solid rgba(27,42,75,0.72);border-radius:12px;background:rgba(255,255,255,0.03);color:var(--text);line-height:1.35;overflow:hidden}
 .recordRow:hover{background:rgba(96,165,250,0.07);border-color:rgba(96,165,250,0.45)}
 .recordRow.active{border-color:rgba(94,234,212,0.48);box-shadow:0 0 0 1px rgba(94,234,212,0.14)}
 .recordRowHead{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
-.recordRowHead strong{font-size:12px;color:#dbeafe}
+.recordRowHead strong{font-size:14px;line-height:1.25;color:#dbeafe;word-break:break-word}
 .recordBadgeRow{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px}
 .recordBadge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;border:1px solid rgba(138,160,194,0.24);background:rgba(255,255,255,0.05);font-size:10px;color:#dbeafe}
 .recordBadge.ok{border-color:rgba(94,234,212,0.34);color:var(--accent);background:rgba(94,234,212,0.08)}
 .recordBadge.warn{border-color:rgba(251,191,36,0.32);color:#fcd34d;background:rgba(251,191,36,0.08)}
 .recordBadge.danger{border-color:rgba(251,113,133,0.35);color:var(--danger);background:rgba(251,113,133,0.08)}
-.recordRowMeta{font-size:10px;color:var(--muted);line-height:1.45;word-break:break-all}
-.recordRowSeat{font-size:11px;color:#dbeafe;font-weight:700}
+.recordRowMeta{font-size:11px;color:var(--muted);line-height:1.45;word-break:break-word;overflow-wrap:anywhere}
+.recordRowUrl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.recordRowInfo{font-size:11px}
+.recordRowTiming{font-size:10px;opacity:.9}
+.recordRowSeat{font-size:13px;line-height:1.3;color:#dbeafe;font-weight:700;word-break:break-word}
 .recordDetailBody{max-height:calc(100vh - 300px);overflow:auto}
 .recordDetailGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
 .recordDetailBlock{border:1px solid rgba(27,42,75,0.75);border-radius:10px;padding:10px;background:rgba(255,255,255,0.02)}
@@ -276,11 +285,18 @@ input#teamSearchInput{min-height:38px}
   .managerWorkspace{grid-template-columns:1fr}
   .managerGridContent{grid-template-columns:1fr}
   .stepGridRunTop,.stepGridRunBottom{grid-template-columns:1fr}
+  .recordsFilterGrid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .recordsFieldWide{grid-column:span 2}
   .recordsSummary{grid-template-columns:repeat(2,minmax(0,1fr))}
   .recordsLayout{grid-template-columns:1fr}
   .recordDetailGrid{grid-template-columns:1fr}
+  .recordRowHead{flex-direction:column;align-items:flex-start}
+  .recordBadgeRow{justify-content:flex-start}
 }
 @media (max-width:640px){
+  .recordsFilterGrid{grid-template-columns:1fr}
+  .recordsFieldWide{grid-column:span 1}
+  .recordsToolbar .actions{justify-content:flex-start}
   .proxyFormSection .row,
   .proxyFormSection .row2 .row{grid-template-columns:1fr}
 }

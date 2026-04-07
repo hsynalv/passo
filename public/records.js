@@ -150,6 +150,8 @@ function renderList() {
     const active = record.id === state.selectedId ? ' active' : '';
     const seatLabel = record?.seat?.combined || [record?.seat?.row, record?.seat?.seatNumber].filter(Boolean).join(' / ') || record?.seat?.seatId || '—';
     const hasFailureLogs = Number(record.sessionLogCount || 0) > 0;
+    const holderText = record.holderRole === 'A' ? 'Ana Hesap' : record.holderRole === 'B' ? 'Tutucu Hesap' : record.holderRole || '—';
+    const paymentOwnerText = record.paymentOwnerRole === 'A' ? 'Ana Hesap' : record.paymentOwnerRole === 'B' ? 'Tutucu Hesap' : record.paymentOwnerRole || '—';
     return `<button type="button" class="recordRow${active}" data-record-id="${escapeHtml(record.id)}">
       <div class="recordRowHead">
         <strong>${escapeHtml(record.teamName || 'Takim yok')}</strong>
@@ -159,11 +161,11 @@ function renderList() {
           ${hasFailureLogs ? badge(`Log: ${record.sessionLogCount}`, 'danger') : ''}
         </div>
       </div>
-      <div class="recordRowMeta">${escapeHtml(record.eventUrl || '—')}</div>
-      <div class="recordRowMeta">Akis #${escapeHtml(record.pairIndex || 1)} · Tutucu: ${escapeHtml(record.holderRole === 'A' ? 'Ana Hesap' : record.holderRole === 'B' ? 'Tutucu Hesap' : record.holderRole || '—')} · Odeme sahibi: ${escapeHtml(record.paymentOwnerRole === 'A' ? 'Ana Hesap' : record.paymentOwnerRole === 'B' ? 'Tutucu Hesap' : record.paymentOwnerRole || '—')}</div>
-      <div class="recordRowMeta">Ana: ${escapeHtml(record.aAccountEmail || '—')} · Tutucu: ${escapeHtml(record.bAccountEmail || '—')} · C: ${escapeHtml(record.cAccountEmail || '—')}</div>
+      <div class="recordRowMeta recordRowUrl">${escapeHtml(record.eventUrl || '—')}</div>
+      <div class="recordRowMeta recordRowInfo">Akis #${escapeHtml(record.pairIndex || 1)} · Tutucu: ${escapeHtml(holderText)} · Odeme sahibi: ${escapeHtml(paymentOwnerText)}</div>
+      <div class="recordRowMeta recordRowInfo">Ana: ${escapeHtml(record.aAccountEmail || '—')} · Tutucu: ${escapeHtml(record.bAccountEmail || '—')} · C: ${escapeHtml(record.cAccountEmail || '—')}</div>
       <div class="recordRowSeat">${escapeHtml(seatLabel)}</div>
-      <div class="recordRowMeta">Basket: ${escapeHtml(formatDateTime(record?.basketState?.addedAt))} · Guncel: ${escapeHtml(formatDateTime(record.updatedAt || record.createdAt))}</div>
+      <div class="recordRowMeta recordRowTiming">Basket: ${escapeHtml(formatDateTime(record?.basketState?.addedAt))} · Guncel: ${escapeHtml(formatDateTime(record.updatedAt || record.createdAt))}</div>
     </button>`;
   }).join('');
 

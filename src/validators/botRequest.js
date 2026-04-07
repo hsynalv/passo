@@ -40,6 +40,12 @@ const botRequestSchema = z.object({
       return Math.min(Math.floor(n), 10);
     }),
   transferTargetEmail: z.string().email('Geçerli bir transfer email adresi giriniz').optional(),
+  useProxyPool: z.union([z.boolean(), z.string()]).optional().transform((val) => {
+    if (val === undefined || val === null || val === '') return true;
+    if (val === true || val === 'true' || val === 1 || val === '1' || val === 'on') return true;
+    if (val === false || val === 'false' || val === 0 || val === '0' || val === 'off') return false;
+    return true;
+  }),
   /** Çoklu A/B eşleşmelerinde C finalize hangi çifti kullansın (1 = A1↔B1, 2 = A2↔B2, …). */
   cTransferPairIndex: z
     .union([z.number(), z.string()])

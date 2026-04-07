@@ -6185,6 +6185,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         transferTargetEmail,
         ticketCount = 1,
         extendWhenRemainingSecondsBelow,
+        useProxyPool = true,
         prioritySale, fanCardCode, identity, sicilNo, priorityTicketCode, priorityPhone, priorityTckn,
         email, password,
         cardHolder = null, cardNumber = null, expiryMonth = null, expiryYear = null, cvv = null,
@@ -6336,6 +6337,7 @@ async function startBotAfterValidation(req, res, validatedData) {
             proxyPassword
         }
         : null;
+    const shouldUseProxyPool = useProxyPool !== false;
 
     const launchAndLoginWithManagedProxy = async (baseOpts, meta = {}) => {
         const opts = baseOpts && typeof baseOpts === 'object' ? { ...baseOpts } : {};
@@ -6347,7 +6349,7 @@ async function startBotAfterValidation(req, res, validatedData) {
 
         if (manualProxyLaunchConfig) {
             Object.assign(opts, manualProxyLaunchConfig);
-        } else {
+        } else if (shouldUseProxyPool) {
             try {
                 activeProxy = await proxyRepo.acquireNextActiveProxy();
             } catch (e) {
@@ -6371,6 +6373,14 @@ async function startBotAfterValidation(req, res, validatedData) {
                 proxyId: activeProxy.id,
                 proxy: `${activeProxy.host}:${activeProxy.port}`,
                 protocol: activeProxy.protocol
+            });
+        } else {
+            audit('proxy_skipped', {
+                runId,
+                role,
+                idx,
+                email: emailForLog,
+                reason: 'useProxyPool=false'
             });
         }
 

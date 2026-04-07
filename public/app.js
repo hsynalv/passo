@@ -14,6 +14,7 @@ const stepPanels = Array.from(document.querySelectorAll('[data-step-panel]'));
 const setupIssuesCard = $('setupIssuesCard');
 const setupIssuesList = $('setupIssuesList');
 const setupPaymentCard = $('setupPaymentCard');
+const cFlowCard = $('cFlowCard');
 const finNeedsPaymentEl = $('finNeedsPayment');
 const finPaymentFieldsEl = $('finPaymentFields');
 
@@ -29,6 +30,21 @@ function entryEventKey(entry, line) {
   const metaEvent = String(entry?.meta?.event || '').trim().toLowerCase();
   if (metaEvent) return metaEvent;
   return String(entry?.message || line || '').trim().toLowerCase();
+}
+
+function syncCFlowCardVisibility(forceTransferCount = null) {
+  if (!cFlowCard) return;
+  const catalogApi = window.passobotCatalog || null;
+  const transferCount = forceTransferCount != null
+    ? Math.max(0, Number(forceTransferCount) || 0)
+    : (catalogApi && typeof catalogApi.getSelectedTransferCredentialIds === 'function'
+      ? catalogApi.getSelectedTransferCredentialIds().length
+      : 0);
+  cFlowCard.hidden = transferCount < 1;
+  if (cFlowCard.hidden && finNeedsPaymentEl) {
+    finNeedsPaymentEl.checked = false;
+    syncFinalizePaymentUi();
+  }
 }
 
 function showToast(title, msg, type = 'success', durationMs = 4500) {
@@ -1143,8 +1159,10 @@ document.getElementById('prioritySaleCategorySelect')?.addEventListener('change'
 syncPrioritySaleUi();
 window.addEventListener('passobot:payer-selection-changed', (event) => {
   syncSetupPaymentCard(event?.detail?.payerCount ?? null);
+  syncCFlowCardVisibility(event?.detail?.transferCount ?? null);
 });
 syncSetupPaymentCard();
+syncCFlowCardVisibility();
 bindPaymentInputMasks();
 syncFinalizePaymentUi();
 finNeedsPaymentEl?.addEventListener('change', syncFinalizePaymentUi);
@@ -1155,6 +1173,7 @@ $('botForm').addEventListener('submit', async (e) => {
 
   const fd = new FormData(e.target);
   const body = Object.fromEntries(fd.entries());
+  body.useProxyPool = !!$('useProxyPoolInput')?.checked;
   const catalogApi = window.passobotCatalog || null;
   const selectedTeam = catalogApi && typeof catalogApi.getSelectedTeam === 'function'
     ? catalogApi.getSelectedTeam()
