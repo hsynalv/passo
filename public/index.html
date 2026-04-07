@@ -18,6 +18,7 @@
         <a href="/records.html" class="btnGhost navGhost">Kayit Ekrani</a>
         <button type="button" id="btnOpenSettings" class="btnGhost">Bilet alım ayarları</button>
         <button type="button" id="btnOpenCatalogManager" class="btnGhost">Takım Havuzu Yönet</button>
+        <button type="button" id="btnOpenProxyManager" class="btnGhost">Proxy Havuzu</button>
         <div class="status" id="connStatus">Disconnected</div>
       </div>
     </header>
@@ -236,7 +237,7 @@
 
             <section class="card stepCard">
               <h2>Proxy Ayarları</h2>
-              <div class="hint" style="margin-top:0">İstersen botu proxy ile başlatabilirsin. Boş bırakırsan doğrudan bağlantı kullanılır.</div>
+              <div class="hint" style="margin-top:0">İstersen bu run için manuel proxy girebilirsin. Boş bırakırsan Proxy Havuzu'ndan otomatik seçim yapılır.</div>
               <div class="row2" style="margin-top:10px">
                 <div class="row">
                   <label>Proxy Host</label>
@@ -556,7 +557,106 @@
     </div>
   </div>
 
+  <div id="proxyModal" class="modalRoot" hidden>
+    <div class="modalBackdrop" id="proxyModalBackdrop"></div>
+    <div class="modalDialog modalDialogWide" role="dialog" aria-modal="true" aria-labelledby="proxyModalTitle">
+      <div class="modalHead">
+        <h2 id="proxyModalTitle">Proxy Havuzu Yönetimi</h2>
+        <button type="button" class="modalClose" id="btnCloseProxyModal" aria-label="Kapat">×</button>
+      </div>
+      <p class="modalIntro">Webshare proxylerini buradan yönetebilirsin. Start formunda manuel proxy boşsa bot giriş aşamasında bu havuzdan otomatik seçer; aynı proxy ile 3 login hatasında 24 saat blacklist'e alınır.</p>
+      <div class="modalBody">
+        <div class="managerWorkspace">
+          <aside class="managerSidebar">
+            <section class="managerSection">
+              <h3>Proxy Formu</h3>
+              <input id="proxyEditId" type="hidden" />
+              <div class="row">
+                <label>Host</label>
+                <input id="proxyHostInput" type="text" placeholder="142.111.67.146" />
+              </div>
+              <div class="row2">
+                <div class="row">
+                  <label>Port</label>
+                  <input id="proxyPortInput" type="number" min="1" max="65535" placeholder="5611" />
+                </div>
+                <div class="row">
+                  <label>Protocol</label>
+                  <select id="proxyProtocolInput">
+                    <option value="socks5" selected>socks5</option>
+                    <option value="socks4">socks4</option>
+                    <option value="http">http</option>
+                    <option value="https">https</option>
+                  </select>
+                </div>
+              </div>
+              <div class="row2">
+                <div class="row">
+                  <label>Username</label>
+                  <input id="proxyUsernameInput" type="text" placeholder="opsiyonel" />
+                </div>
+                <div class="row">
+                  <label>Password</label>
+                  <input id="proxyPasswordInput" type="password" placeholder="opsiyonel" />
+                </div>
+              </div>
+              <div class="row">
+                <label class="chk"><input id="proxyActiveInput" type="checkbox" checked /> Aktif</label>
+              </div>
+              <div class="actions">
+                <button type="button" id="btnSaveProxy">Kaydet</button>
+                <button type="button" id="btnDeleteProxy" class="btnDanger">Sil</button>
+                <button type="button" id="btnResetProxy" class="btnMuted">Temizle</button>
+              </div>
+            </section>
+
+            <section class="managerSection">
+              <h3>Toplu Import</h3>
+              <div class="hint" style="margin-top:0">Satır formatı: <code>host port username password</code> veya <code>host:port:user:pass</code>. Protocol seçimi default uygulanır.</div>
+              <div class="row">
+                <label>Default Protocol</label>
+                <select id="proxyImportProtocolInput">
+                  <option value="socks5" selected>socks5</option>
+                  <option value="socks4">socks4</option>
+                  <option value="http">http</option>
+                  <option value="https">https</option>
+                </select>
+              </div>
+              <div class="row">
+                <label>Proxy Satırları</label>
+                <textarea id="proxyBulkInput" rows="8" placeholder="31.59.20.176 6754 user pass"></textarea>
+              </div>
+              <div class="actions">
+                <button type="button" id="btnImportProxyBulk">Toplu Ekle</button>
+              </div>
+            </section>
+          </aside>
+
+          <div class="managerContent" id="proxyManagerContent">
+            <div class="logsHeader" style="margin-bottom:8px">
+              <h3>Proxy Listesi</h3>
+              <div class="logsControls">
+                <button type="button" id="btnProxyTabActive" class="btnMuted">Aktif</button>
+                <button type="button" id="btnProxyTabBlacklisted" class="btnMuted">Blacklisted</button>
+                <button type="button" id="btnRefreshProxies" class="btnMuted">Yenile</button>
+              </div>
+            </div>
+            <div id="proxySummary" class="managerSummary"><strong>0 proxy</strong><span>Yükleniyor...</span></div>
+            <div id="proxyList" class="itemList" style="margin-top:10px">
+              <div class="itemListEmpty">Henüz proxy yok.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modalFoot">
+        <span class="modalFootSpacer"></span>
+        <button type="button" id="btnProxyModalDone" class="btnMuted">Kapat</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/catalog.js"></script>
+  <script src="/proxyManager.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

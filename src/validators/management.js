@@ -60,11 +60,41 @@ const credentialUpdateSchema = credentialBaseSchema;
 
 const idListSchema = z.array(objectIdLike).optional().default([]);
 
+const proxyProtocolSchema = z.enum(['http', 'https', 'socks4', 'socks5']).optional().default('socks5');
+
+const proxyCreateSchema = z.object({
+  host: z.string().min(3, 'Proxy host zorunludur'),
+  port: z.union([z.number(), z.string()]).transform((val) => {
+    const n = typeof val === 'number' ? val : parseInt(String(val || '').trim(), 10);
+    return Number.isFinite(n) ? n : 0;
+  }).refine((n) => n >= 1 && n <= 65535, 'Proxy port gecersiz'),
+  protocol: proxyProtocolSchema,
+  username: z.string().optional().nullable(),
+  password: z.string().optional().nullable(),
+  isActive: z.boolean().optional().default(true),
+}).transform((data) => ({
+  ...data,
+  host: String(data.host || '').trim(),
+  username: data.username ? String(data.username).trim() : '',
+  password: data.password ? String(data.password).trim() : '',
+}));
+
+const proxyUpdateSchema = proxyCreateSchema.partial();
+
+const proxyImportSchema = z.object({
+  defaultProtocol: proxyProtocolSchema,
+  rawText: z.string().optional().default(''),
+  items: z.array(proxyCreateSchema).optional().default([]),
+});
+
 module.exports = {
   categoryPayloadSchema,
   credentialCreateSchema,
   credentialUpdateSchema,
   idListSchema,
   objectIdLike,
+  proxyCreateSchema,
+  proxyImportSchema,
+  proxyUpdateSchema,
   teamPayloadSchema,
 };

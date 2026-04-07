@@ -10,6 +10,7 @@ const configRoot = require('../config');
 const categoryRepo = require('../repositories/categoryRepository');
 const credentialRepo = require('../repositories/credentialRepository');
 const orderRecordRepo = require('../repositories/orderRecordRepository');
+const proxyRepo = require('../repositories/proxyRepository');
 const teamRepo = require('../repositories/teamRepository');
 const { withRunCfg, getCfg } = require('../runCfg');
 const { buildProviderChain, hasCaptchaSolverCredentials, solveTurnstileProxyless, solveRecaptchaV2Proxyless } = require('../services/captchaSolver');
@@ -6319,6 +6320,89 @@ async function startBotAfterValidation(req, res, validatedData) {
         }
     };
 
+    const attachProtocolToHost = (host, fallbackProtocol = 'socks5') => {
+        const h = String(host || '').trim();
+        if (!h) return '';
+        if (/^(http|https|socks4|socks5):\/\//i.test(h)) return h;
+        return `${String(fallbackProtocol || 'socks5').toLowerCase()}://${h}`;
+    };
+
+    const manualProxyConfigured = !!(String(proxyHost || '').trim() && String(proxyPort || '').trim());
+    const manualProxyLaunchConfig = manualProxyConfigured
+        ? {
+            proxyHost: attachProtocolToHost(proxyHost, 'socks5'),
+            proxyPort,
+            proxyUsername,
+            proxyPassword
+        }
+        : null;
+
+    const launchAndLoginWithManagedProxy = async (baseOpts, meta = {}) => {
+        const opts = baseOpts && typeof baseOpts === 'object' ? { ...baseOpts } : {};
+        const role = String(meta.role || '').trim();
+        const idx = Number.isFinite(Number(meta.idx)) ? Number(meta.idx) : null;
+        const emailForLog = String(opts.email || meta.email || '').trim();
+        let activeProxy = null;
+        let fromPool = false;
+
+        if (manualProxyLaunchConfig) {
+            Object.assign(opts, manualProxyLaunchConfig);
+        } else {
+            try {
+                activeProxy = await proxyRepo.acquireNextActiveProxy();
+            } catch (e) {
+                throw new Error(`Proxy havuzu okunamadi: ${e?.message || String(e)}`);
+            }
+            if (!activeProxy) {
+                throw new Error('Aktif proxy bulunamadi (proxy havuzu bos ya da blacklistte).');
+            }
+            fromPool = true;
+            Object.assign(opts, {
+                proxyHost: attachProtocolToHost(activeProxy.host, activeProxy.protocol || 'socks5'),
+                proxyPort: activeProxy.port,
+                proxyUsername: activeProxy.username || '',
+                proxyPassword: activeProxy.password || ''
+            });
+            audit('proxy_selected', {
+                runId,
+                role,
+                idx,
+                email: emailForLog,
+                proxyId: activeProxy.id,
+                proxy: `${activeProxy.host}:${activeProxy.port}`,
+                protocol: activeProxy.protocol
+            });
+        }
+
+        try {
+            const result = await launchAndLogin(opts);
+            if (fromPool && activeProxy?.id) {
+                try { await proxyRepo.markLoginSuccess(activeProxy.id); } catch {}
+            }
+            return result;
+        } catch (error) {
+            if (fromPool && activeProxy?.id) {
+                try {
+                    const updated = await proxyRepo.markLoginFailure(activeProxy.id, {
+                        threshold: 3,
+                        reason: error?.message || 'login_failed'
+                    });
+                    audit('proxy_login_failed', {
+                        runId,
+                        role,
+                        idx,
+                        email: emailForLog,
+                        proxyId: activeProxy.id,
+                        proxy: `${activeProxy.host}:${activeProxy.port}`,
+                        blacklistedUntil: updated?.blacklistUntil || null,
+                        reason: error?.message || String(error)
+                    }, 'warn');
+                } catch {}
+            }
+            throw error;
+        }
+    };
+
     let currentHolder = null; // 'A' | 'B'
     let currentSeatInfo = null;
     let currentCatBlock = null;
@@ -7357,15 +7441,11 @@ async function startBotAfterValidation(req, res, validatedData) {
         const holderPass = (currentHolder === 'A') ? passwordA : passwordB;
 
         setStep('C.launchAndLogin.start', { email: cAcc.email });
-        ({ browser: browserC, page: pageC } = await launchAndLogin({
+        ({ browser: browserC, page: pageC } = await launchAndLoginWithManagedProxy({
             email: cAcc.email,
             password: cAcc.password,
-            userDataDir: userDataDirC,
-            proxyHost,
-            proxyPort,
-            proxyUsername,
-            proxyPassword
-        }));
+            userDataDir: userDataDirC
+        }, { role: 'C', idx: finalizePairIndex, email: cAcc.email }));
         try { multiBrowsers.push(browserC); } catch {}
         registerPassobotBrowser(browserC, runId);
         setStep('C.launchAndLogin.done', { email: cAcc.email, snap: await snapshotPage(pageC, 'C.afterLogin') });
@@ -8200,15 +8280,11 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.launchAndLogin.start`, { email: acc.email });
                 audit('account_launch_start', { role: 'B', idx: i, email: acc.email });
                 const userDataDir = buildRunUserDataDir(getCfg().USER_DATA_DIR_B, `B${i}`);
-                const { browser, page } = await launchAndLogin({
+                const { browser, page } = await launchAndLoginWithManagedProxy({
                     email: acc.email,
                     password: acc.password,
-                    userDataDir,
-                    proxyHost,
-                    proxyPort,
-                    proxyUsername,
-                    proxyPassword
-                });
+                    userDataDir
+                }, { role: 'B', idx: i, email: acc.email });
                 bBrowser = browser;
                 try { multiBrowsers.push(browser); } catch {}
                 registerPassobotBrowser(browser, runId);
@@ -8365,15 +8441,11 @@ async function startBotAfterValidation(req, res, validatedData) {
 
                 setStep(`${label}.launchAndLogin.start`, { email: acc.email });
                 audit('account_launch_start', { role: 'A', idx: i, email: acc.email });
-                const { browser, page } = await launchAndLogin({
+                const { browser, page } = await launchAndLoginWithManagedProxy({
                     email: acc.email,
                     password: acc.password,
-                    userDataDir,
-                    proxyHost,
-                    proxyPort,
-                    proxyUsername,
-                    proxyPassword
-                });
+                    userDataDir
+                }, { role: 'A', idx: i, email: acc.email });
                 aBrowser = browser;
                 try { multiBrowsers.push(browser); } catch {}
                 registerPassobotBrowser(browser, runId);
@@ -9352,9 +9424,11 @@ async function startBotAfterValidation(req, res, validatedData) {
         // A: Launch + Login
         setStep('A.launchAndLogin.start', { email: emailA });
         audit('account_launch_start', { role: 'A', idx: 0, email: emailA });
-        ({browser: browserA, page: pageA} = await launchAndLogin({
-            email: emailA, password: passwordA, userDataDir: userDataDirA, proxyHost, proxyPort, proxyUsername, proxyPassword
-        }));
+        ({browser: browserA, page: pageA} = await launchAndLoginWithManagedProxy({
+            email: emailA,
+            password: passwordA,
+            userDataDir: userDataDirA
+        }, { role: 'A', idx: 0, email: emailA }));
         registerPassobotBrowser(browserA, runId);
         setStep('A.launchAndLogin.done', { email: emailA, snap: await snapshotPage(pageA, 'A.afterLogin') });
         audit('account_launch_done', { role: 'A', idx: 0, email: emailA, url: (() => { try { return pageA.url(); } catch { return null; } })() });
@@ -9962,15 +10036,11 @@ async function startBotAfterValidation(req, res, validatedData) {
         // B: Launch + Login (A koltuk sepette beklerken)
         setStep('B.launchAndLogin.start', { email: emailB });
         audit('account_launch_start', { role: 'B', idx: 0, email: emailB });
-        ({browser: browserB, page: pageB} = await launchAndLogin({
+        ({browser: browserB, page: pageB} = await launchAndLoginWithManagedProxy({
             email: emailB,
             password: passwordB,
-            userDataDir: userDataDirB,
-            proxyHost,
-            proxyPort,
-            proxyUsername,
-            proxyPassword
-        }));
+            userDataDir: userDataDirB
+        }, { role: 'B', idx: 0, email: emailB }));
         registerPassobotBrowser(browserB, runId);
         setStep('B.launchAndLogin.done', { email: emailB, snap: await snapshotPage(pageB, 'B.afterLogin') });
         audit('account_launch_done', { role: 'B', idx: 0, email: emailB, url: (() => { try { return pageB.url(); } catch { return null; } })() });
