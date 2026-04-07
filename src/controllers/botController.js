@@ -2928,15 +2928,26 @@ async function launchAndLogin(options) {
         try {
             await page.evaluate(() => {
                 const norm = (s) => (s || '').toString().trim().toLowerCase();
-                const btns = document.querySelectorAll('a, button, [role="button"], [role="link"]');
+                const btns = document.querySelectorAll('a, button, [role="button"], [role="link"], [onclick], [data-testid], [class*="login" i], [id*="login" i]');
                 for (const x of btns) {
                     const t = norm(x.innerText || x.textContent || '');
-                    if (t.includes('giriş') || t.includes('giris') || t === 'giriş yap' || t === 'üye girişi') {
+                    const href = norm(x.getAttribute?.('href') || '');
+                    if (
+                        t.includes('giriş') ||
+                        t.includes('giris') ||
+                        t.includes('üye girişi') ||
+                        t.includes('uye girisi') ||
+                        t === 'giriş yap' ||
+                        t === 'giris yap' ||
+                        href.includes('/tr/giris') ||
+                        href.includes('/giris') ||
+                        href.includes('uye-girisi')
+                    ) {
                         try { x.click(); return; } catch {}
                     }
                 }
             });
-            await delay(1500);
+            await delay(1800);
         } catch {}
         return !!await findLoginContext();
     };
@@ -2956,9 +2967,20 @@ async function launchAndLogin(options) {
         for (let attempt = 1; attempt <= 5; attempt++) {
             const ctx = await tryEnsureLoginForm(12000);
             if (ctx) return ctx;
-            try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }); } catch {}
+            try {
+                await gotoWithRetry(page, `${getCfg().PASSO_LOGIN}${getCfg().PASSO_LOGIN.includes('?') ? '&' : '?'}pb_retry=${Date.now()}`, {
+                    retries: 1,
+                    waitUntil: 'networkidle2',
+                    expectedUrlIncludes: '/giris',
+                    timeoutMs: 60000,
+                    backoffMs: 400
+                });
+            } catch {
+                try { await page.reload({ waitUntil: 'networkidle2', timeout: 60000 }); } catch {}
+            }
             const backoff = 600 * attempt;
             try { await delay(backoff); } catch {}
+            await tryRevealLoginForm().catch(() => false);
             const u = (() => { try { return page.url(); } catch { return ''; } })();
             if (!/\/tr\/giris(\?|$)/i.test(String(u || ''))) {
                 try {
