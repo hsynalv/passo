@@ -62,24 +62,37 @@ const idListSchema = z.array(objectIdLike).optional().default([]);
 
 const proxyProtocolSchema = z.enum(['http', 'https', 'socks4', 'socks5']).optional().default('socks5');
 
+const proxyPortSchema = z.union([z.number(), z.string()]).transform((val) => {
+  const n = typeof val === 'number' ? val : parseInt(String(val || '').trim(), 10);
+  return Number.isFinite(n) ? n : 0;
+}).refine((n) => n >= 1 && n <= 65535, 'Proxy port gecersiz');
+
+function normalizeProxyPayload(data) {
+  return {
+    ...data,
+    host: data.host === undefined ? undefined : String(data.host || '').trim(),
+    username: data.username === undefined || data.username === null ? '' : String(data.username).trim(),
+    password: data.password === undefined || data.password === null ? '' : String(data.password).trim(),
+  };
+}
+
 const proxyCreateSchema = z.object({
   host: z.string().min(3, 'Proxy host zorunludur'),
-  port: z.union([z.number(), z.string()]).transform((val) => {
-    const n = typeof val === 'number' ? val : parseInt(String(val || '').trim(), 10);
-    return Number.isFinite(n) ? n : 0;
-  }).refine((n) => n >= 1 && n <= 65535, 'Proxy port gecersiz'),
+  port: proxyPortSchema,
   protocol: proxyProtocolSchema,
   username: z.string().optional().nullable(),
   password: z.string().optional().nullable(),
   isActive: z.boolean().optional().default(true),
-}).transform((data) => ({
-  ...data,
-  host: String(data.host || '').trim(),
-  username: data.username ? String(data.username).trim() : '',
-  password: data.password ? String(data.password).trim() : '',
-}));
+}).transform(normalizeProxyPayload);
 
-const proxyUpdateSchema = proxyCreateSchema.partial();
+const proxyUpdateSchema = z.object({
+  host: z.string().min(3, 'Proxy host zorunludur').optional(),
+  port: proxyPortSchema.optional(),
+  protocol: proxyProtocolSchema.optional(),
+  username: z.string().optional().nullable(),
+  password: z.string().optional().nullable(),
+  isActive: z.boolean().optional(),
+}).transform(normalizeProxyPayload);
 
 const proxyImportSchema = z.object({
   defaultProtocol: proxyProtocolSchema,
