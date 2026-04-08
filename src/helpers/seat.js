@@ -15,6 +15,69 @@ const SELECTED_SEAT_SELECTOR = (
   'svg.seatmap-svg rect.selected'
 );
 
+const SEAT_CLAIM_TTL_MS = 20000;
+const seatClaimsByGroup = new Map();
+
+function pruneSeatClaims(groupKey, now = Date.now()) {
+  const key = String(groupKey || 'default');
+  const grp = seatClaimsByGroup.get(key);
+  if (!grp) return null;
+  for (const [sid, meta] of grp.entries()) {
+    if (!meta || (now - Number(meta.ts || 0)) > SEAT_CLAIM_TTL_MS) grp.delete(sid);
+  }
+  if (!grp.size) {
+    seatClaimsByGroup.delete(key);
+    return null;
+  }
+  return grp;
+}
+
+function getClaimedSeatIds(groupKey, owner) {
+  const grp = pruneSeatClaims(groupKey);
+  if (!grp) return [];
+  const mine = String(owner || '');
+  const out = [];
+  for (const [sid, meta] of grp.entries()) {
+    if (!sid) continue;
+    if (meta?.owner && mine && String(meta.owner) === mine) continue;
+    out.push(String(sid));
+  }
+  return out;
+}
+
+function claimSeatId(groupKey, owner, seatId) {
+  const sid = String(seatId || '').trim();
+  if (!sid) return true;
+  const key = String(groupKey || 'default');
+  const mine = String(owner || '');
+  const now = Date.now();
+  let grp = pruneSeatClaims(key, now);
+  if (!grp) {
+    grp = new Map();
+    seatClaimsByGroup.set(key, grp);
+  }
+  const cur = grp.get(sid);
+  if (cur && cur.owner && mine && String(cur.owner) !== mine && (now - Number(cur.ts || 0)) <= SEAT_CLAIM_TTL_MS) {
+    return false;
+  }
+  grp.set(sid, { owner: mine, ts: now });
+  return true;
+}
+
+function releaseSeatId(groupKey, owner, seatId, force = false) {
+  const sid = String(seatId || '').trim();
+  if (!sid) return;
+  const key = String(groupKey || 'default');
+  const mine = String(owner || '');
+  const grp = pruneSeatClaims(key);
+  if (!grp) return;
+  const cur = grp.get(sid);
+  if (!cur) return;
+  if (!force && cur.owner && mine && String(cur.owner) !== mine) return;
+  grp.delete(sid);
+  if (!grp.size) seatClaimsByGroup.delete(key);
+}
+
 function mapHeldSeatsFromProducts(products) {
   if (!Array.isArray(products) || !products.length) return [];
   const seen = new Set();
@@ -170,13 +233,44 @@ async function clickSeatById(page, seatId) {
       const bb = r.getBoundingClientRect();
       const cx = bb.left + (bb.width / 2);
       const cy = bb.top + (bb.height / 2);
-      const el = document.elementFromPoint(cx, cy) || r;
-      const fire = (type) => {
+      const topEl = document.elementFromPoint(cx, cy);
+      const fireOn = (node, type) => {
         try {
-          el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
+          if (!node) return;
+          node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
         } catch {}
       };
-      ['pointerover', 'pointerdown', 'mousedown', 'mouseup', 'pointerup', 'click'].forEach(fire);
+      const seq = ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+      // First hit the actual seat nodes to bypass floating overlays/widgets.
+      for (const t of seq) {
+        fireOn(g || r, t);
+        if (r !== g) fireOn(r, t);
+      }
+      // Then mirror to top element (if different) so page-level listeners still trigger.
+      if (topEl && topEl !== r && topEl !== g) {
+        for (const t of seq) fireOn(topEl, t);
+      }
+      try { if (typeof (g || r).click === 'function') (g || r).click(); } catch {}
+      const topTxt = (() => {
+        try {
+          const t = (topEl?.innerText || topEl?.textContent || '').toString().trim().slice(0, 80);
+          return t || null;
+        } catch { return null; }
+      })();
+      const topCls = (() => { try { return String(topEl?.className || '').slice(0, 120); } catch { return null; } })();
+      const topTag = (() => { try { return String(topEl?.tagName || ''); } catch { return null; } })();
+      const overlayLikely = !!topEl && topEl !== r && topEl !== g && /turnstile|cloudflare|swal|toast|modal|captcha|overlay/i.test(`${topCls || ''} ${topTag || ''} ${topTxt || ''}`);
+      if (overlayLikely) {
+        try {
+          window.__passobotClickObstruction = {
+            seatId: String(sid),
+            topTag,
+            topCls,
+            topTxt,
+            at: Date.now()
+          };
+        } catch {}
+      }
       return true;
     }, String(seatId));
     return !!ok;
@@ -703,6 +797,8 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
   const categorySelectionMode = options.categorySelectionMode || 'legacy';
   const seatSelectionModeRaw = String(options.seatSelectionMode || 'random').trim().toLowerCase();
   const seatSelectionMode = seatSelectionModeRaw === 'deterministic' ? 'deterministic' : 'random';
+  const seatClaimGroupKey = String(options.claimGroupKey || 'default');
+  const seatClaimOwner = String(context || 'unknown');
   const ticketCount = Math.max(1, Math.min(10, Number(options.ticketCount) || 1));
   const adjacentSeats = options.adjacentSeats === true;
   const quantitySelectionModeRaw = String(options.quantitySelectionMode || '').trim().toLowerCase();
@@ -1300,6 +1396,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
       }
     }
     try { await openSeatMapStrict(page); } catch {}
+    if (lockedSeat?.seatId) releaseSeatId(seatClaimGroupKey, seatClaimOwner, lockedSeat.seatId);
     lockedSeat = null;
     lockedMiss = 0;
     await delay(260);
@@ -1930,7 +2027,9 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
           }
 
           if (!clickInfo) {
-          const picked = await page.evaluate((sel, mode) => {
+          const claimedSeatIds = getClaimedSeatIds(seatClaimGroupKey, seatClaimOwner);
+          const picked = await page.evaluate((sel, mode, excludedSeatIds) => {
+              const excluded = new Set(Array.isArray(excludedSeatIds) ? excludedSeatIds.map(x => String(x)) : []);
               const bySeatRect = () => {
                   const rects = Array.from(document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect'));
                   const clickable = rects.filter(r => {
@@ -2027,6 +2126,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                   }).filter(it => {
                     if (!Number.isFinite(it.x) || !Number.isFinite(it.y) || it.x <= 0 || it.y <= 0) return false;
                     if (it.y <= 10 || it.x <= 10 || it.y >= window.innerHeight - 10 || it.x >= window.innerWidth - 10) return false;
+                    if (it.seatId && excluded.has(String(it.seatId))) return false;
                     return true;
                   });
 
@@ -2085,7 +2185,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                 labelText: null,
                 sig: null
               }, queue: [] };
-          }, SEAT_NODE_SELECTOR, seatSelectionMode);
+          }, SEAT_NODE_SELECTOR, seatSelectionMode, claimedSeatIds);
           if (picked && typeof picked === 'object') {
             if (Array.isArray(picked.queue) && picked.queue.length) seatPickQueue = picked.queue;
             clickInfo = picked.primary || null;
@@ -2099,6 +2199,20 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
             continue;
           }
 
+          if (clickInfo.seatId) {
+            const claimed = claimSeatId(seatClaimGroupKey, seatClaimOwner, clickInfo.seatId);
+            if (!claimed) {
+              logger.info(`seatPick:${context}:seat_claim_conflict`, {
+                seatId: clickInfo.seatId,
+                group: seatClaimGroupKey
+              });
+              lockedSeat = null;
+              lockedMiss = 0;
+              await delay(120);
+              continue;
+            }
+          }
+
           if (!lockedSeat) {
             lockedSeat = clickInfo;
             logger.info(`seatPick:${context}:locked`, { seatId: clickInfo.seatId, row: clickInfo.row || null, seat: clickInfo.seat || null, mode: seatSelectionMode, x: clickInfo.x, y: clickInfo.y });
@@ -2108,12 +2222,21 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
           let clicked = false;
           if (clickInfo.seatId) {
             clicked = await clickSeatById(page, clickInfo.seatId);
+            try {
+              const obs = await page.evaluate(() => {
+                const x = window.__passobotClickObstruction || null;
+                if (x) window.__passobotClickObstruction = null;
+                return x;
+              }).catch(() => null);
+              if (obs) logger.warn(`seatPick:${context}:click_obstructed_overlay`, obs);
+            } catch {}
           }
           if (!clicked) {
             clicked = await robustSeatClick(page, clickInfo.x, clickInfo.y);
           }
           if (!clicked) {
             logger.warn(`seatPick:${context}:click_failed`, { seatId: lockedSeat?.seatId });
+            if (lockedSeat?.seatId) releaseSeatId(seatClaimGroupKey, seatClaimOwner, lockedSeat.seatId);
             if (seatSelectionMode === 'deterministic' && Array.isArray(seatPickQueue) && seatPickQueue.length) {
               // Don't get stuck retrying a problematic seat; advance to the next deterministic candidate.
               lockedSeat = null;
@@ -2147,11 +2270,13 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
               }
               if (seatSelectionMode === 'deterministic' && Array.isArray(seatPickQueue) && seatPickQueue.length) {
                 logger.info(`seatPick:${context}:deterministic_advance_candidate`, { fromSeatId: lockedSeat?.seatId || null, remaining: seatPickQueue.length });
+                if (lockedSeat?.seatId) releaseSeatId(seatClaimGroupKey, seatClaimOwner, lockedSeat.seatId);
                 lockedSeat = null;
                 lockedMiss = 0;
               }
               if (lockedMiss >= 3) {
                 logger.warn(`seatPick:${context}:lock_reset`, { seatId: lockedSeat?.seatId, reason: 'not_selected_after_3_clicks' });
+                if (lockedSeat?.seatId) releaseSeatId(seatClaimGroupKey, seatClaimOwner, lockedSeat.seatId);
                 lockedSeat = null;
                 lockedMiss = 0;
               }

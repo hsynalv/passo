@@ -9197,6 +9197,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                             chooseCategoryFn: accountCategoryChooser.choose,
                             categorySelectionMode,
                             seatSelectionMode,
+                            claimGroupKey: runId,
                             ticketCount: effectiveTicketCount,
                             quantitySelectionMode: 'afterCategory',
                             ticketQuantityPrimed,
@@ -10425,6 +10426,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                         chooseCategoryFn: singleCategoryChooserA.choose,
                         categorySelectionMode,
                         seatSelectionMode,
+                        claimGroupKey: runId,
                         ticketCount: effectiveTicketCountA,
                         quantitySelectionMode: 'afterCategory',
                         ticketQuantityPrimed: ticketQuantityPrimedA,
@@ -10868,6 +10870,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     chooseCategoryFn: singleCategoryChooserB.choose,
                     categorySelectionMode,
                     seatSelectionMode,
+                    claimGroupKey: runId,
                     ticketCount: Math.max(ticketCount, catMinBFallback),
                     adjacentSeats: catRuleBFallback.adjacentSeats === true
                 }
