@@ -865,9 +865,9 @@ function statusTextFromStep(entry, meta = {}) {
     const categoryType = String(meta?.categoryType || '').trim();
     const alternativeCategory = String(meta?.alternativeCategory || '').trim();
     const categoryHint = categoryLabel || categoryType || alternativeCategory;
-    if (categoryHint) {
-      extras.push(`kategori: ${categoryHint}`);
-    }
+    if (meta?.categoryId) extras.push(`kategoriId: ${String(meta.categoryId)}`);
+    if (categoryHint) extras.push(`kategori: ${categoryHint}`);
+    if (meta?.svgBlockId) extras.push(`svgBlok: ${meta.svgBlockId}`);
   }
   if (meta?.ok === false) extras.push('başarısız');
   else if (meta?.ok === true && /\.done$/i.test(stepInfo.stageKey)) extras.push('ok');
@@ -893,7 +893,14 @@ function statusTextFromAudit(eventKey, meta = {}) {
   if (event === 'account_goto_event_done') return `ℹ️ ${prefix}etkinlik sayfası açıldı`;
   if (event === 'account_click_buy_start') return `ℹ️ ${prefix}SATIN AL deneniyor`;
   if (event === 'account_click_buy_done') return `ℹ️ ${prefix}SATIN AL tamamlandı`;
-  if (event === 'a_category_block_selected') return `📚 ${prefix}kategori/blok seçildi`;
+  if (event === 'a_category_block_selected') {
+    const bits = [];
+    if (meta?.categoryId) bits.push(`id=${meta.categoryId}`);
+    if (meta?.categoryLabel || meta?.categoryType) bits.push(String(meta.categoryLabel || meta.categoryType));
+    if (meta?.svgBlockId) bits.push(`blok=${meta.svgBlockId}`);
+    const detail = bits.length ? ` — ${bits.join(' · ')}` : '';
+    return `📚 ${prefix}kategori/blok seçildi${detail}`;
+  }
   if (event === 'a_payment_tc_assign') return `💳 ${prefix}TC tanımlama ${meta?.ok ? 'tamamlandı' : 'başarısız'}`;
   if (event === 'a_payment_invoice_tc') return `💳 ${prefix}fatura formu ${meta?.ok ? 'tamamlandı' : 'başarısız'}`;
   if (event === 'a_payment_agreements') return `💳 ${prefix}sözleşme onayları ${meta?.ok ? 'tamamlandı' : 'başarısız'}`;
@@ -947,11 +954,13 @@ function isStatusMessage(entry, line) {
 
   if (msg.includes('categoryblock:selected_category_candidate')) {
     const label = String(meta?.label || meta?.categoryType || meta?.alternativeCategory || '').trim() || '—';
+    const cid = meta?.categoryId ? ` [id:${meta.categoryId}]` : '';
+    const bid = meta?.svgBlockId ? ` [svg:${meta.svgBlockId}]` : '';
     const total = Number.isFinite(Number(meta?.total)) ? Number(meta.total) : null;
     const nextIndex = Number.isFinite(Number(meta?.nextIndex)) ? Number(meta.nextIndex) : null;
     const currentIndex = (total && nextIndex != null) ? (((nextIndex + total - 1) % total) + 1) : null;
     const ordinal = (currentIndex && total) ? ` (${currentIndex}/${total})` : '';
-    return `🎯 Aranan kategori: ${label}${ordinal}`;
+    return `🎯 Aranan kategori: ${label}${cid}${bid}${ordinal}`;
   }
 
   if (msg.includes('categoryblock:svg_targets')) {
@@ -977,12 +986,18 @@ function isStatusMessage(entry, line) {
     return `🪑 Koltuk seçildi${details}`;
   }
 
+  if (msg.includes('swal_basket_success')) {
+    const t = String(meta?.text || '').trim();
+    const short = t.length > 140 ? `${t.slice(0, 137)}…` : t;
+    return short ? `✅ ${short}` : '✅ Koltuk sepete aktarıldı (site onayı)';
+  }
+
   if (
     eventKey === 'a_hold_in_basket' ||
     eventKey === 'a_only_holding' ||
     eventKey === 'a_only_payment_ready' ||
     eventKey === 'a_payment_ready' ||
-    msg.includes('sepete') ||
+    (msg.includes('sepete') && !/sepetten|kaldır|düş|çıkar|heartbeat|boşalt/i.test(msg)) ||
     msg.includes('basket_success') ||
     msg.includes('basket_from_network')
   ) {
@@ -1162,6 +1177,7 @@ async function pollRunStatus(runId) {
 }
 
 const DIVAN_PRIORITY_CATEGORY_VALUE = 'Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler';
+const KARA_KARTAL_PLUS_CATEGORY_VALUE = 'Kara Kartal+ Öncelikli Bilet Alım';
 const GS_PLUS_PREMIUM_CATEGORY_VALUE = 'GS PLUS Premium';
 const GSPARA_PRIORITY_CATEGORY_VALUE = 'GSPara Öncelik';
 
@@ -1182,7 +1198,8 @@ function syncPrioritySaleUi() {
     divanDetails.hidden = !divan;
   }
   if (gsPlusDetails) {
-    gsPlusDetails.hidden = !(on && catVal === GS_PLUS_PREMIUM_CATEGORY_VALUE);
+    const needsPhone = on && (catVal === GS_PLUS_PREMIUM_CATEGORY_VALUE || catVal === KARA_KARTAL_PLUS_CATEGORY_VALUE);
+    gsPlusDetails.hidden = !needsPhone;
   }
   if (gsParaDetails) {
     gsParaDetails.hidden = !(on && catVal === GSPARA_PRIORITY_CATEGORY_VALUE);
@@ -1253,10 +1270,10 @@ $('botForm').addEventListener('submit', async (e) => {
     }
     body.prioritySale = cat;
     delete body.prioritySaleCategory;
-    if (cat === GS_PLUS_PREMIUM_CATEGORY_VALUE) {
+    if (cat === GS_PLUS_PREMIUM_CATEGORY_VALUE || cat === KARA_KARTAL_PLUS_CATEGORY_VALUE) {
       const ph = String(body.priorityPhone || '').replace(/\D/g, '');
       if (ph.length < 10) {
-        validationIssues.push('GS PLUS Premium için geçerli cep telefonu gir (en az 10 hane).');
+        validationIssues.push('Bu öncelik için geçerli cep telefonu gir (en az 10 hane).');
       }
     }
     if (cat === GSPARA_PRIORITY_CATEGORY_VALUE) {
@@ -1487,6 +1504,15 @@ try {
   }
   if (window.passobotCatalog && typeof window.passobotCatalog.init === 'function') {
     window.passobotCatalog.init();
+  }
+} catch {}
+
+try {
+  if (window.passobotScanMap && typeof window.passobotScanMap.setNotifier === 'function') {
+    window.passobotScanMap.setNotifier(infoLine);
+  }
+  if (window.passobotScanMap && typeof window.passobotScanMap.init === 'function') {
+    window.passobotScanMap.init();
   }
 } catch {}
 

@@ -1,0 +1,7 @@
+{"at":"2026-04-08T02:24:39.326Z","level":"info","message":"Canlı scan run başlatıldı","meta":{"teamId":"69c405fbdb783011c5a0d859","eventAddress":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746","maxProbe":30}}
+{"at":"2026-04-08T02:24:39.328Z","level":"info","message":"Rastgele takım hesabı seçiliyor...","meta":{}}
+{"at":"2026-04-08T02:24:39.337Z","level":"info","message":"Hesap seçildi","meta":{"email":"linemargs1@yaani.com","credentialId":"69cfce838f9a9ac2b5ff58fe"}}
+{"at":"2026-04-08T02:24:39.339Z","level":"info","message":"Tarayıcı açılıyor (ana bot akışı)...","meta":{"profileDir":"C:\\Users\\alavh\\AppData\\Local\\Temp\\passo-scan-live-XNy1qR"}}
+{"at":"2026-04-08T02:24:39.340Z","level":"info","message":"Passo login + turnstile/captcha çözüm adımları başlatıldı...","meta":{}}
+{"at":"2026-04-08T02:25:44.760Z","level":"info","message":"Login adımı tamamlandı, evente gidiliyor ve koltuk haritası açılıyor...","meta":{}}
+{"at":"2026-04-08T02:26:03.946Z","level":"error","message":"Canlı tarama başarısız","meta":{"error":"SCAN_SEATMAP_NOT_READY"}}

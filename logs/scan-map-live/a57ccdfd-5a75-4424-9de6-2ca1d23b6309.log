@@ -1,0 +1,49 @@
+{"at":"2026-04-08T03:02:05.925Z","level":"info","message":"Canlı scan run başlatıldı","meta":{"teamId":"69c405fbdb783011c5a0d859","eventAddress":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746","maxProbe":30}}
+{"at":"2026-04-08T03:02:05.928Z","level":"info","message":"Rastgele takım hesabı seçiliyor...","meta":{}}
+{"at":"2026-04-08T03:02:05.932Z","level":"info","message":"Hesap seçildi","meta":{"email":"archiechamberlain@aj.com.tr","credentialId":"69c40b9f3a0933c48dab5bbb"}}
+{"at":"2026-04-08T03:02:05.934Z","level":"warn","message":"Proxy kullanımı kapalı, doğrudan bağlantı deneniyor","meta":{}}
+{"at":"2026-04-08T03:02:05.935Z","level":"info","message":"Tarayıcı açılıyor (ana bot akışı)...","meta":{"profileDir":"C:\\Users\\alavh\\AppData\\Local\\Temp\\passo-scan-live-HDsssE"}}
+{"at":"2026-04-08T03:02:05.936Z","level":"info","message":"Passo login + turnstile/captcha çözüm adımları başlatıldı...","meta":{}}
+{"at":"2026-04-08T03:03:24.856Z","level":"info","message":"Login adımı tamamlandı, evente gidiliyor ve koltuk haritası açılıyor...","meta":{}}
+{"at":"2026-04-08T03:03:24.857Z","level":"info","message":"Seat map hazırlığı başladı","meta":{"eventUrl":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746","seatUrl":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746/koltuk-secim"}}
+{"at":"2026-04-08T03:03:24.858Z","level":"info","message":"Event sayfasına gidiliyor","meta":{"eventUrl":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746"}}
+{"at":"2026-04-08T03:03:25.096Z","level":"info","message":"Koltuk seçim URL çağrılıyor","meta":{"seatUrl":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746/koltuk-secim"}}
+{"at":"2026-04-08T03:03:25.334Z","level":"info","message":"Koltuk seçim URL sonrası durum","meta":{"currentUrl":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746/koltuk-secim"}}
+{"at":"2026-04-08T03:03:25.335Z","level":"info","message":"openSeatMapStrict çağrılıyor...","meta":{}}
+{"at":"2026-04-08T03:03:43.930Z","level":"warn","message":"openSeatMapStrict false döndü ama SVG zaten mevcut, taramaya devam ediliyor","meta":{}}
+{"at":"2026-04-08T03:03:43.931Z","level":"info","message":"Seat map açıldı, SVG bekleniyor...","meta":{}}
+{"at":"2026-04-08T03:03:43.939Z","level":"info","message":"Seat map SVG hazır","meta":{}}
+{"at":"2026-04-08T03:03:43.940Z","level":"info","message":"Koltuk seçim/SVG harita hazır, block taraması başladı...","meta":{}}
+{"at":"2026-04-08T03:03:43.941Z","level":"info","message":"SVG layout bekleniyor...","meta":{"maxProbe":30}}
+{"at":"2026-04-08T03:03:43.954Z","level":"info","message":"Block ID listesi çıkarıldı","meta":{"count":30}}
+{"at":"2026-04-08T03:03:44.178Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block17363","hasTooltip":false,"confidence":22}}
+{"at":"2026-04-08T03:03:44.425Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block38371","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:44.673Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block38855","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:44.921Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block38851","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:45.151Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block18337","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:45.383Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block18342","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:45.619Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block18345","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:45.872Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block18350","hasTooltip":false,"confidence":22}}
+{"at":"2026-04-08T03:03:46.152Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block39896","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:46.382Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block40405","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:46.615Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block39903","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:46.852Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block17851","hasTooltip":false,"confidence":22}}
+{"at":"2026-04-08T03:03:47.087Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block18351","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:47.321Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block17852","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:47.569Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block39905","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:47.802Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block42362","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:48.034Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block42373","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:48.269Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block17859","hasTooltip":false,"confidence":22}}
+{"at":"2026-04-08T03:03:48.502Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block17858","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:48.735Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block42375","hasTooltip":false,"confidence":22}}
+{"at":"2026-04-08T03:03:48.957Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block36334","hasTooltip":false,"confidence":22}}
+{"at":"2026-04-08T03:03:49.206Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block60344","hasTooltip":false,"confidence":22}}
+{"at":"2026-04-08T03:03:49.459Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block61336","hasTooltip":false,"confidence":22}}
+{"at":"2026-04-08T03:03:49.695Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block617354","hasTooltip":false,"confidence":22}}
+{"at":"2026-04-08T03:03:49.947Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block43339","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:50.179Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block38913","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:50.412Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block38388","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:50.645Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block59337","hasTooltip":false,"confidence":22}}
+{"at":"2026-04-08T03:03:50.880Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block58339","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:51.112Z","level":"info","message":"Block probe tamam","meta":{"blockId":"block58338","hasTooltip":true,"confidence":78}}
+{"at":"2026-04-08T03:03:51.116Z","level":"info","message":"Canlı tarama tamamlandı","meta":{"count":30}}

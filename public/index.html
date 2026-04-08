@@ -18,6 +18,7 @@
         <a href="/records.html" class="btnGhost navGhost">Kayit Ekrani</a>
         <button type="button" id="btnOpenSettings" class="btnGhost">Bilet alım ayarları</button>
         <button type="button" id="btnOpenCatalogManager" class="btnGhost">Takım Havuzu Yönet</button>
+        <button type="button" id="btnOpenScanMapManager" class="btnGhost">Blok Haritası (Scan Map)</button>
         <button type="button" id="btnOpenProxyManager" class="btnGhost">Proxy Havuzu</button>
         <div class="status" id="connStatus">Disconnected</div>
       </div>
@@ -94,13 +95,12 @@
 
               <div class="row2">
                 <div class="row">
-                  <label>Category Mode</label>
+                  <label>Kategori Modu</label>
                   <select name="categorySelectionMode">
-                    <option value="svg">svg</option>
-                    <option value="scan">scan</option>
-                    <option value="legacy">legacy</option>
+                    <option value="scan" selected>Normal Mod</option>
+                    <option value="legacy">Legacy (Eski)</option>
                   </select>
-                  <div class="hint">Kategori kaydında mod ipucu varsa o kategori seçilirken kullanılabilir.</div>
+                  <div class="hint">Normal Mod: önce SVG varsa onu dener, olmazsa legacy dropdown’a düşer.</div>
                 </div>
                 <div class="row">
                   <label>Öncelikli satış</label>
@@ -111,11 +111,24 @@
                   <div class="hint">Açıkken Passo’daki öncelik satırı eşlemesi için seçim yapılır (diğer gruplar eklendikçe liste genişler).</div>
                 </div>
               </div>
+
+              <div class="row2">
+                <div class="row">
+                  <label>Koltuk Seçim Modu</label>
+                  <select name="seatSelectionMode">
+                    <option value="random" selected>Normal</option>
+                    <option value="deterministic">Tarama Modu (ilk boş)</option>
+                  </select>
+                  <div class="hint">Tarama Modu: seatmap’te “ilk boş” koltuğu seçer (row/seat öncelikli).</div>
+                </div>
+                <div class="row"></div>
+              </div>
               <div class="row" id="prioritySaleCategoryRow" hidden style="margin-top:4px">
                 <label>Öncelik kategorisi</label>
                 <select name="prioritySaleCategory" id="prioritySaleCategorySelect">
                   <option value="">Seçin…</option>
                   <option value="Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler">Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler</option>
+                  <option value="Kara Kartal+ Öncelikli Bilet Alım">Kara Kartal+ Öncelikli Bilet Alım</option>
                   <option value="GS PLUS Premium">GS PLUS Premium</option>
                   <option value="GSPara Öncelik">GSPara Öncelik</option>
                 </select>
@@ -361,6 +374,89 @@
         </section>
       </form>
     </main>
+  </div>
+
+  <div id="scanMapModal" class="modalRoot" hidden>
+    <div class="modalBackdrop" id="scanMapModalBackdrop"></div>
+    <div class="modalDialog modalDialogWide" role="dialog" aria-modal="true" aria-labelledby="scanMapModalTitle">
+      <div class="modalHead">
+        <h2 id="scanMapModalTitle">Blok Haritası (Scan Map)</h2>
+        <button type="button" class="modalClose" id="btnCloseScanMapModal" aria-label="Kapat">×</button>
+      </div>
+      <p class="modalIntro">Tooltip tabanlı blok tarama sonuçlarını takım+event bazında saklar. İleride sadece takım scope'una genişletilebilir.</p>
+      <div class="modalBody">
+        <div class="managerWorkspace">
+          <aside class="managerSidebar">
+            <section class="managerSection">
+              <h3>Taramayı Başlat</h3>
+              <div class="row">
+                <label>Takım</label>
+                <select id="scanMapTeamSelect">
+                  <option value="">Takım seç</option>
+                </select>
+              </div>
+              <div class="row">
+                <label>Event URL</label>
+                <input id="scanMapEventAddressInput" type="url" placeholder="https://www.passo.com.tr/..." />
+              </div>
+              <div class="row2">
+                <div class="row">
+                  <label>Scope</label>
+                  <select id="scanMapScopeSelect">
+                    <option value="team_event" selected>team_event</option>
+                    <option value="team">team</option>
+                  </select>
+                </div>
+                <div class="row">
+                  <label>Max Probe</label>
+                  <input id="scanMapMaxProbeInput" type="number" min="1" max="200" value="30" />
+                </div>
+              </div>
+              <div class="row">
+                <label>Kategori İpucu (ops.)</label>
+                <input id="scanMapCategoryHintInput" type="text" placeholder="100, 125, Classic" />
+              </div>
+              <div class="row">
+                <label style="display:flex;align-items:center;gap:8px;margin:0;cursor:pointer">
+                  <input id="scanMapUseProxyInput" type="checkbox" checked />
+                  <span>Canlı taramada proxy kullan</span>
+                </label>
+              </div>
+              <div class="actions">
+                <button type="button" id="btnScanMapStart">Başlat (Canlı Tarayıcı)</button>
+                <button type="button" id="btnScanMapRun">Yeniden Tara</button>
+                <button type="button" id="btnScanMapSave" class="btnMuted">Kaydet</button>
+                <button type="button" id="btnScanMapRefresh" class="btnMuted">Listeyi Yenile</button>
+              </div>
+            </section>
+          </aside>
+
+          <div class="managerContent" id="scanMapManagerContent">
+            <div id="scanMapSummary" class="managerSummary"><strong>0 kayıt</strong><span>Tarama sonucu bekleniyor...</span></div>
+            <section class="managerSection">
+              <h3>Canlı Tarama Logları</h3>
+              <div class="run" style="margin-top:0;padding-top:0;border-top:none">
+                <div><span class="muted">Run ID:</span> <code id="scanMapRunId">-</code></div>
+                <div><span class="muted">Durum:</span> <strong id="scanMapRunStatus">idle</strong></div>
+                <div><span class="muted">Log Dosyası:</span> <code id="scanMapRunLogFile">-</code></div>
+                <div><span class="muted">Proxy:</span> <code id="scanMapRunProxy">-</code></div>
+              </div>
+              <div id="scanMapLogBox" class="logBox" style="height:140px;margin-top:8px"></div>
+            </section>
+            <div id="scanMapList" class="itemList scanMapList" style="margin-top:10px">
+              <div class="itemListEmpty">Henüz kayıt yok.</div>
+            </div>
+            <div class="actions" style="justify-content:flex-end">
+              <button type="button" id="btnScanMapClear" class="btnDanger">Temizle</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modalFoot">
+        <span class="modalFootSpacer"></span>
+        <button type="button" id="btnScanMapModalDone" class="btnMuted">Kapat</button>
+      </div>
+    </div>
   </div>
 
   <div id="settingsModal" class="modalRoot" hidden>
@@ -618,6 +714,7 @@
   </div>
 
   <script src="/catalog.js"></script>
+  <script src="/scanMapManager.js"></script>
   <script src="/proxyManager.js"></script>
   <script src="/app.js"></script>
 </body>

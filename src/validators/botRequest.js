@@ -17,7 +17,8 @@ const selectedCategorySchema = z.object({
   label: z.string().min(1, 'Kategori etiketi zorunludur').optional(),
   categoryType: z.string().min(1, 'Kategori değeri zorunludur'),
   alternativeCategory: z.string().optional().nullable(),
-  selectionModeHint: z.enum(['legacy', 'scan', 'svg']).optional().nullable(),
+  selectionModeHint: z.enum(['legacy', 'scan', 'svg', 'scan_map']).optional().nullable(),
+  svgBlockId: z.string().optional().nullable(),
   sortOrder: z.union([z.number(), z.string()]).optional(),
 });
 
@@ -28,7 +29,11 @@ const botRequestSchema = z.object({
     errorMap: () => ({ message: 'ticketType "combined" veya "regular" olmalıdır' })
   }),
   eventAddress: z.string().url('Geçerli bir URL giriniz'),
-  categorySelectionMode: z.enum(['legacy', 'scan', 'svg']).optional().default('scan'),
+  categorySelectionMode: z.enum(['legacy', 'scan', 'svg', 'scan_map']).optional().default('scan'),
+  seatSelectionMode: z
+    .enum(['random', 'deterministic'])
+    .optional()
+    .default('random'),
   categoryType: z.string().optional(),
   alternativeCategory: z.string().optional(),
   ticketCount: z.union([z.number(), z.string()])

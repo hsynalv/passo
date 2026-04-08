@@ -1,0 +1,14 @@
+{"at":"2026-04-08T02:55:09.020Z","level":"info","message":"Canlı scan run başlatıldı","meta":{"teamId":"69c4fa867ee985a07152cc56","eventAddress":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746","maxProbe":30}}
+{"at":"2026-04-08T02:55:09.021Z","level":"info","message":"Rastgele takım hesabı seçiliyor...","meta":{}}
+{"at":"2026-04-08T02:55:09.027Z","level":"info","message":"Hesap seçildi","meta":{"email":"apasalfb2@yaani.com","credentialId":"69c4faf17ee985a07152cc61"}}
+{"at":"2026-04-08T02:55:09.036Z","level":"info","message":"Proxy seçildi","meta":{"proxyId":"69d4eb86a1e40b627283fc5f","proxy":"142.111.67.146:5611","protocol":"http"}}
+{"at":"2026-04-08T02:55:09.040Z","level":"info","message":"Passo login + turnstile/captcha çözüm adımları başlatıldı...","meta":{}}
+{"at":"2026-04-08T02:55:09.038Z","level":"info","message":"Tarayıcı açılıyor (ana bot akışı)...","meta":{"profileDir":"C:\\Users\\alavh\\AppData\\Local\\Temp\\passo-scan-live-SdBxsQ"}}
+{"at":"2026-04-08T02:56:45.964Z","level":"info","message":"Seat map hazırlığı başladı","meta":{"eventUrl":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746","seatUrl":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746/koltuk-secim"}}
+{"at":"2026-04-08T02:56:45.963Z","level":"info","message":"Login adımı tamamlandı, evente gidiliyor ve koltuk haritası açılıyor...","meta":{}}
+{"at":"2026-04-08T02:56:45.965Z","level":"info","message":"Event sayfasına gidiliyor","meta":{"eventUrl":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746"}}
+{"at":"2026-04-08T02:56:46.761Z","level":"info","message":"Koltuk seçim URL çağrılıyor","meta":{"seatUrl":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746/koltuk-secim"}}
+{"at":"2026-04-08T02:56:47.539Z","level":"info","message":"Koltuk seçim URL sonrası durum","meta":{"currentUrl":"https://www.passo.com.tr/tr/kombine/galatasaray-lig-paketi/639746/koltuk-secim"}}
+{"at":"2026-04-08T02:56:47.540Z","level":"info","message":"openSeatMapStrict çağrılıyor...","meta":{}}
+{"at":"2026-04-08T02:57:08.849Z","level":"error","message":"Seat map açılamadı","meta":{"currentUrl":"https://www.passo.com.tr/"}}
+{"at":"2026-04-08T02:57:08.852Z","level":"error","message":"Canlı tarama başarısız","meta":{"error":"SCAN_SEATMAP_NOT_READY"}}

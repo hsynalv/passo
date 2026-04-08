@@ -9,6 +9,7 @@ const SELECTED_SEAT_SELECTOR = (
   'circle.seat-circle.selected,' +
   'circle.seat-circle[aria-pressed="true"],' +
   '[data-selected="true"],' +
+  'svg.seatmap-svg rect.seatActive,' +
   'svg.seatmap-svg g.seatActive rect,' +
   'svg.seatmap-svg g.selected rect,' +
   'svg.seatmap-svg rect.selected'
@@ -152,7 +153,17 @@ async function clickSeatById(page, seatId) {
   if (!page || !seatId) return false;
   try {
     const ok = await page.evaluate((sid) => {
-      const g = document.querySelector(`svg.seatmap-svg g#seat${sid}`);
+      const pickG = (id) => {
+        const root = document.querySelector('svg.seatmap-svg');
+        if (!root) return null;
+        return (
+          root.querySelector(`g#seat${id}`) ||
+          root.querySelector(`g#g${id}`) ||
+          root.querySelector(`g[id="seat${id}"]`) ||
+          root.querySelector(`g[id="g${id}"]`)
+        );
+      };
+      const g = pickG(sid);
       const r = g ? (g.querySelector('rect') || g.querySelector('circle') || g) : null;
       if (!r) return false;
       try { r.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
@@ -256,7 +267,7 @@ async function recoverIfRedirected(page, context, label, expectedUrlIncludes, re
           return false;
         }
       },
-      { timeout: 18000 },
+      { timeout: 14000, polling: 120 },
       SEAT_NODE_SELECTOR
     );
   } catch {
@@ -589,6 +600,7 @@ async function reclickActiveSeatAfterQuantityChange(page, context) {
   try {
     const pt = await page.evaluate(() => {
       const rect =
+        document.querySelector('svg.seatmap-svg rect.seatActive') ||
         document.querySelector('svg.seatmap-svg g.seatActive rect') ||
         document.querySelector('svg.seatmap-svg g.selected rect') ||
         document.querySelector('circle.seat-circle.selected');
@@ -681,6 +693,8 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
   const password = options.password || null;
   const chooseCategoryFn = typeof options.chooseCategoryFn === 'function' ? options.chooseCategoryFn : null;
   const categorySelectionMode = options.categorySelectionMode || 'legacy';
+  const seatSelectionModeRaw = String(options.seatSelectionMode || 'random').trim().toLowerCase();
+  const seatSelectionMode = seatSelectionModeRaw === 'deterministic' ? 'deterministic' : 'random';
   const ticketCount = Math.max(1, Math.min(10, Number(options.ticketCount) || 1));
   const adjacentSeats = options.adjacentSeats === true;
   const quantitySelectionModeRaw = String(options.quantitySelectionMode || '').trim().toLowerCase();
@@ -819,7 +833,10 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
             pointerEventsTop: topN(peCounts)
           };
         }
-        const hasActiveSelection = !!document.querySelector('svg.seatmap-svg g.seatActive rect');
+        const hasActiveSelection = !!(
+          document.querySelector('svg.seatmap-svg rect.seatActive') ||
+          document.querySelector('svg.seatmap-svg g.seatActive rect')
+        );
         return {
           label: lbl,
           title: document.title,
@@ -931,6 +948,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
 
   let lockedSeat = null;
   let lockedMiss = 0;
+  let seatPickQueue = [];
   let lastContinueAttemptAt = 0;
   let lastContinueClickedAt = 0;
   let turnstileWarmStartedAt = 0;
@@ -959,7 +977,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
           return (m && m[1] ? m[1].trim() : '');
         };
         const selectedNow = Array.from(document.querySelectorAll(
-          'circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"], svg.seatmap-svg g.seatActive rect, svg.seatmap-svg g.selected rect, svg.seatmap-svg rect.selected'
+          'circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"], svg.seatmap-svg rect.seatActive, svg.seatmap-svg g.seatActive rect, svg.seatmap-svg g.selected rect, svg.seatmap-svg rect.selected'
         ));
 
         const rects = Array.from(document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect'));
@@ -975,7 +993,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
           // avoid already selected/active rects
           const g = r.closest('g');
           if (g && (g.classList.contains('seatActive') || g.classList.contains('selected'))) return false;
-          if (r.classList.contains('selected')) return false;
+          if (r.classList.contains('selected') || r.classList.contains('seatActive')) return false;
           return true;
         });
 
@@ -1022,14 +1040,16 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
           if (/(occupied|disabled|unavailable|dolu|sold|reserved)/i.test(cls)) return false;
           const g = r.closest('g');
           if (g && (g.classList.contains('seatActive') || g.classList.contains('selected'))) return false;
-          if (r.classList.contains('selected')) return false;
+          if (r.classList.contains('selected') || r.classList.contains('seatActive')) return false;
           return true;
         };
 
         // Seçili koltukların g elementlerini bul
-        const selectedGs = Array.from(document.querySelectorAll(
-          'svg.seatmap-svg g.seatActive, svg.seatmap-svg g.selected'
-        ));
+        const fromGs = Array.from(document.querySelectorAll('svg.seatmap-svg g.seatActive, svg.seatmap-svg g.selected'));
+        const fromRectParents = Array.from(document.querySelectorAll('svg.seatmap-svg rect.seatActive'))
+          .map((rr) => rr.closest('g'))
+          .filter(Boolean);
+        const selectedGs = Array.from(new Set([...fromGs, ...fromRectParents]));
         if (!selectedGs.length) return null;
 
         // Seçili koltukların pozisyonlarını topla (seatId ve bbox)
@@ -1131,7 +1151,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
           if (/(occupied|disabled|unavailable|dolu|sold|reserved)/i.test(cls)) return false;
           const g = r.closest('g');
           if (g && (g.classList.contains('seatActive') || g.classList.contains('selected'))) return false;
-          if (r.classList.contains('selected')) return false;
+          if (r.classList.contains('selected') || r.classList.contains('seatActive')) return false;
           return true;
         });
         if (!candidates.length) return null;
@@ -1172,10 +1192,14 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
         if (!seat) return false;
         const seatId = seat.seatId;
         if (seatId) {
-          const g = document.querySelector(`svg.seatmap-svg g#seat${seatId}`);
+          const root = document.querySelector('svg.seatmap-svg');
+          const g = root && seatId
+            ? (root.querySelector(`g#seat${seatId}`) || root.querySelector(`g#g${seatId}`) || root.querySelector(`g[id="seat${seatId}"]`) || root.querySelector(`g[id="g${seatId}"]`))
+            : null;
           const r = g ? g.querySelector('rect') : null;
           if (g && (g.classList.contains('seatActive') || /\bseatActive\b/i.test(g.getAttribute('class') || ''))) return true;
           if (g && (g.classList.contains('selected') || /selected/i.test(g.getAttribute('class') || ''))) return true;
+          if (r && (r.classList.contains('seatActive') || /\bseatActive\b/i.test(r.getAttribute('class') || ''))) return true;
           if (r && (r.classList.contains('selected') || /selected/i.test(r.getAttribute('class') || ''))) return true;
           // Prefer explicit selected indicators only. Attribute changes can happen due to hover/zoom and must not be treated as a selection.
           if (g && g.getAttribute('aria-pressed') === 'true') return true;
@@ -1198,7 +1222,10 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
         const seatId = seat?.seatId || null;
         let locked = null;
         if (seatId) {
-          const g = document.querySelector(`svg.seatmap-svg g#seat${seatId}`);
+          const root = document.querySelector('svg.seatmap-svg');
+          const g = root
+            ? (root.querySelector(`g#seat${seatId}`) || root.querySelector(`g#g${seatId}`) || root.querySelector(`g[id="seat${seatId}"]`) || root.querySelector(`g[id="g${seatId}"]`))
+            : null;
           const r = g ? g.querySelector('rect') : null;
           locked = {
             hasG: !!g,
@@ -1709,7 +1736,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                   }).catch(() => false);
                   if (hasDropdown) {
                     logger.info(`seatPick:${context}:seatmap_recover_reselect_category`, { cats: roamCategoryTexts });
-                    await chooseCategoryFn(page, roamCategoryTexts[0], roamCategoryTexts[1] || '', categorySelectionMode);
+                    await chooseCategoryFn(page, roamCategoryTexts[0], roamCategoryTexts[1] || '', categorySelectionMode, { reapplyLastCommitted: true });
                     if (quantitySelectionMode === 'outsideSeat' && ticketCount > 1) {
                       const qtyAfterReselect = await applyTicketQuantityDropdown(page, context, ticketCount, {
                         appearMaxMs: PASSO_QTY_SELECT_APPEAR_MAX_MS
@@ -1787,7 +1814,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                   }).catch(() => false);
                   if (hasDropdown) {
                     logger.info(`seatPick:${context}:seatmap_recoverNav_reselect_category`, { cats: roamCategoryTexts });
-                    await chooseCategoryFn(page, roamCategoryTexts[0], roamCategoryTexts[1] || '', categorySelectionMode);
+                    await chooseCategoryFn(page, roamCategoryTexts[0], roamCategoryTexts[1] || '', categorySelectionMode, { reapplyLastCommitted: true });
                     if (quantitySelectionMode === 'outsideSeat' && ticketCount > 1) {
                       const qtyAfterReselect = await applyTicketQuantityDropdown(page, context, ticketCount, {
                         appearMaxMs: PASSO_QTY_SELECT_APPEAR_MAX_MS
@@ -1836,7 +1863,13 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
       // seçili koltuk varsa tekrar TIKLAMA YOK
       const hasSelected = await page.evaluate((sel) => !!document.querySelector(sel), SELECTED_SEAT_SELECTOR);
       if (!hasSelected) {
-          const clickInfo = lockedSeat || await page.evaluate((sel) => {
+          let clickInfo = lockedSeat;
+          if (!clickInfo && seatSelectionMode === 'deterministic' && Array.isArray(seatPickQueue) && seatPickQueue.length) {
+            clickInfo = seatPickQueue.shift();
+          }
+
+          if (!clickInfo) {
+          const picked = await page.evaluate((sel, mode) => {
               const bySeatRect = () => {
                   const rects = Array.from(document.querySelectorAll('svg.seatmap-svg g[id^="seat"] rect'));
                   const clickable = rects.filter(r => {
@@ -1870,31 +1903,99 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                       return true;
                   });
                   if (!clickable.length) return null;
-                  const r0 = clickable[Math.floor(Math.random() * clickable.length)];
-                  const gid = r0.closest('g')?.getAttribute('id') || '';
-                  const seatId = (gid.match(/seat(\d+)/i) || [])[1] || null;
-                  const sig = {
-                      cls: (r0.getAttribute('class') || ''),
-                      fill: (r0.getAttribute('fill') || ''),
-                      stroke: (r0.getAttribute('stroke') || ''),
-                    op: (r0.getAttribute('opacity') || ''),
-                    pe: (r0.getAttribute('pointer-events') || ''),
-                    style: (r0.getAttribute('style') || '')
+                  const normToken = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+                  const parseRowSeat = (txt) => {
+                    const s = normToken(txt).toLowerCase();
+                    if (!s) return { row: null, seat: null };
+                    const rowM = s.match(/\b(?:sıra|sira|row)\s*[:#-]?\s*([a-z0-9çğıöşü]+)\b/i);
+                    const seatM = s.match(/\b(?:koltuk|seat)\s*[:#-]?\s*([a-z0-9çğıöşü]+)\b/i);
+                    return {
+                      row: rowM && rowM[1] ? normToken(rowM[1]) : null,
+                      seat: seatM && seatM[1] ? normToken(seatM[1]) : null
+                    };
                   };
-                  r0.scrollIntoView({ block: 'center', inline: 'center' });
-                  const bb = r0.getBoundingClientRect();
-                  const cx = bb.left + (bb.width / 2);
-                  const cy = bb.top + (bb.height / 2);
-                  // Skip if outside viewport
-                  if (cy <= 10 || cx <= 10 || cy >= window.innerHeight - 10 || cx >= window.innerWidth - 10) return null;
-                  return {
-                      x: cx,
-                      y: cy,
-                      w: bb.width,
-                      h: bb.height,
+                  const toNumOrNull = (v) => {
+                    const s = String(v || '').trim();
+                    if (!s) return null;
+                    if (!/^\d+$/.test(s)) return null;
+                    const n = parseInt(s, 10);
+                    return Number.isFinite(n) ? n : null;
+                  };
+                  const cmpToken = (a, b) => {
+                    const an = toNumOrNull(a);
+                    const bn = toNumOrNull(b);
+                    if (an != null && bn != null) return an - bn;
+                    if (an != null && bn == null) return -1;
+                    if (an == null && bn != null) return 1;
+                    return String(a || '').localeCompare(String(b || ''), 'tr', { numeric: true, sensitivity: 'base' });
+                  };
+
+                  const items = clickable.map((r0) => {
+                    const g = r0.closest('g');
+                    const gid = g?.getAttribute('id') || '';
+                    const seatId = (gid.match(/seat(\d+)/i) || [])[1] || null;
+                    let labelText = '';
+                    try { labelText = String(g?.getAttribute('aria-label') || r0.getAttribute('aria-label') || ''); } catch {}
+                    if (!labelText) {
+                      try { labelText = String(g?.querySelector?.('title')?.textContent || r0.querySelector?.('title')?.textContent || ''); } catch {}
+                    }
+                    const dataRow = g?.getAttribute?.('data-row') || r0.getAttribute?.('data-row') || g?.getAttribute?.('data-rowname') || r0.getAttribute?.('data-rowname') || '';
+                    const dataSeat = g?.getAttribute?.('data-seat') || r0.getAttribute?.('data-seat') || g?.getAttribute?.('data-seatname') || r0.getAttribute?.('data-seatname') || '';
+                    const parsed = parseRowSeat(labelText);
+                    const row = (dataRow && normToken(dataRow)) || parsed.row || null;
+                    const seat = (dataSeat && normToken(dataSeat)) || parsed.seat || null;
+                    r0.scrollIntoView({ block: 'center', inline: 'center' });
+                    const bb = r0.getBoundingClientRect();
+                    const cx = bb.left + (bb.width / 2);
+                    const cy = bb.top + (bb.height / 2);
+                    return {
+                      x: cx, y: cy, w: bb.width, h: bb.height,
                       seatId,
-                      sig
-                  };
+                      row,
+                      seat,
+                      labelText: labelText ? normToken(labelText) : null,
+                      sig: {
+                        cls: (r0.getAttribute('class') || ''),
+                        fill: (r0.getAttribute('fill') || ''),
+                        stroke: (r0.getAttribute('stroke') || ''),
+                        op: (r0.getAttribute('opacity') || ''),
+                        pe: (r0.getAttribute('pointer-events') || ''),
+                        style: (r0.getAttribute('style') || '')
+                      }
+                    };
+                  }).filter(it => {
+                    if (!Number.isFinite(it.x) || !Number.isFinite(it.y) || it.x <= 0 || it.y <= 0) return false;
+                    if (it.y <= 10 || it.x <= 10 || it.y >= window.innerHeight - 10 || it.x >= window.innerWidth - 10) return false;
+                    return true;
+                  });
+
+                  if (!items.length) return null;
+
+                  if (mode === 'deterministic') {
+                    items.sort((a, b) => {
+                      const aHas = !!(a.row && a.seat);
+                      const bHas = !!(b.row && b.seat);
+                      if (aHas !== bHas) return aHas ? -1 : 1;
+                      if (aHas && bHas) {
+                        const cr = cmpToken(a.row, b.row);
+                        if (cr !== 0) return cr;
+                        const cs = cmpToken(a.seat, b.seat);
+                        if (cs !== 0) return cs;
+                      }
+                      const aid = toNumOrNull(a.seatId);
+                      const bid = toNumOrNull(b.seatId);
+                      if (aid != null && bid != null && aid !== bid) return aid - bid;
+                      if (aid != null && bid == null) return -1;
+                      if (aid == null && bid != null) return 1;
+                      if (a.y !== b.y) return a.y - b.y;
+                      return a.x - b.x;
+                    });
+                    const queue = items.slice(0, 12);
+                    return { primary: queue[0] || null, queue: queue.slice(1) };
+                  }
+
+                  const r0 = items[Math.floor(Math.random() * items.length)];
+                  return { primary: r0, queue: [] };
               };
 
               const primary = bySeatRect();
@@ -1912,14 +2013,26 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
               s.scrollIntoView({block:'center', inline:'center'});
               const bb = s.getBoundingClientRect();
               window.__passobot.clicked = true;
-              return {
+              return { primary: {
                 x: Math.max(0, bb.left + (bb.width / 2)),
                 y: Math.max(0, bb.top + (bb.height / 2)),
                 w: bb.width,
                 h: bb.height,
-                seatId: null
-              };
-          }, SEAT_NODE_SELECTOR);
+                seatId: null,
+                row: null,
+                seat: null,
+                labelText: null,
+                sig: null
+              }, queue: [] };
+          }, sel, mode);
+          if (picked && typeof picked === 'object') {
+            if (Array.isArray(picked.queue) && picked.queue.length) seatPickQueue = picked.queue;
+            clickInfo = picked.primary || null;
+            if (!clickInfo && seatSelectionMode === 'deterministic' && Array.isArray(seatPickQueue) && seatPickQueue.length) {
+              clickInfo = seatPickQueue.shift();
+            }
+          }
+          }
           if (!clickInfo || !Number.isFinite(clickInfo.x) || !Number.isFinite(clickInfo.y) || clickInfo.x <= 0 || clickInfo.y <= 0) {
             await delay(200);
             continue;
@@ -1927,7 +2040,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
 
           if (!lockedSeat) {
             lockedSeat = clickInfo;
-            logger.info(`seatPick:${context}:locked`, { seatId: clickInfo.seatId, x: clickInfo.x, y: clickInfo.y });
+            logger.info(`seatPick:${context}:locked`, { seatId: clickInfo.seatId, row: clickInfo.row || null, seat: clickInfo.seat || null, mode: seatSelectionMode, x: clickInfo.x, y: clickInfo.y });
           }
 
           // Prefer deterministic click by seatId when available.
@@ -1940,6 +2053,11 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
           }
           if (!clicked) {
             logger.warn(`seatPick:${context}:click_failed`, { seatId: lockedSeat?.seatId });
+            if (seatSelectionMode === 'deterministic' && Array.isArray(seatPickQueue) && seatPickQueue.length) {
+              // Don't get stuck retrying a problematic seat; advance to the next deterministic candidate.
+              lockedSeat = null;
+              lockedMiss = 0;
+            }
             await delay(200);
             continue;
           }
@@ -1960,6 +2078,11 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
             } else {
               lockedMiss++;
               logger.warn(`seatPick:${context}:not_selected_after_click`, { seatId: lockedSeat?.seatId, lockedMiss, selDiag });
+              if (seatSelectionMode === 'deterministic' && Array.isArray(seatPickQueue) && seatPickQueue.length) {
+                logger.info(`seatPick:${context}:deterministic_advance_candidate`, { fromSeatId: lockedSeat?.seatId || null, remaining: seatPickQueue.length });
+                lockedSeat = null;
+                lockedMiss = 0;
+              }
               if (lockedMiss >= 3) {
                 logger.warn(`seatPick:${context}:lock_reset`, { seatId: lockedSeat?.seatId, reason: 'not_selected_after_3_clicks' });
                 lockedSeat = null;
@@ -2275,20 +2398,30 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
         }
       }
 
-      // swal (Tamam/Evet) modal çıkarsa kapat
+      // swal (Tamam/Evet) modal çıkarsa kapat — başlık + gövde birlikte okunur (Passo bazen metni title'da tutuyor)
       try {
           const swalText = await page.evaluate(() => {
-              const cont = document.querySelector('.swal2-container.swal2-shown');
+              const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim();
+              const cont = document.querySelector('.swal2-container.swal2-shown, .swal2-container.swal2-backdrop-show');
               if (!cont) return null;
-              const txt = (cont.querySelector('.swal2-html-container')?.innerText || cont.innerText || '').trim();
-              return txt || null;
+              const title = norm(cont.querySelector('.swal2-title')?.innerText || cont.querySelector('.swal2-title')?.textContent || '');
+              const html = norm(cont.querySelector('.swal2-html-container')?.innerText || cont.querySelector('.swal2-html-container')?.textContent || '');
+              const combined = norm(`${title} ${html}`.trim());
+              const fallback = norm(cont.innerText || '');
+              const out = combined || fallback;
+              return out || null;
           });
           if (swalText) {
-              logger.warn(`seatPick:${context}:swal`, { text: swalText });
+              const basketSuccessSwal = /(koltuk|biletiniz|bilet|ürün).{0,120}?(sepete|sepet)\s*(aktarıldı|eklendi|alındı|taşındı|yönlendirildi)|sepete\s*aktarıldı|sepete\s*eklendi|başarıyla\s*eklendi|işlem\s*başarılı/i.test(swalText);
+              if (basketSuccessSwal) {
+                  logger.info(`seatPick:${context}:swal_basket_success`, { text: swalText });
+              } else {
+                  logger.warn(`seatPick:${context}:swal`, { text: swalText });
+              }
               const needsMore = /lütfen\s*1\s*adet\s*daha\s*ürün\s*seçiniz/i.test(swalText);
               const seatProblem = /(koltuk\s*seç|koltuk\s*seçiniz|koltuk\s*dolu|seçtiğiniz\s*koltuk|seat\s*(is|was)\s*(not|no)\s*available)/i.test(swalText);
               const sessionProblem = /(oturum|zaman\s*aşımı|süre\s*doldu|yeniden\s*giriş|session\s*(expired|timeout)|time\s*(out|expired))/i.test(swalText);
-              await confirmSwalYes(page, 5000);
+              await confirmSwalYes(page, basketSuccessSwal ? 12000 : 8000);
               if (sessionProblem) {
                   throw new Error(`Oturum/Zaman aşımı uyarısı: ${swalText}`);
               }
@@ -2305,7 +2438,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                       throw new Error('"1 adet daha ürün seçiniz" uyarısı devam ediyor. İkinci koltuk eklenemedi veya sepet akışı ilerlemiyor.');
                   }
               }
-              if (seatProblem) {
+              if (seatProblem && !basketSuccessSwal) {
                   // yanlış/dolu koltuk seçildi veya seçim yok uyarısı -> lock reset + seatmap'i tekrar hazırla
                   lockedSeat = null;
                   lockedMiss = 0;
@@ -2562,7 +2695,7 @@ async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) 
     // Seçili seat kontrolü
     const selectedMatches = await page.evaluate(({ wantSeatId, wantRow, wantSeat }) => {
       const norm = (s) => (s || '').toString().trim().toLowerCase();
-      const sel = document.querySelector('circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"], svg.seatmap-svg g.seatActive, svg.seatmap-svg g.seatActive rect, svg.seatmap-svg g.selected, svg.seatmap-svg g.selected rect');
+      const sel = document.querySelector('circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"], svg.seatmap-svg rect.seatActive, svg.seatmap-svg g.seatActive, svg.seatmap-svg g.seatActive rect, svg.seatmap-svg g.selected, svg.seatmap-svg g.selected rect');
       if (!sel) return false;
 
       // Passo SVG map: seat id can be embedded in class names (g<id>, block<id>)
@@ -2700,14 +2833,14 @@ async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) 
       // click sonrası seçimin DOM'a düşmesini kısa süre bekle
       for (let w = 0; w < (isAggressive ? 20 : 10); w++) {
         const selNow = await page.evaluate(() => !!document.querySelector(
-          'circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"]'
+          'circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"], svg.seatmap-svg rect.seatActive, svg.seatmap-svg g.seatActive rect'
         ));
         if (selNow) break;
         await delay(isAggressive ? 30 : 60);
       }
 
       const selectedNow = await page.evaluate(() => !!document.querySelector(
-        'circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"], svg.seatmap-svg g.seatActive, svg.seatmap-svg g.seatActive rect, svg.seatmap-svg g.selected, svg.seatmap-svg g.selected rect'
+        'circle.seat-circle.selected, circle.seat-circle[aria-pressed="true"], [data-selected="true"], svg.seatmap-svg rect.seatActive, svg.seatmap-svg g.seatActive, svg.seatmap-svg g.seatActive rect, svg.seatmap-svg g.selected, svg.seatmap-svg g.selected rect'
       ));
 
       if (selectedNow) {

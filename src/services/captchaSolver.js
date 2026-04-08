@@ -1,6 +1,9 @@
 const axios = require('axios');
 const ac = require('@antiadmin/anticaptchaofficial');
 
+const PROVIDER_COOLDOWN_MS = 5 * 60 * 1000;
+const providerCooldownUntil = new Map();
+
 function normalizeProviderName(v) {
   const s = String(v || '').trim().toLowerCase();
   if (!s) return '';
@@ -15,6 +18,42 @@ function buildProviderChain(cfg) {
     .map((x) => normalizeProviderName(x))
     .filter(Boolean);
   return Array.from(new Set([primary, ...fallbackRaw]));
+}
+
+function nowMs() {
+  return Date.now();
+}
+
+function getProviderCooldownUntil(provider) {
+  const until = Number(providerCooldownUntil.get(provider) || 0);
+  return Number.isFinite(until) ? until : 0;
+}
+
+function isProviderCoolingDown(provider) {
+  return getProviderCooldownUntil(provider) > nowMs();
+}
+
+function setProviderCooldown(provider, ms = PROVIDER_COOLDOWN_MS) {
+  const ttl = Math.max(5000, Number(ms) || PROVIDER_COOLDOWN_MS);
+  providerCooldownUntil.set(provider, nowMs() + ttl);
+}
+
+function classifyProviderError(message) {
+  const m = String(message || '').toLowerCase();
+  if (!m) return { cooldown: false };
+  if (m.includes('_key_missing')) return { cooldown: true, reason: 'key_missing' };
+  if (m.includes('status code 401')) return { cooldown: true, reason: 'unauthorized' };
+  if (m.includes('error_key_does_not_exist') || m.includes('error wrong user key') || m.includes('invalid key')) {
+    return { cooldown: true, reason: 'invalid_key' };
+  }
+  return { cooldown: false };
+}
+
+function buildEffectiveProviderChain(cfg) {
+  const chain = buildProviderChain(cfg);
+  const active = chain.filter((provider) => !isProviderCoolingDown(provider));
+  if (active.length > 0) return { chain: active, skipped: chain.filter((x) => !active.includes(x)) };
+  return { chain, skipped: [] };
 }
 
 function getPollConfig(cfg) {
@@ -187,23 +226,27 @@ async function solveWithChain(chain, solveOneFn) {
     try {
       const token = await solveOneFn(provider);
       if (!token) throw new Error('EMPTY_TOKEN');
+      if (providerCooldownUntil.has(provider)) providerCooldownUntil.delete(provider);
       return { token: String(token), provider };
     } catch (e) {
-      errors.push({ provider, error: e?.message || String(e) });
+      const errMsg = e?.message || String(e);
+      const cls = classifyProviderError(errMsg);
+      if (cls.cooldown) setProviderCooldown(provider);
+      errors.push({ provider, error: errMsg, cooldown: !!cls.cooldown, reason: cls.reason || '' });
     }
   }
-  const detail = errors.map((x) => `${x.provider}:${x.error}`).join(' | ');
+  const detail = errors.map((x) => `${x.provider}:${x.error}${x.cooldown ? ':cooldown' : ''}`).join(' | ');
   throw new Error(`CAPTCHA_SOLVE_ALL_PROVIDERS_FAILED ${detail}`);
 }
 
 async function solveTurnstileProxyless({ url, siteKey, cfg }) {
-  const chain = buildProviderChain(cfg);
-  return await solveWithChain(chain, async (provider) => solveTurnstileWithProvider(provider, { url, siteKey, cfg }));
+  const effective = buildEffectiveProviderChain(cfg);
+  return await solveWithChain(effective.chain, async (provider) => solveTurnstileWithProvider(provider, { url, siteKey, cfg }));
 }
 
 async function solveRecaptchaV2Proxyless({ url, siteKey, invisible, cfg }) {
-  const chain = buildProviderChain(cfg);
-  return await solveWithChain(chain, async (provider) => solveRecaptchaV2WithProvider(provider, { url, siteKey, invisible, cfg }));
+  const effective = buildEffectiveProviderChain(cfg);
+  return await solveWithChain(effective.chain, async (provider) => solveRecaptchaV2WithProvider(provider, { url, siteKey, invisible, cfg }));
 }
 
 module.exports = {

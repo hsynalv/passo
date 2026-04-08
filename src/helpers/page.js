@@ -1,6 +1,7 @@
 const delay = require('../utils/delay');
 const { getCfg } = require('../runCfg');
 const { evaluateSafe, waitForFunctionSafe } = require('../utils/browserEval');
+const logger = require('../utils/logger');
 
 const SEAT_NODE_SELECTOR = 'circle.seat-circle, .seat-circle, [seat-id], [data-seat-id], [data-id][class*="seat"], [class*="seat-circle"], svg circle[class*="seat"], svg.seatmap-svg g[id^="seat"], svg.seatmap-svg g[id^="seat"] rect, svg.seatmap-svg g[id^="seat"] circle, svg.seatmap-svg g[id^="seat"] path, svg.seatmap-svg g[id^="seat"] polygon, svg.seatmap-svg g[id^="seat"] line, svg.seatmap-svg rect[class^="block"]';
 
@@ -894,9 +895,10 @@ async function clickContinueInsidePage(page){
   try {
       // Find the button and get its coordinates
       const btnData = await page.evaluate(() => {
-          const norm = (s) => (s || '').toString().trim().toLowerCase();
+          const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
           const candidates = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"], .black-btn, .btn, [role="button"]'))
               .filter(el => {
+                  if (el.closest('.swal2-container, .cdk-overlay-container, [role="dialog"]')) return false;
                   const st = window.getComputedStyle(el);
                   const visible = !!(el.offsetParent !== null) && st && st.visibility !== 'hidden' && st.display !== 'none';
                   if (!visible) return false;
@@ -904,15 +906,22 @@ async function clickContinueInsidePage(page){
                   return true;
               });
 
+          /**
+           * Önceden yalnızca "sepete" geçen her şey +5 alıyordu; "Sepete git" gibi linkler
+           * "Devam"dan (3) yüksek çıkıp yanlış tıklanıyordu. Gerçek CTA: sepete+devam veya saf devam.
+           */
           const scoreEl = (el) => {
               const t = norm(el.innerText || el.textContent || el.value || '');
-              if (t === 'sepete devam et') return 100;
+              if (!t) return 0;
+              if (/(aktarıldı|başarılı\s*!|işlem\s*başarılı|ürün(ünüz)?\s*eklendi)/i.test(t)) return -50;
               if (t.includes('seçimi') || t.includes('değiştir')) return -1;
-              let score = 0;
-              if (t.includes('sepete') && t.includes('devam')) score += 10;
-              else if (t.includes('sepete')) score += 5;
-              else if (t.includes('devam')) score += 3;
-              return score;
+              if ((t.includes('sepete') || t.includes('sepet')) && (t.includes('git') || t === 'sepet' || /^sepete\s*$/i.test(t))) return -20;
+              if (t === 'sepete devam et' || (t.includes('sepete') && t.includes('devam'))) return 100;
+              if (t.includes('devam') && (t.includes('sepete') || t.includes('sepet'))) return 95;
+              if (t === 'devam' || t === 'devam et' || /^devam\b/i.test(t) && t.length <= 28) return 55;
+              if (t.includes('devam')) return 40;
+              if (t.includes('sepete') && !t.includes('devam')) return 2;
+              return 0;
           };
 
           let best = null;
@@ -928,15 +937,36 @@ async function clickContinueInsidePage(page){
 
           best.scrollIntoView({ block: 'center', inline: 'center' });
           const r = best.getBoundingClientRect();
+          const x = r.left + (r.width / 2);
+          const y = r.top + (r.height / 2);
+          try {
+            const topEl = document.elementFromPoint(x, y);
+            if (topEl) {
+              const inTurnstile = !!topEl.closest?.('.cf-turnstile, [class*="turnstile" i], iframe[src*="challenges.cloudflare" i], iframe[src*="turnstile" i]');
+              if (inTurnstile || (topEl.tagName === 'IFRAME' && /cloudflare|turnstile|recaptcha/i.test(String(topEl.getAttribute('src') || '')))) {
+                return { blocked: true, reason: 'captcha_overlay', x, y, text: (best.innerText || '').trim().substring(0, 80), score: bestScore };
+              }
+            }
+          } catch {}
           return {
-            x: r.left + (r.width / 2),
-            y: r.top + (r.height / 2),
-            text: (best.innerText || '').trim().substring(0, 50),
+            x,
+            y,
+            text: (best.innerText || '').trim().substring(0, 80),
             score: bestScore
           };
       });
       
-      if (!btnData || !btnData.x || !btnData.y) return false;
+      if (!btnData || btnData.blocked) {
+        if (btnData && btnData.blocked) {
+          logger.warn('clickContinueInsidePage:blocked_overlay', {
+            reason: btnData.reason || 'unknown',
+            labelText: btnData.text || '',
+            score: btnData.score
+          });
+        }
+        return false;
+      }
+      if (!btnData.x || !btnData.y) return false;
       
       // Use Puppeteer mouse click - this triggers Angular event handlers properly
       await page.mouse.move(btnData.x, btnData.y);

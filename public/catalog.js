@@ -160,7 +160,13 @@
       const sub = document.createElement('span');
       const tc = item.ticketCount || 1;
       const adj = item.adjacentSeats ? 'Yanyana' : 'Serbest';
-      sub.textContent = tc > 1 ? `${tc} bilet · ${adj}` : '1 bilet';
+      const hint = String(item.selectionModeHint || '').trim();
+      const extra = [];
+      const hintLower = hint.toLowerCase();
+      const svgishHint = hintLower === 'scan_map' || hintLower === 'svg';
+      if (hint && !svgishHint) extra.push(`mod: ${hint}`);
+      const baseLine = tc > 1 ? `${tc} bilet · ${adj}` : '1 bilet';
+      sub.textContent = extra.length ? `${baseLine} · ${extra.join(' · ')}` : baseLine;
       meta.appendChild(title);
       meta.appendChild(sub);
       wrap.appendChild(input);
@@ -498,6 +504,12 @@
       renderCredentialPickers();
       renderManageCategoryList();
       renderManageCredentialList();
+    }
+  }
+
+  async function reloadCategories() {
+    if (state.selectedTeamId) {
+      await loadSelectedTeamData();
     }
   }
 
@@ -879,6 +891,7 @@
     init,
     loadTeams,
     openModal,
+    reloadCategories,
     setNotifier,
   };
 })();

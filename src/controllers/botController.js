@@ -32,14 +32,16 @@ function normalizeSelectedCategory(item, fallbackMode = 'scan') {
     const selectionModeHint = String(item.selectionModeHint || fallbackMode || 'scan').trim().toLowerCase();
     const tc = Number(item.ticketCount);
     const ticketCount = Number.isFinite(tc) && tc >= 1 ? Math.min(Math.floor(tc), 10) : 1;
+    const svgBlockId = String(item.svgBlockId || '').trim();
     return {
         id: item.id ? String(item.id) : null,
         label: String(item.label || item.name || categoryType).trim(),
         categoryType,
         alternativeCategory,
-        selectionModeHint: ['legacy', 'scan', 'svg'].includes(selectionModeHint) ? selectionModeHint : String(fallbackMode || 'scan').trim().toLowerCase(),
+        selectionModeHint: ['legacy', 'scan', 'svg', 'scan_map'].includes(selectionModeHint) ? selectionModeHint : String(fallbackMode || 'scan').trim().toLowerCase(),
         ticketCount,
-        adjacentSeats: item.adjacentSeats === true
+        adjacentSeats: item.adjacentSeats === true,
+        ...(svgBlockId ? { svgBlockId } : {})
     };
 }
 
@@ -67,7 +69,8 @@ async function resolveCategoriesForCredential(teamId, selectedCategories, creden
       selectionModeHint: item.selectionModeHint,
       sortOrder: item.sortOrder,
       ticketCount: item.ticketCount,
-      adjacentSeats: item.adjacentSeats
+      adjacentSeats: item.adjacentSeats,
+      svgBlockId: item.svgBlockId
     }, categorySelectionMode))
     .filter(Boolean);
 }
@@ -601,6 +604,8 @@ function createCategoryChooser(selectedCategories, fallbackCategoryType, fallbac
         .map((item) => normalizeSelectedCategory(item, defaultMode))
         .filter(Boolean);
     let nextIndex = 0;
+    /** Son başarılı kategori indeksi; seatmap recover’da nextIndex ilerlemesin diye */
+    let lastCommittedCategoryIndex = null;
 
     const peekNext = () => {
         const chosen = normalized[nextIndex] || normalized[0] || null;
@@ -621,47 +626,250 @@ function createCategoryChooser(selectedCategories, fallbackCategoryType, fallbac
         list: normalized,
         peekNext,
         getRoamTexts: () => buildCategoryRoamTexts(normalized, fallbackCategoryType, fallbackAlternativeCategory),
-        async choose(page, categoryType, alternativeCategory, selectionMode) {
+        async choose(page, categoryType, alternativeCategory, selectionMode, opts = null) {
+            const reapplyLast = opts && opts.reapplyLastCommitted === true;
             if (!normalized.length) {
                 return chooseCategoryAndRandomBlock(
                     page,
                     fallbackCategoryType || categoryType,
                     fallbackAlternativeCategory || alternativeCategory,
-                    selectionMode || defaultMode
+                    selectionMode || defaultMode,
+                    ''
                 );
             }
-            const chosen = normalized[nextIndex] || normalized[0];
-            nextIndex = normalized.length > 1 ? ((nextIndex + 1) % normalized.length) : 0;
+            const nlen = normalized.length;
+            const idx = reapplyLast
+                ? (lastCommittedCategoryIndex != null
+                    ? lastCommittedCategoryIndex
+                    : (nlen ? (nextIndex + nlen - 1) % nlen : 0))
+                : nextIndex;
+            const chosen = normalized[idx] || normalized[0];
+            if (!reapplyLast) {
+                nextIndex = normalized.length > 1 ? ((nextIndex + 1) % normalized.length) : 0;
+            }
             const mode = String(selectionMode || chosen.selectionModeHint || defaultMode || 'scan').trim().toLowerCase();
             logger.info('categoryBlock:selected_category_candidate', {
                 categoryId: chosen.id || null,
                 label: chosen.label || null,
                 categoryType: chosen.categoryType,
+                svgBlockId: chosen.svgBlockId || null,
                 alternativeCategory: chosen.alternativeCategory || null,
                 mode,
                 nextIndex,
-                total: normalized.length
+                total: normalized.length,
+                reapplyLastCommitted: reapplyLast || false,
+                usedIndex: idx
             });
+            const svgBid = String(chosen.svgBlockId || '').trim();
+            if (svgBid) {
+                const catLog = {
+                    categoryId: chosen.id || null,
+                    categoryLabel: chosen.label || null,
+                    categoryType: chosen.categoryType || null,
+                    svgBlockId: svgBid
+                };
+                logger.info('categoryBlock:direct_svg_block_from_db_category', catLog);
+                const directOk = await selectSvgBlockById(page, svgBid, {
+                    categoryId: chosen.id,
+                    categoryLabel: chosen.label,
+                    categoryType: chosen.categoryType
+                });
+                if (directOk) {
+                    lastCommittedCategoryIndex = idx;
+                    return { svgBlockId: svgBid, chosenCategory: chosen };
+                }
+                logger.warn('categoryBlock:direct_svg_block_failed_fallback_text', catLog);
+            }
             const result = await chooseCategoryAndRandomBlock(
                 page,
                 chosen.categoryType,
                 chosen.alternativeCategory,
-                mode
+                mode,
+                chosen.svgBlockId
             );
             if (result && typeof result === 'object') result.chosenCategory = chosen;
+            if (result) lastCommittedCategoryIndex = idx;
             return result;
         }
     };
 }
 
-async function selectSvgBlockById(page, blockId) {
+/**
+ * openSeatMapStrict koltuk node'larını beklediği için blok tıklamadan önce 10–20sn boşa gidebiliyor.
+ * Burada yalnızca svgLayout + hedef blok id için hızlı yol: hazırsa hiç bekleme; değilse tek tık + kısa poll.
+ */
+async function ensureSvgBlockLayerVisible(page, blockId, logBase) {
+    const bid = String(blockId || '').trim();
+    if (!bid) return;
+    const ensureStarted = Date.now();
+
+    const snapshot = async () => page.evaluate((id) => {
+        const hasLayout = !!document.querySelector('svg.svgLayout, .svgLayout');
+        const el = document.getElementById(id);
+        return { hasLayout, hasBlock: !!el };
+    }, bid).catch(() => ({ hasLayout: false, hasBlock: false }));
+
+    let st = await snapshot();
+    if (st.hasLayout && st.hasBlock) {
+        logger.info('categoryBlock:ensureSvgBlockLayer_fast_path', { ...logBase, note: 'svgLayout+block zaten DOMda', waitMs: Date.now() - ensureStarted });
+        return;
+    }
+
+    try {
+        await page.evaluate(() => {
+            const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+            const byId = document.getElementById('custom_seat_button');
+            const byText = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')).find((el) => {
+                const t = norm(el.innerText || el.textContent || el.value || '');
+                if (!t) return false;
+                return (
+                    t.includes('kendim seçmek istiyorum') ||
+                    t === 'seçimi değiştir' ||
+                    (t.includes('koltuk') && (t.includes('seç') || t.includes('seçim') || t.includes('değiştir')))
+                );
+            });
+            const btn = byId || byText;
+            if (!btn || btn.disabled) return;
+            try { btn.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+            try { btn.click(); } catch {}
+        });
+    } catch {}
+
+    const deadline = Date.now() + 8500;
+    while (Date.now() < deadline) {
+        st = await snapshot();
+        if (st.hasLayout && st.hasBlock) {
+            logger.info('categoryBlock:ensureSvgBlockLayer_after_self_select', { ...logBase, waitMs: Date.now() - ensureStarted });
+            return;
+        }
+        await delay(100);
+    }
+
+    logger.warn('categoryBlock:ensureSvgBlockLayer_fallback_openSeatMapStrict', { ...logBase });
+    try {
+        await openSeatMapStrict(page);
+    } catch {}
+}
+
+async function selectSvgBlockById(page, blockId, meta = {}) {
     const safeId = String(blockId || '').trim();
     if (!safeId) return false;
+
+    const logBase = {
+        svgBlockId: safeId,
+        categoryId: meta.categoryId != null ? String(meta.categoryId) : null,
+        categoryLabel: meta.categoryLabel != null ? String(meta.categoryLabel) : null,
+        categoryType: meta.categoryType != null ? String(meta.categoryType) : null
+    };
+    logger.info('categoryBlock:selectSvgBlockById_start', logBase);
+
+    await ensureSvgBlockLayerVisible(page, safeId, logBase);
+
+    try {
+        await page.waitForSelector('svg.svgLayout, .svgLayout', { timeout: 6000 });
+    } catch (e) {
+        logger.warn('categoryBlock:selectSvgBlockById_svg_layout_wait', { ...logBase, error: e?.message || String(e) });
+    }
+
+    let effectiveId = safeId;
+    try {
+        await page.waitForFunction(
+            (bid) => {
+                const el = document.getElementById(bid);
+                if (!el) return false;
+                try {
+                    const r = el.getBoundingClientRect();
+                    if (r && r.width > 1 && r.height > 1) return true;
+                } catch {}
+                try {
+                    const b = typeof el.getBBox === 'function' ? el.getBBox() : null;
+                    return !!(b && b.width > 0 && b.height > 0);
+                } catch {
+                    return true;
+                }
+            },
+            { timeout: 10000, polling: 100 },
+            effectiveId
+        );
+    } catch {
+        const altId = await page.evaluate((want) => {
+            const w = String(want || '').toLowerCase();
+            const nodes = document.querySelectorAll('svg.svgLayout g[id], .svgLayout g[id], svg g[id].svgBlock, .svgBlock[id]');
+            for (const n of nodes) {
+                const id = n.getAttribute?.('id') || n.id;
+                if (id && String(id).toLowerCase() === w) return String(id);
+            }
+            const all = document.querySelectorAll('[id]');
+            for (const n of all) {
+                const id = n.getAttribute?.('id') || n.id;
+                if (id && String(id).toLowerCase() === w && /^block/i.test(String(id))) return String(id);
+            }
+            return null;
+        }, safeId).catch(() => null);
+
+        if (altId) {
+            effectiveId = altId;
+            try {
+                await page.waitForFunction(
+                    (bid) => {
+                        const el = document.getElementById(bid);
+                        if (!el) return false;
+                        try {
+                            const r = el.getBoundingClientRect();
+                            if (r && r.width > 1 && r.height > 1) return true;
+                        } catch {}
+                        try {
+                            const b = typeof el.getBBox === 'function' ? el.getBBox() : null;
+                            return !!(b && b.width > 0 && b.height > 0);
+                        } catch {
+                            return true;
+                        }
+                    },
+                    { timeout: 7000, polling: 120 },
+                    effectiveId
+                );
+            } catch (e2) {
+                const diag = await page.evaluate((want) => {
+                    const ids = [];
+                    const nodes = document.querySelectorAll('svg.svgLayout g[id], .svgLayout g[id]');
+                    for (let i = 0; i < Math.min(nodes.length, 14); i++) {
+                        ids.push(nodes[i].getAttribute('id') || nodes[i].id || '');
+                    }
+                    return {
+                        want,
+                        sampleBlockIds: ids,
+                        hasSvgLayout: !!document.querySelector('svg.svgLayout, .svgLayout')
+                    };
+                }, safeId).catch(() => null);
+                logger.warn('categoryBlock:selectSvgBlockById_block_missing', { ...logBase, effectiveId, error: e2?.message || String(e2), diag });
+                return false;
+            }
+        } else {
+            const diag = await page.evaluate((want) => {
+                const ids = [];
+                const nodes = document.querySelectorAll('svg.svgLayout g[id], .svgLayout g[id]');
+                for (let i = 0; i < Math.min(nodes.length, 14); i++) {
+                    ids.push(nodes[i].getAttribute('id') || nodes[i].id || '');
+                }
+                return {
+                    want,
+                    sampleBlockIds: ids,
+                    hasSvgLayout: !!document.querySelector('svg.svgLayout, .svgLayout')
+                };
+            }, safeId).catch(() => null);
+            logger.warn('categoryBlock:selectSvgBlockById_block_missing', { ...logBase, diag });
+            return false;
+        }
+    }
+
+    if (effectiveId !== safeId) {
+        logger.info('categoryBlock:selectSvgBlockById_id_resolved', { ...logBase, effectiveId });
+    }
 
     try {
         await page.evaluate((bid) => {
             try { window.__passobotLastSvgBlockId = String(bid || ''); } catch {}
-        }, safeId);
+        }, effectiveId);
     } catch {}
 
     const clickPoint = await page.evaluate((targetId) => {
@@ -715,9 +923,14 @@ async function selectSvgBlockById(page, blockId) {
             }
         })();
         return { ok: true, id: targetId, tag: asEl.tagName, x, y, method: 'getBoundingClientRect', top, pe };
-    }, safeId).catch(() => ({ ok: false, id: safeId, reason: 'eval_failed' }));
+    }, effectiveId).catch(() => ({ ok: false, id: effectiveId, reason: 'eval_failed' }));
 
-    if (!clickPoint || !clickPoint.ok || !Number.isFinite(clickPoint.x) || !Number.isFinite(clickPoint.y)) return false;
+    if (!clickPoint || !clickPoint.ok || !Number.isFinite(clickPoint.x) || !Number.isFinite(clickPoint.y)) {
+        logger.warn('categoryBlock:selectSvgBlockById_no_click_point', { ...logBase, effectiveId, reason: clickPoint?.reason || null, clickPoint });
+        return false;
+    }
+
+    logger.info('categoryBlock:selectSvgBlockById_pointer', { ...logBase, effectiveId, method: clickPoint.method || null });
 
     // If the target block (or its subtree) is not hit-testable, force pointer-events back.
     try {
@@ -736,7 +949,7 @@ async function selectSvgBlockById(page, blockId) {
                         }
                     } catch {}
                 } catch {}
-            }, safeId);
+            }, effectiveId);
         }
     } catch {}
 
@@ -771,8 +984,8 @@ async function selectSvgBlockById(page, blockId) {
 
     try {
         // Move like a real user (hover tooltip already appears in some UIs)
-        await page.mouse.move(clickPoint.x, clickPoint.y, { steps: 14 });
-        await delay(60);
+        await page.mouse.move(clickPoint.x, clickPoint.y, { steps: 6 });
+        await delay(35);
         // Some UIs require pointerover/move to arm the click handler
         try {
             await page.evaluate((x, y) => {
@@ -806,11 +1019,10 @@ async function selectSvgBlockById(page, blockId) {
 
         // Prefer down/up with realistic delays; some handlers ignore .click()
         await page.mouse.down();
-        await delay(90);
+        await delay(45);
         await page.mouse.up();
-        await delay(40);
-        // Extra click as a fallback
-        await page.mouse.click(clickPoint.x, clickPoint.y, { delay: 55 });
+        await delay(25);
+        await page.mouse.click(clickPoint.x, clickPoint.y, { delay: 35 });
     } catch {
         return false;
     }
@@ -853,10 +1065,12 @@ async function selectSvgBlockById(page, blockId) {
         }, clickPoint.x, clickPoint.y);
     } catch {}
 
-    try { await openSeatMapStrict(page); } catch {}
+    // Koltukları burada beklemeyin: openSeatMapStrict koltuk node şartı yüzünden +20sn kaybediyordu.
+    // Koltuk hazırlığı seat pick aşamasında yapılır.
     try {
-        await page.waitForFunction((sel) => document.querySelectorAll(sel).length > 0, { timeout: 20000 }, SEAT_NODE_SELECTOR);
+        await page.waitForFunction((sel) => document.querySelectorAll(sel).length > 0, { timeout: 4500, polling: 120 }, SEAT_NODE_SELECTOR);
     } catch {}
+    logger.info('categoryBlock:selectSvgBlockById_done', { ...logBase, effectiveId });
     return true;
 }
 
@@ -867,7 +1081,10 @@ async function applyCategoryBlockSelection(page, selectionMode, catBlock, seatIn
         (seatInfo && seatInfo.svgBlockId ? String(seatInfo.svgBlockId) : '') ||
         '';
     if (svgBlockId) {
-        return await selectSvgBlockById(page, svgBlockId);
+        return await selectSvgBlockById(page, svgBlockId, {
+            categoryLabel: catBlock?.categoryText || null,
+            categoryType: catBlock?.categoryText || null
+        });
     }
     await setCatBlockOnB(page, catBlock);
     return true;
@@ -1477,7 +1694,7 @@ async function killSessions(req, res) {
     });
 }
 
-module.exports = { startBot, startBotAsync, registerCAccount, requestFinalize, getRunStatus, killSessions };
+module.exports = { startBot, startBotAsync, registerCAccount, requestFinalize, getRunStatus, killSessions, launchAndLogin };
 
 // Global semaphore to avoid hammering captcha provider with too many parallel solves.
 // This helps reduce queueing and long tail solve times in multi-account runs.
@@ -3125,7 +3342,7 @@ async function launchAndLogin(options) {
             const visible = st && st.display !== 'none' && st.visibility !== 'hidden' && st.opacity !== '0' && btn.offsetParent !== null;
             if (!visible) return false;
             return !btn.disabled && btn.getAttribute('disabled') === null;
-        }, { timeout: 15000, polling: 250 });
+        }, { timeout: 12000, polling: 120 });
         logger.info('launchAndLogin: login button enabled after turnstile', { email });
     } catch {
         // If we can't detect enabled state, continue with existing click fallbacks.
@@ -3218,7 +3435,7 @@ async function launchAndLogin(options) {
             await delay(500);
         }
     };
-    await waitForGirisBtn();
+    await waitForGirisBtn(7000);
     const tryFormSubmitEarly = async () => {
         await dismissObstructions('before_early_submit');
         const r = await evaluateSafe(evalTarget, () => {
@@ -3304,9 +3521,20 @@ async function launchAndLogin(options) {
     });
 
     let submitResult = null;
+    const tokenLikelyReady = await evaluateSafe(evalTarget, () => {
+        const i = document.querySelector('input[name="cf-turnstile-response"]');
+        return !!(i && String(i.value || '').length > 40);
+    }).catch(() => false);
+    if (tokenLikelyReady) {
+        await dismissObstructions('token_ready_fast_submit');
+        submitResult = await tryFormSubmitEarly();
+        if (!submitResult) submitResult = await tryClickGirisBtn();
+        if (submitResult) logger.info('launchAndLogin: hizli submit (turnstile token hazir)', { email, method: submitResult });
+    }
+
     const pollStart = Date.now();
-    const pollMaxMs = 8000;
-    const pollIntervalMs = 500;
+    const pollMaxMs = submitResult ? 0 : 5000;
+    const pollIntervalMs = 320;
     while (Date.now() - pollStart < pollMaxMs) {
         try {
             await dismissObstructions('before_click_giris');
@@ -3405,11 +3633,11 @@ async function launchAndLogin(options) {
     }
     logger.info('launchAndLogin: GİRİŞ submit', { method: submitResult });
 
-    await delay(500);
+    await delay(350);
     const dismissLoginErrorModal = async () => {
         const evalTarget = loginCtx?.frame || page;
-        for (let i = 0; i < 15; i++) {
-            await delay(2000);
+        for (let i = 0; i < 5; i++) {
+            await delay(350);
             const dismissed = await evaluateSafe(evalTarget, () => {
                 var root = document.querySelector('.swal2-container.swal2-shown, .modal.show, [role="dialog"][aria-modal="true"]');
                 if (!root) return false;
@@ -3431,16 +3659,18 @@ async function launchAndLogin(options) {
         }
         return false;
     };
+    // domcontentloaded: 'load' çok geç tetikleniyor; URL değişimi genelde daha hızlı yakalanır
+    const postSubmitRaceMs = 16000;
     await Promise.race([
-        page.waitForNavigation({ waitUntil: 'load', timeout: 25000 }).catch(() => {}),
-        page.waitForFunction(() => !/\/giris(\?|$)/i.test(location.href || ''), { timeout: 25000 }).catch(() => {}),
-        (async () => {
-            const d = await dismissLoginErrorModal();
-            if (d) await delay(2000);
-        })(),
-        delay(25000)
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: postSubmitRaceMs }).catch(() => {}),
+        page.waitForFunction(() => !/\/giris(\?|$)/i.test(location.href || ''), { timeout: postSubmitRaceMs, polling: 80 }).catch(() => {}),
+        delay(postSubmitRaceMs)
     ]);
-    await delay(getCfg().DELAYS.AFTER_LOGIN || 800);
+    await Promise.race([
+        dismissLoginErrorModal().catch(() => {}),
+        delay(1000)
+    ]);
+    await delay(Math.min(450, Number(getCfg().DELAYS.AFTER_LOGIN) || 450));
 
     try {
         const postLogin = await evalOnPage(page, `
@@ -3470,8 +3700,20 @@ async function launchAndLogin(options) {
     } catch {}
 
     let finalUrl = (() => { try { return page.url(); } catch { return ''; } })();
+    const hasPassoSessionHints = async () => evaluateSafe(page, () => {
+        const b = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : '';
+        if (b.includes('çıkış') || b.includes('cikis') || b.includes('hesabım') || b.includes('hesabim')) return true;
+        return !!document.querySelector('a[href*="cikis" i], a[href*="logout" i], a[href*="/hesabim" i]');
+    }).catch(() => false);
+
+    if (/\/giris(\?|$)/i.test(finalUrl) && (await hasPassoSessionHints())) {
+        logger.info('launchAndLogin: giris URL ama oturum icerigi var, basarili', { email, finalUrl });
+        await delay(Math.min(500, Number(getCfg().DELAYS.AFTER_LOGIN) || 500));
+        return { browser, page };
+    }
+
     if (/\/giris(\?|$)/i.test(finalUrl) && submitResult) {
-        await delay(1500);
+        await delay(900);
         const modalDismissed = await evaluateSafe(evalTarget, () => {
             var root = document.querySelector('.swal2-container.swal2-shown, .modal.show');
             if (!root) return false;
@@ -3494,16 +3736,20 @@ async function launchAndLogin(options) {
             const retrySubmit = await tryFormSubmitEarly();
             if (retrySubmit) {
                 await Promise.race([
-                    page.waitForNavigation({ waitUntil: 'load', timeout: 20000 }).catch(() => {}),
-                    page.waitForFunction(() => !/\/giris(\?|$)/i.test(location.href || ''), { timeout: 20000 }).catch(() => {}),
-                    delay(20000)
+                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 14000 }).catch(() => {}),
+                    page.waitForFunction(() => !/\/giris(\?|$)/i.test(location.href || ''), { timeout: 14000, polling: 80 }).catch(() => {}),
+                    delay(14000)
                 ]);
-                await delay(getCfg().DELAYS.AFTER_LOGIN || 800);
+                await delay(Math.min(600, Number(getCfg().DELAYS.AFTER_LOGIN) || 600));
             }
             finalUrl = (() => { try { return page.url(); } catch { return ''; } })();
         }
     }
     if (/\/giris(\?|$)/i.test(finalUrl) && submitResult) {
+        if (await hasPassoSessionHints()) {
+            logger.info('launchAndLogin: final recovery atlandi (oturum isareti mevcut)', { email, finalUrl });
+            return { browser, page };
+        }
         logger.warn('launchAndLogin: hala login sayfasında, final recovery deneniyor', { email, submitResult, finalUrl });
         try {
             loginCtx = await ensureLoginFormWithReload() || loginCtx;
@@ -3523,11 +3769,11 @@ async function launchAndLogin(options) {
                 }
             }
             await Promise.race([
-                page.waitForNavigation({ waitUntil: 'load', timeout: 20000 }).catch(() => {}),
-                page.waitForFunction(() => !/\/giris(\?|$)/i.test(location.href || ''), { timeout: 20000 }).catch(() => {}),
-                delay(20000)
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 14000 }).catch(() => {}),
+                page.waitForFunction(() => !/\/giris(\?|$)/i.test(location.href || ''), { timeout: 14000, polling: 80 }).catch(() => {}),
+                delay(14000)
             ]);
-            await delay(getCfg().DELAYS.AFTER_LOGIN || 800);
+            await delay(Math.min(600, Number(getCfg().DELAYS.AFTER_LOGIN) || 600));
             finalUrl = (() => { try { return page.url(); } catch { return ''; } })();
         } catch (e) {
             logger.warn('launchAndLogin: final recovery failed', { email, error: e?.message || String(e) });
@@ -3950,13 +4196,18 @@ function isDivanPrioritySaleCategory(desired) {
 }
 
 const GS_PLUS_PREMIUM_PRIORITY_TITLE = 'GS PLUS Premium';
+const KARA_KARTAL_PLUS_PRIORITY_TITLE = 'Kara Kartal+ Öncelikli Bilet Alım';
 const GSPARA_PRIORITY_TITLE = 'GSPara Öncelik';
 
 function isGsPlusPremiumPriorityCategory(desired) {
-    const a = normKeyPrioritySaleTitle(GS_PLUS_PREMIUM_PRIORITY_TITLE);
     const b = normKeyPrioritySaleTitle(desired);
     if (!b) return false;
-    return a === b || a.includes(b) || b.includes(a);
+    const a1 = normKeyPrioritySaleTitle(GS_PLUS_PREMIUM_PRIORITY_TITLE);
+    const a2 = normKeyPrioritySaleTitle(KARA_KARTAL_PLUS_PRIORITY_TITLE);
+    return (
+        a1 === b || a1.includes(b) || b.includes(a1) ||
+        a2 === b || a2.includes(b) || b.includes(a2)
+    );
 }
 
 function isGsParaPriorityCategory(desired) {
@@ -4809,7 +5060,7 @@ async function handlePrioritySaleModal(page, opts = null) {
     return false;
 }
 
-async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCategory, selectionMode = 'legacy') {
+async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCategory, selectionMode = 'legacy', preferredSvgBlockId = '') {
     try {
         const u = (() => { try { return page.url(); } catch { return ''; } })();
         const url = String(u || '');
@@ -4829,7 +5080,8 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
     const reAlt = alt ? new RegExp(alt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') : null;
     const UNAVAILABLE_TEXT = 'şu anda uygun bilet bulunmamaktadır';
 
-    const mode = String(selectionMode || 'legacy').toLowerCase();
+    let mode = String(selectionMode || 'legacy').toLowerCase();
+    if (mode === 'scan_map') mode = 'svg';
     const isPageContextGone = (err) => /detached|target closed|protocol error|session closed|execution context was destroyed|cannot find context/i.test(String(err?.message || err || ''));
 
     // Scan mode: try SVG first if present, else use dropdown
@@ -4847,6 +5099,19 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
 
     // New UI: SVG stadium layout block selection
     if (useSvgFlow) {
+        const prefBid = String(preferredSvgBlockId || '').trim();
+        if (prefBid) {
+            const okPref = await selectSvgBlockById(page, prefBid, {
+                categoryType: cat,
+                categoryLabel: cat,
+                categoryId: null
+            });
+            if (okPref) {
+                logger.info('categoryBlock:svg_preferred_block_id_ok', { blockId: prefBid, categoryType: cat || null });
+                return { svgBlockId: prefBid };
+            }
+            logger.warn('categoryBlock:svg_preferred_block_id_miss', { blockId: prefBid, categoryType: cat || null });
+        }
         const readSeatmapStateAcrossFrames = async () => {
             try {
                 const frames = page.frames();
@@ -5053,11 +5318,30 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                             return '';
                         }
                     };
-                    const rows = Array.from(document.querySelectorAll('.blogContainer > div, .blogContainer > *'));
+                    const pickRows = () => {
+                        const selectors = [
+                            '.blogContainer > div', '.blogContainer > *',
+                            '#blogContainer > div', '#blogContainer > *',
+                            '.legend > div', '.legend > *',
+                            '[class*="legend" i] > div', '[class*="legend" i] > *',
+                            '[class*="kategori" i] > div', '[class*="kategori" i] > *'
+                        ];
+                        for (const sel of selectors) {
+                            const els = Array.from(document.querySelectorAll(sel));
+                            if (els.length) return els;
+                        }
+                        // As a last resort, treat each title as a row.
+                        return Array.from(document.querySelectorAll('.title-category, [class*="title-category" i]'));
+                    };
+                    const rows = pickRows();
                     const out = [];
                     for (const row of rows) {
-                        const titleEl = row.querySelector?.('.title-category');
-                        const colorEl = row.querySelector?.('.color-category');
+                        const titleEl =
+                            row?.querySelector?.('.title-category, [class*="title-category" i]') ||
+                            (row?.classList && (row.classList.contains('title-category') || String(row.className || '').toLowerCase().includes('title-category')) ? row : null);
+                        const colorEl =
+                            row?.querySelector?.('.color-category, [class*="color-category" i], [style*="background" i]') ||
+                            (titleEl ? (titleEl.parentElement?.querySelector?.('.color-category, [class*="color-category" i], [style*="background" i]') || null) : null);
                         const title = String(titleEl?.innerText || titleEl?.textContent || '').trim();
                         if (!title || !isVisible(titleEl)) continue;
                         out.push({
@@ -5065,7 +5349,15 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                             color: colorToText(colorEl)
                         });
                     }
-                    return out;
+                    // Deduplicate by title.
+                    const seen = new Set();
+                    return out.filter((e) => {
+                        const k = String(e?.title || '').trim();
+                        if (!k) return false;
+                        if (seen.has(k)) return false;
+                        seen.add(k);
+                        return true;
+                    });
                 }).catch(() => []);
             };
             const waitForSvgLegendEntries = async () => {
@@ -5377,7 +5669,18 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                     continue;
                 }
 
-                const blocksOk = await page.waitForSelector('svg.svgLayout g.block, svg.svgLayout .svgBlock, .svgLayout g.block, .svgLayout .svgBlock', { timeout: 15000 })
+                const blocksOk = await page.waitForSelector(
+                    [
+                        'svg.svgLayout g.block',
+                        'svg.svgLayout .svgBlock',
+                        '.svgLayout g.block',
+                        '.svgLayout .svgBlock',
+                        // Some events don't use class="block"; they only have id="block12345" etc.
+                        'svg.svgLayout [id^="block"]',
+                        '.svgLayout [id^="block"]'
+                    ].join(', '),
+                    { timeout: 15000 }
+                )
                     .then(() => true)
                     .catch(() => false);
 
@@ -5415,15 +5718,26 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                 });
 
                 const candidates = await page.evaluate(() => {
-                    const blocks = Array.from(document.querySelectorAll('svg.svgLayout g.block, .svgLayout g.block'));
-                    const paths = Array.from(document.querySelectorAll('svg.svgLayout .svgBlock, .svgLayout .svgBlock'));
-                    const items = (blocks.length ? blocks : paths)
+                    const picks = [
+                        ...Array.from(document.querySelectorAll('svg.svgLayout g.block, .svgLayout g.block')),
+                        ...Array.from(document.querySelectorAll('svg.svgLayout .svgBlock, .svgLayout .svgBlock')),
+                        ...Array.from(document.querySelectorAll('svg.svgLayout [id^="block"], .svgLayout [id^="block"]'))
+                    ];
+                    const items = picks
                         .map(el => ({
                             id: el.getAttribute('id') || el.id || null,
                             tag: el.tagName
                         }))
                         .filter(x => !!x.id);
-                    return items;
+                    // Dedup by id
+                    const seen = new Set();
+                    return items.filter((x) => {
+                        const k = String(x.id || '');
+                        if (!k) return false;
+                        if (seen.has(k)) return false;
+                        seen.add(k);
+                        return true;
+                    });
                 });
 
                 let remaining = (candidates || []).filter(c => c?.id && !tried.has(c.id));
@@ -5476,15 +5790,33 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                         matchScore: pick.matchScore || 0
                     });
                 } else if (svgDesiredTexts.length && mode === 'svg') {
-                    throw new Error(`SVG_CATEGORY_MATCH_NOT_FOUND:${cat || alt || 'unknown'}`);
+                    logger.warn('categoryBlock:svg_category_match_failed', {
+                        categoryType: cat || null,
+                        alternativeCategory: alt || null,
+                        mode,
+                        preferredSvgBlockId: String(preferredSvgBlockId || '').trim() || null,
+                        desiredTexts: svgDesiredTexts
+                    });
+                    // Some events don't expose category names in legend/tooltips consistently.
+                    // In that case, continue with a random block instead of aborting the whole run.
+                    pick = remaining[Math.floor(Math.random() * remaining.length)];
                 } else if (svgDesiredTexts.length && mode === 'scan') {
+                    // In scan mode prefer dropdown when available, but some pages are SVG-only.
+                    const hasDropdownUi = await page.evaluate(() => {
+                        return !!document.querySelector('.custom-select-box, .dropdown-option, [role="option"], select#blocks, select[name*="block" i], select[id*="block" i]');
+                    }).catch(() => false);
                     logger.info('categoryBlock:scan_svg_fallback_dropdown', {
                         reason: 'SVG_CATEGORY_MATCH_NOT_FOUND',
                         categoryType: cat || null,
-                        alternativeCategory: alt || null
+                        alternativeCategory: alt || null,
+                        hasDropdownUi
                     });
-                    proceedToDropdown = true;
-                    break;
+                    if (hasDropdownUi) {
+                        proceedToDropdown = true;
+                        break;
+                    }
+                    // SVG-only: just pick a random block and proceed with clicking.
+                    pick = remaining[Math.floor(Math.random() * remaining.length)];
                 } else {
                     pick = remaining[Math.floor(Math.random() * remaining.length)];
                 }
@@ -5818,7 +6150,7 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
 
     // Prefer native <select> category when present (matches the UI in the screenshot).
     try {
-        const didNative = await page.evaluate((catText, altText, scanMode) => {
+        const didNative = await page.evaluate((catText, altText) => {
             const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
             const wantCat = norm(catText);
             const wantAlt = norm(altText);
@@ -5867,11 +6199,7 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
             const texts = opts.map(o => norm(o.textContent || o.innerText || ''));
 
             let idx = -1;
-            if (scanMode) {
-                idx = texts.findIndex(t => t && t !== 'kategori' && !t.includes('uygun bilet bulunamamaktadır'));
-            } else {
-                idx = texts.findIndex(t => (wantCat && t.includes(wantCat)) || (wantAlt && t.includes(wantAlt)));
-            }
+            idx = texts.findIndex(t => (wantCat && t.includes(wantCat)) || (wantAlt && t.includes(wantAlt)));
             if (idx < 0) return { ok: false, reason: 'no_option' };
 
             try {
@@ -5880,7 +6208,7 @@ async function chooseCategoryAndRandomBlock(page, categoryType, alternativeCateg
                 pickSelect.dispatchEvent(new Event('change', { bubbles: true }));
             } catch {}
             return { ok: true, idx, selectedText: (opts[idx].textContent || '').trim() };
-        }, cat, alt, mode === 'scan');
+        }, cat, alt);
 
         if (didNative?.ok) {
             logger.info('categoryBlock:native_select_used', { selectedText: didNative.selectedText });
@@ -6321,6 +6649,7 @@ async function startBotAfterValidation(req, res, validatedData) {
     const {
         team: requestedTeam, teamId, ticketType, eventAddress, categoryType, alternativeCategory,
         categorySelectionMode,
+        seatSelectionMode,
         transferTargetEmail,
         ticketCount = 1,
         extendWhenRemainingSecondsBelow,
@@ -6363,7 +6692,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                 selectionModeHint: item.selectionModeHint,
                 sortOrder: item.sortOrder,
                 ticketCount: item.ticketCount,
-                adjacentSeats: item.adjacentSeats
+                adjacentSeats: item.adjacentSeats,
+                svgBlockId: item.svgBlockId
             }, categorySelectionMode))
             .filter(Boolean);
     }
@@ -8684,8 +9014,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                 const targetCategory = accountCategoryChooser.peekNext ? accountCategoryChooser.peekNext() : null;
                 setStep(`${label}.categoryBlock.select.start`, {
                     categorySelectionMode,
+                    categoryId: targetCategory?.id || null,
                     categoryLabel: targetCategory?.label || null,
                     categoryType: targetCategory?.categoryType || resolvedCategoryType || null,
+                    svgBlockId: targetCategory?.svgBlockId || null,
                     alternativeCategory: targetCategory?.alternativeCategory || resolvedAlternativeCategory || null
                 });
                 const cbStart = Date.now();
@@ -8696,8 +9028,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                     email: acc.email,
                     mode: categorySelectionMode,
                     ms: Date.now() - cbStart,
+                    categoryId: cbRes?.chosenCategory?.id || null,
                     categoryLabel: cbRes?.chosenCategory?.label || null,
-                    categoryType: cbRes?.chosenCategory?.categoryType || resolvedCategoryType || null
+                    categoryType: cbRes?.chosenCategory?.categoryType || resolvedCategoryType || null,
+                    svgBlockId: cbRes?.svgBlockId || cbRes?.chosenCategory?.svgBlockId || null
                 });
 
                 let catBlock = { categoryText: '', blockText: '', blockVal: '' };
@@ -8750,6 +9084,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                             ensureTurnstileFn: ensureCaptchaOnPage,
                             chooseCategoryFn: accountCategoryChooser.choose,
                             categorySelectionMode,
+                            seatSelectionMode,
                             ticketCount: effectiveTicketCount,
                             quantitySelectionMode: 'afterCategory',
                             ticketQuantityPrimed,
@@ -9915,9 +10250,11 @@ async function startBotAfterValidation(req, res, validatedData) {
         let ticketQuantityPrimedA = false;
         const singleTargetCategoryA = singleCategoryChooserA.peekNext ? singleCategoryChooserA.peekNext() : null;
         setStep('A.categoryBlock.select.start', {
+            categoryId: singleTargetCategoryA?.id || null,
             categoryType: singleTargetCategoryA?.categoryType || resolvedCategoryType || null,
             alternativeCategory: singleTargetCategoryA?.alternativeCategory || resolvedAlternativeCategory || null,
             categoryLabel: singleTargetCategoryA?.label || null,
+            svgBlockId: singleTargetCategoryA?.svgBlockId || null,
             categorySelectionMode
         });
         const cbResA = await singleCategoryChooserA.choose(pageA, resolvedCategoryType, resolvedAlternativeCategory, categorySelectionMode);
@@ -9975,6 +10312,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                         ensureTurnstileFn: ensureCaptchaOnPage,
                         chooseCategoryFn: singleCategoryChooserA.choose,
                         categorySelectionMode,
+                        seatSelectionMode,
                         ticketCount: effectiveTicketCountA,
                         quantitySelectionMode: 'afterCategory',
                         ticketQuantityPrimed: ticketQuantityPrimedA,
@@ -10383,6 +10721,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     ensureTurnstileFn: ensureCaptchaOnPage,
                     chooseCategoryFn: singleCategoryChooserB.choose,
                     categorySelectionMode,
+                    seatSelectionMode,
                     ticketCount: Math.max(ticketCount, catMinBFallback),
                     adjacentSeats: catRuleBFallback.adjacentSeats === true
                 }
