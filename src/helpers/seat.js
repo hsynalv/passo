@@ -2024,7 +2024,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
                 labelText: null,
                 sig: null
               }, queue: [] };
-          }, sel, mode);
+          }, SEAT_NODE_SELECTOR, seatSelectionMode);
           if (picked && typeof picked === 'object') {
             if (Array.isArray(picked.queue) && picked.queue.length) seatPickQueue = picked.queue;
             clickInfo = picked.primary || null;
