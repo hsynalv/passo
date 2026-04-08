@@ -207,6 +207,14 @@ async function recoverIfRedirected(page, context, label, expectedUrlIncludes, re
 
   if (!isLogin && !isHome && !urlDrift) return false;
   logger.warn(`seatPick:${context}:redirect_detected`, { label, url: curUrl, isLogin, isHome, urlDrift, recoveryUrl });
+  if (/verify_wait|beforeContinue/i.test(String(label || '')) && (isHome || urlDrift)) {
+    logger.warn(`seatPick:${context}:continue_blocked_by_challenge`, {
+      label,
+      reason: isHome ? 'redirect_home_after_continue' : 'url_drift_after_continue',
+      url: curUrl,
+      recoveryUrl
+    });
+  }
 
   if (isLogin && reloginIfRedirected && email && password) {
     try {
@@ -248,7 +256,7 @@ async function recoverIfRedirected(page, context, label, expectedUrlIncludes, re
 
   if (ensureTurnstileFn && email) {
     try {
-      await ensureTurnstileFn(page, email, `seatPick:${context}:${label}:recover`, { background: false });
+      await ensureTurnstileFn(page, email, `seatPick:${context}:${label}:recover`, { background: false, recaptchaFallback: false });
     } catch (e) {
       logger.warn(`seatPick:${context}:recover_captcha_failed`, { label, error: e?.message || String(e) });
     }
@@ -953,6 +961,8 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
   let lastContinueClickedAt = 0;
   let turnstileWarmStartedAt = 0;
   let lastTurnstileBlockingAt = 0;
+  let lastTurnstileFreshCheckAt = 0;
+  let lastChallengeRecoverAt = 0;
   let postContinueVerifyUntil = 0;
   let postContinueRetryCount = 0;
   let noSeatStreak = 0;
@@ -1246,10 +1256,61 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
     }
   };
 
+  const readChallengeBlockState = async () => {
+    try {
+      return await page.evaluate(() => {
+        const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+        const cont = document.querySelector('.swal2-container.swal2-shown, .swal2-container.swal2-backdrop-show');
+        const txt = cont ? norm(cont.innerText || '') : '';
+        const challengeModal = !!txt && (
+          txt.includes('güvenlik doğrulaması başarısız') ||
+          txt.includes('verify') ||
+          txt.includes('human') ||
+          txt.includes('captcha')
+        );
+        const tsField = document.querySelector('input[name="cf-turnstile-response"]');
+        const tokenLen = tsField && tsField.value ? String(tsField.value).length : 0;
+        const hasWidget = !!document.querySelector('.cf-turnstile');
+        return { challengeModal, modalText: txt || null, hasWidget, hasTokenField: !!tsField, tokenLen };
+      });
+    } catch {
+      return { challengeModal: false, modalText: null, hasWidget: false, hasTokenField: false, tokenLen: 0 };
+    }
+  };
+
+  const recoverChallengeIfNeeded = async (label) => {
+    const st = await readChallengeBlockState();
+    const needs = !!st.challengeModal || (!!st.hasWidget && st.tokenLen < 80);
+    if (!needs) return false;
+    const now = Date.now();
+    if (now - lastChallengeRecoverAt < 4500) return false;
+    lastChallengeRecoverAt = now;
+    logger.warn(`seatPick:${context}:challenge_block_detected`, { label, ...st });
+    try {
+      if (st.challengeModal) await confirmSwalYes(page, 6000);
+    } catch {}
+    if (ensureTurnstileFn && email) {
+      try {
+        const t0 = Date.now();
+        await ensureTurnstileFn(page, email, `seatPick:${context}:challengeRecover:${label}`, { background: false, recaptchaFallback: false });
+        const dt = Date.now() - t0;
+        if (dt > 1200) extendDeadline(Math.min(12000, dt + 2000), 'challenge_recover_turnstile');
+      } catch (e) {
+        logger.warn(`seatPick:${context}:challenge_recover_turnstile_failed`, { label, error: e?.message || String(e) });
+      }
+    }
+    try { await openSeatMapStrict(page); } catch {}
+    lockedSeat = null;
+    lockedMiss = 0;
+    await delay(260);
+    return true;
+  };
+
   while (Date.now() < end) {
       const nw = basketWatcher.getLatest();
       if (nw && nw.data && await canTreatBasketAsSuccess(nw.data, 'networkLatest')) return nw.data;
       await ensureOnSeatPage('loop');
+      await recoverChallengeIfNeeded('loop_start');
       await diag('loop');
 
       const selectableState = await page.evaluate(() => {
@@ -2078,6 +2139,12 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
             } else {
               lockedMiss++;
               logger.warn(`seatPick:${context}:not_selected_after_click`, { seatId: lockedSeat?.seatId, lockedMiss, selDiag });
+              if (lockedMiss >= 2) {
+                const recovered = await recoverChallengeIfNeeded('not_selected_after_click');
+                if (recovered) {
+                  continue;
+                }
+              }
               if (seatSelectionMode === 'deterministic' && Array.isArray(seatPickQueue) && seatPickQueue.length) {
                 logger.info(`seatPick:${context}:deterministic_advance_candidate`, { fromSeatId: lockedSeat?.seatId || null, remaining: seatPickQueue.length });
                 lockedSeat = null;
@@ -2233,6 +2300,21 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
       }
       if (now - lastContinueAttemptAt > continueCooldownMs) {
         lastContinueAttemptAt = now;
+
+        // Continue öncesi token freshness check: token var görünse bile sayfa drift sonrası stale olabilir.
+        // Wrapper token hazırsa hızlı döner; yoksa turnstile-first toparlar.
+        const freshnessCooldownMs = 12000;
+        if (ensureTurnstileFn && email && (!lastTurnstileFreshCheckAt || (Date.now() - lastTurnstileFreshCheckAt) > freshnessCooldownMs)) {
+          lastTurnstileFreshCheckAt = Date.now();
+          try {
+            const t0 = Date.now();
+            await ensureTurnstileFn(page, email, `seatPick:${context}:preContinueFreshness`, { background: false, recaptchaFallback: false });
+            const dt = Date.now() - t0;
+            if (dt > 3000) extendDeadline(Math.min(12000, dt + 1500), 'turnstile_precontinue_freshness');
+          } catch (e) {
+            logger.warn(`seatPick:${context}:turnstile_freshness_check_failed`, { error: e?.message || String(e) });
+          }
+        }
         
         // Turnstile token kontrolü - yoksa devam'a basma
         const tokenState = await page.evaluate(() => {
@@ -2250,7 +2332,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
             try {
               if (!turnstileWarmStartedAt || (Date.now() - turnstileWarmStartedAt) > 120000) {
                 turnstileWarmStartedAt = Date.now();
-                await ensureTurnstileFn(page, email, `seatPick:${context}:turnstileWarmup`, { background: true });
+                await ensureTurnstileFn(page, email, `seatPick:${context}:turnstileWarmup`, { background: true, recaptchaFallback: false });
               }
             } catch {}
           }
@@ -2268,7 +2350,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
             logger.info(`seatPick:${context}:resolving_turnstile_blocking`);
             try {
               const t0 = Date.now();
-              await ensureTurnstileFn(page, email, `seatPick:${context}:beforeContinue`);
+              await ensureTurnstileFn(page, email, `seatPick:${context}:beforeContinue`, { background: false, recaptchaFallback: false });
               const dt = Date.now() - t0;
               // Captcha solving can take 60-90s; extend seat-pick deadline accordingly.
               extendDeadline(dt + 8000, 'turnstile_before_continue');
@@ -2385,8 +2467,17 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
             // If backend/response suggests basket but UI is still on seat selection, try direct navigation.
             const curUrl = (() => { try { return page.url(); } catch { return ''; } })();
             const stillOnSeat = expectedUrlIncludes ? (curUrl && curUrl.includes(String(expectedUrlIncludes))) : false;
-            const looksBasket = transition && (transition.type === 'url' || (transition.type === 'resp' && transition.status >= 200 && transition.status < 400));
-            if (stillOnSeat && looksBasket) {
+            const transitionUrl = String(transition?.url || '').toLowerCase();
+            const isRespOk = !!(transition && transition.type === 'resp' && transition.status >= 200 && transition.status < 400);
+            const isAddSeatResp = isRespOk && /addseattobasket|addseat|add-to-basket|addtobasket/i.test(transitionUrl);
+            const transitionProducts = Array.isArray(transition?.json?.value?.basketBookingProducts)
+              ? transition.json.value.basketBookingProducts
+              : [];
+            const strongBasketSignal =
+              !!(transition && transition.type === 'url') ||
+              isAddSeatResp ||
+              (isRespOk && transitionProducts.length > 0);
+            if (stillOnSeat && strongBasketSignal) {
               try {
                 await page.goto('https://www.passo.com.tr/tr/sepet', { waitUntil: 'domcontentloaded', timeout: 30000 });
               } catch {}

@@ -2521,10 +2521,54 @@ async function injectRecaptchaToken(page, token) {
     }
 }
 
+async function detectRecaptchaPresence(page) {
+    if (!page) return { hasRecaptcha: false, siteKey: null };
+    try {
+        const fromFrames = (() => {
+            try {
+                const frames = typeof page.frames === 'function' ? page.frames() : [];
+                for (const fr of frames) {
+                    const u = (() => { try { return fr?.url?.() || ''; } catch { return ''; } })();
+                    if (!u) continue;
+                    if (u.indexOf('google.com/recaptcha') < 0 && u.indexOf('recaptcha/api2') < 0 && u.indexOf('recaptcha/enterprise') < 0) continue;
+                    const m = u.match(/[?&]k=([0-9A-Za-z_-]+)/);
+                    return { hasRecaptcha: true, siteKey: m && m[1] ? m[1] : null };
+                }
+            } catch {}
+            return null;
+        })();
+        if (fromFrames) return fromFrames;
+        const fromDom = await evaluateSafe(page, () => {
+            const iframe = document.querySelector('iframe[src*="recaptcha" i], iframe[src*="google.com/recaptcha" i]');
+            const recNode = document.querySelector('.g-recaptcha[data-sitekey], [data-sitekey*="6L"], [data-sitekey*="6l"]');
+            let siteKey = null;
+            if (recNode) {
+                try { siteKey = recNode.getAttribute('data-sitekey') || null; } catch {}
+            }
+            if (!siteKey && iframe) {
+                try {
+                    const src = iframe.getAttribute('src') || '';
+                    const m = src.match(/[?&]k=([0-9A-Za-z_-]+)/);
+                    if (m && m[1]) siteKey = m[1];
+                } catch {}
+            }
+            return {
+                hasRecaptcha: !!(iframe || recNode),
+                siteKey: siteKey || null
+            };
+        }).catch(() => ({ hasRecaptcha: false, siteKey: null }));
+        return fromDom || { hasRecaptcha: false, siteKey: null };
+    } catch {
+        return { hasRecaptcha: false, siteKey: null };
+    }
+}
+
 /**
  * Wrapper: tries Turnstile first, then falls back to reCAPTCHA v2 if Turnstile can't solve.
  */
 async function ensureCaptchaOnPage(page, email, label, options) {
+    const opts = (options && typeof options === 'object') ? options : {};
+    const allowRecaptchaFallback = opts.recaptchaFallback !== false;
     const turnstileResult = await ensureTurnstileTokenOnPage(page, email, label, options);
     // If Turnstile solved successfully or is in-flight, return
     if (turnstileResult?.attempted || turnstileResult?.started || turnstileResult?.inFlight) {
@@ -2535,10 +2579,20 @@ async function ensureCaptchaOnPage(page, email, label, options) {
     if (turnstileResult?.state?.tokenLen > 0) {
         return turnstileResult;
     }
+    if (!allowRecaptchaFallback) {
+        logger.info('captcha:wrapper_skip_recaptcha', { email, label, reason: 'recaptcha_fallback_disabled' });
+        return turnstileResult;
+    }
     // If Turnstile couldn't solve (missing keys / no widget), try reCAPTCHA v2
-    // On /koltuk-secim pages, the reCAPTCHA iframe loads late — enable polling wait
+    // Only attempt reCAPTCHA fallback when recaptcha presence is actually detected.
+    const recaptchaPresence = await detectRecaptchaPresence(page);
+    if (!recaptchaPresence?.hasRecaptcha) {
+        logger.info('captcha:wrapper_skip_recaptcha', { email, label, reason: 'recaptcha_not_detected' });
+        return turnstileResult;
+    }
+    // On /koltuk-secim pages, reCAPTCHA iframe can load late; if already detected, allow polling.
     const isKoltukSecim = (() => { try { return /\/koltuk-secim/i.test(page.url()); } catch { return false; } })();
-    logger.info('captcha:wrapper_try_recaptcha', { email, label, isKoltukSecim, turnstileMissingKeys: !!turnstileResult?.missingKeys });
+    logger.info('captcha:wrapper_try_recaptcha', { email, label, isKoltukSecim, turnstileMissingKeys: !!turnstileResult?.missingKeys, recaptchaDetected: true, hasSiteKey: !!recaptchaPresence?.siteKey });
     const recaptchaOpts = { ...(options || {}), waitForIframe: isKoltukSecim };
     const recaptchaResult = await ensureRecaptchaV2OnPage(page, email, label, recaptchaOpts);
     logger.info('captcha:wrapper_recaptcha_result', { email, label, attempted: recaptchaResult?.attempted, started: recaptchaResult?.started, reason: recaptchaResult?.reason, solveType: recaptchaResult?.solveType });
@@ -7147,7 +7201,54 @@ async function startBotAfterValidation(req, res, validatedData) {
     };
 
     const persistBasketRecordForPair = async (pairIndex, extra = {}) => {
-        const payload = buildOrderRecordPayload(pairIndex, extra);
+        const idx = Math.max(1, Math.floor(Number(pairIndex) || 1));
+        let normalizedExtra = { ...extra };
+        try {
+            const runtime = pairRuntimeByIndex.get(idx) || {};
+            const candidatePage =
+                runtime?.aCtx?.page ||
+                runtime?.bCtx?.page ||
+                pageA ||
+                pageB ||
+                null;
+            const incomingSeat = normalizedExtra?.seat || runtime?.currentSeatInfo || runtime?.aCtx?.seatInfo || null;
+            const missingSeatDetails = !!incomingSeat && !(
+                String(incomingSeat?.row || '').trim() &&
+                String(incomingSeat?.seat || '').trim() &&
+                String(incomingSeat?.block || '').trim() &&
+                String(incomingSeat?.tribune || '').trim()
+            );
+            if (candidatePage && missingSeatDetails) {
+                const basketSeat = await readBasketData(candidatePage).catch(() => null);
+                if (basketSeat) {
+                    normalizedExtra.seat = {
+                        ...incomingSeat,
+                        tribune: incomingSeat?.tribune || basketSeat?.tribune || '',
+                        block: incomingSeat?.block || basketSeat?.block || '',
+                        row: incomingSeat?.row || basketSeat?.row || '',
+                        seat: incomingSeat?.seat || basketSeat?.seat || '',
+                        blockId: incomingSeat?.blockId || basketSeat?.blockId || '',
+                        seatId: incomingSeat?.seatId || basketSeat?.seatId || '',
+                        combined: incomingSeat?.combined || basketSeat?.combined || '',
+                        itemCount: Math.max(Number(incomingSeat?.itemCount) || 0, Number(basketSeat?.itemCount) || 0),
+                        heldSeats: (Array.isArray(incomingSeat?.heldSeats) && incomingSeat.heldSeats.length)
+                            ? incomingSeat.heldSeats
+                            : (Array.isArray(basketSeat?.heldSeats) ? basketSeat.heldSeats : [])
+                    };
+                    logger.info('order_record_seat_enriched_from_basket', {
+                        pairIndex: idx,
+                        seatId: normalizedExtra.seat?.seatId || null,
+                        row: normalizedExtra.seat?.row || null,
+                        seat: normalizedExtra.seat?.seat || null,
+                        block: normalizedExtra.seat?.block || null,
+                        tribune: normalizedExtra.seat?.tribune || null
+                    });
+                }
+            }
+        } catch (e) {
+            logger.warnSafe('order_record_seat_enrich_failed', { pairIndex: idx, error: e?.message || String(e) });
+        }
+        const payload = buildOrderRecordPayload(idx, normalizedExtra);
         return safePersistOrderRecord('basket_upsert', () => orderRecordRepo.upsertBasketRecord(payload));
     };
 
@@ -10384,6 +10485,40 @@ async function startBotAfterValidation(req, res, validatedData) {
             aBasketArrivedAtMs = Date.now();
             setStep('A.gotoBasket.done', { snap: await snapshotPage(pageA, 'A.afterGotoBasket') });
         } catch {}
+
+        // Seat helper can return early from add-to-basket network with partial fields (row/seat empty).
+        // After landing on /sepet, enrich seat info from basket DOM/api snapshot for accurate UI/log output.
+        try {
+            const basketSeatA = await readBasketData(pageA);
+            if (basketSeatA && seatInfoA) {
+                seatInfoA = {
+                    ...seatInfoA,
+                    tribune: seatInfoA.tribune || basketSeatA.tribune || '',
+                    block: seatInfoA.block || basketSeatA.block || '',
+                    row: seatInfoA.row || basketSeatA.row || '',
+                    seat: seatInfoA.seat || basketSeatA.seat || '',
+                    blockId: seatInfoA.blockId || basketSeatA.blockId || '',
+                    seatId: seatInfoA.seatId || basketSeatA.seatId || '',
+                    combined: seatInfoA.combined || basketSeatA.combined || '',
+                    itemCount: Math.max(
+                        Number(seatInfoA.itemCount) || 0,
+                        Number(basketSeatA.itemCount) || 0
+                    ),
+                    heldSeats: (Array.isArray(seatInfoA.heldSeats) && seatInfoA.heldSeats.length)
+                        ? seatInfoA.heldSeats
+                        : (Array.isArray(basketSeatA.heldSeats) ? basketSeatA.heldSeats : [])
+                };
+                logger.info('A.seatInfo.enriched_from_basket', {
+                    seatId: seatInfoA.seatId || null,
+                    row: seatInfoA.row || null,
+                    seat: seatInfoA.seat || null,
+                    block: seatInfoA.block || null,
+                    tribune: seatInfoA.tribune || null
+                });
+            }
+        } catch (e) {
+            logger.warnSafe('A.seatInfo.enrich_from_basket_failed', { error: e?.message || String(e) });
+        }
 
         const ensureRemoveDelayAfterBasket = async () => {
             const MIN_AFTER_BASKET_MS = 30000;
