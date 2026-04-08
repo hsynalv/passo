@@ -5,6 +5,8 @@ const statusBox = $('statusBox');
 const connStatus = $('connStatus');
 const runIdEl = $('runId');
 const runStatusEl = $('runStatus');
+const accountLiveMetaEl = $('accountLiveMeta');
+const accountLiveBoardEl = $('accountLiveBoard');
 const logFilterEl = $('logFilter');
 const autoScrollEl = $('autoScroll');
 const autoScrollStatusEl = $('autoScrollStatus');
@@ -25,6 +27,142 @@ let runStatusRefreshTimer = null;
 const previousPairSnapshot = new Map();
 let lastSetupIssues = [];
 let latestPairDashboard = null;
+const accountLiveState = new Map();
+
+function accountLiveKey(role, idx, email) {
+  const r = String(role || '').toUpperCase();
+  const i = Number.isFinite(Number(idx)) ? Number(idx) : null;
+  const e = String(email || '').trim().toLowerCase();
+  if (i != null) return `${r}:${i}`;
+  if (e) return `${r}:${e}`;
+  return '';
+}
+
+function accountLiveLabel(item) {
+  const roleMap = { A: 'Ana', B: 'Tutucu', C: 'C' };
+  const roleText = roleMap[item.role] || item.role || 'Hesap';
+  const idxText = Number.isFinite(Number(item.idx)) ? ` #${Number(item.idx) + 1}` : '';
+  return `${roleText}${idxText}`;
+}
+
+function accountLiveSort(a, b) {
+  const order = { A: 1, B: 2, C: 3 };
+  const ao = order[a.role] || 99;
+  const bo = order[b.role] || 99;
+  if (ao !== bo) return ao - bo;
+  const ai = Number.isFinite(Number(a.idx)) ? Number(a.idx) : Number.MAX_SAFE_INTEGER;
+  const bi = Number.isFinite(Number(b.idx)) ? Number(b.idx) : Number.MAX_SAFE_INTEGER;
+  if (ai !== bi) return ai - bi;
+  return String(a.email || '').localeCompare(String(b.email || ''));
+}
+
+function renderAccountLiveBoard() {
+  if (!accountLiveMetaEl || !accountLiveBoardEl) return;
+  const items = Array.from(accountLiveState.values()).sort(accountLiveSort);
+  if (!items.length) {
+    accountLiveMetaEl.textContent = '';
+    accountLiveBoardEl.innerHTML = '<div class="accountLiveEmpty">Hesap durumları run başlayınca canlı görünür.</div>';
+    return;
+  }
+  const failed = items.filter((x) => x.status === 'failed').length;
+  const success = items.filter((x) => x.status === 'success').length;
+  const active = items.filter((x) => x.status === 'active' || x.status === 'ready').length;
+  accountLiveMetaEl.textContent = `${items.length} hesap · aktif/hazır: ${active} · başarılı: ${success} · düşen: ${failed}`;
+
+  accountLiveBoardEl.innerHTML = items.map((it) => {
+    const tone = `status-${it.status || 'idle'}`;
+    const reason = it.reason ? ` · ${escapeHtml(it.reason)}` : '';
+    const email = it.email ? `<span class="accountLiveEmail">${escapeHtml(it.email)}</span>` : '';
+    return `<div class="accountLiveItem ${tone}">
+      <div class="accountLiveHead">
+        <strong>${escapeHtml(accountLiveLabel(it))}</strong>
+        <span class="accountLiveState">${escapeHtml(it.statusText || 'Bekleniyor')}</span>
+      </div>
+      ${email}
+      <div class="accountLiveDesc">${escapeHtml(it.lastStage || 'Bekleniyor')}${reason}</div>
+    </div>`;
+  }).join('');
+}
+
+function upsertAccountLive(partial) {
+  const role = String(partial?.role || '').toUpperCase();
+  if (!role || !['A', 'B', 'C'].includes(role)) return;
+  const idx = Number.isFinite(Number(partial?.idx)) ? Number(partial.idx) : null;
+  const email = String(partial?.email || '').trim();
+  const key = accountLiveKey(role, idx, email);
+  if (!key) return;
+  const prev = accountLiveState.get(key) || { role, idx, email };
+  const next = {
+    ...prev,
+    ...partial,
+    role,
+    idx: idx != null ? idx : prev.idx,
+    email: email || prev.email || '',
+    updatedAt: Date.now(),
+  };
+  accountLiveState.set(key, next);
+}
+
+function updateAccountLiveFromEntry(entry, line) {
+  const meta = entry?.meta || {};
+  const rawMsg = String(entry?.message || line || '').trim();
+  const msg = rawMsg.toLowerCase();
+  const event = entryEventKey(entry, line);
+  const step = parseStepMessage(rawMsg);
+
+  const candidates = [];
+  if (step && ['A', 'B', 'C'].includes(step.role)) {
+    candidates.push({
+      role: step.role,
+      idx: Number.isFinite(Number(meta?.idx)) ? Number(meta.idx) : step.idx,
+      email: String(meta?.email || meta?.aEmail || meta?.bEmail || meta?.cEmail || '').trim(),
+      stage: compactStepStageLabel(step.stageKey) || step.stageKey || rawMsg,
+      stageKey: String(step.stageKey || '').toLowerCase(),
+    });
+  }
+  if (Number.isFinite(Number(meta?.idx)) && (meta?.role === 'A' || meta?.role === 'B' || meta?.role === 'C')) {
+    candidates.push({
+      role: String(meta.role).toUpperCase(),
+      idx: Number(meta.idx),
+      email: String(meta?.email || '').trim(),
+      stage: rawMsg,
+      stageKey: '',
+    });
+  }
+  if (meta?.aEmail) candidates.push({ role: 'A', idx: null, email: String(meta.aEmail), stage: rawMsg, stageKey: '' });
+  if (meta?.bEmail) candidates.push({ role: 'B', idx: null, email: String(meta.bEmail), stage: rawMsg, stageKey: '' });
+  if (meta?.cEmail) candidates.push({ role: 'C', idx: null, email: String(meta.cEmail), stage: rawMsg, stageKey: '' });
+
+  if (!candidates.length) return;
+
+  for (const c of candidates) {
+    let status = 'active';
+    let statusText = 'Çalışıyor';
+    const sk = String(c.stageKey || '');
+
+    if (/(failed|başarısız|error|hata)/i.test(msg) || /_failed$/i.test(event)) {
+      status = 'failed';
+      statusText = 'Düştü';
+    } else if (/(a_hold_in_basket|a_hold_acquired|b_exact_pick_done|transfer_pair_done|finalize_done)/i.test(event) || msg.includes('basket_success') || msg.includes('sepete koltuk eklendi')) {
+      status = 'success';
+      statusText = 'Başarılı';
+    } else if (sk.endsWith('.done') || sk.includes('postbuy.ensureurl.done') || sk.includes('prerelease.ready') || sk.includes('seatmap.ensure.done')) {
+      status = 'ready';
+      statusText = 'Hazır';
+    }
+
+    upsertAccountLive({
+      role: c.role,
+      idx: c.idx,
+      email: c.email,
+      status,
+      statusText,
+      lastStage: c.stage,
+      reason: status === 'failed' ? (String(meta?.error || meta?.message || '').trim() || '') : '',
+    });
+  }
+  renderAccountLiveBoard();
+}
 
 function entryEventKey(entry, line) {
   const metaEvent = String(entry?.meta?.event || '').trim().toLowerCase();
@@ -652,6 +790,7 @@ function appendLogLine(line, entry) {
   }
   logBox.appendChild(div);
   if (state.autoScroll) logBox.scrollTop = logBox.scrollHeight;
+  try { updateAccountLiveFromEntry(entry, line); } catch {}
 
   // Status box (simplified)
   if (isSeparator) {
@@ -1111,6 +1250,8 @@ function clearLogs() {
   statusState.lastText = '';
   statusState.lastKey = '';
   statusState.lastAt = 0;
+  accountLiveState.clear();
+  renderAccountLiveBoard();
 }
 
 function infoLine(msg, meta) {
@@ -1347,6 +1488,8 @@ $('botForm').addEventListener('submit', async (e) => {
   runIdEl.textContent = '-';
   runStatusEl.textContent = '-';
   renderPairDashboard(null);
+  accountLiveState.clear();
+  renderAccountLiveBoard();
 
   try {
     const resp = await fetch('/start-bot-async', {
@@ -1495,6 +1638,7 @@ autoScrollStatusEl.addEventListener('change', (e) => {
 });
 
 setActiveStep('setup');
+renderAccountLiveBoard();
 startSse();
 
 ensurePanelDefaultsFetched().catch(() => {});

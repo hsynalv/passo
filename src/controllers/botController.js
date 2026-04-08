@@ -8731,7 +8731,18 @@ async function startBotAfterValidation(req, res, validatedData) {
                     while (true) {
                         const cur = idx++;
                         if (cur >= items.length) return;
-                        results[cur] = await handler(items[cur], cur);
+                        try {
+                            results[cur] = await handler(items[cur], cur);
+                        } catch (e) {
+                            // Isolate worker failures so one account doesn't abort whole multi pool.
+                            const item = items[cur] || {};
+                            logger.warn('multi:pool_worker_failed', {
+                                index: cur,
+                                email: item?.email || null,
+                                error: e?.message || String(e)
+                            });
+                            results[cur] = null;
+                        }
                     }
                 });
                 await Promise.all(workers);

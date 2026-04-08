@@ -1,7 +1,7 @@
 const { ZodError } = require('zod');
 const categoryRepo = require('../repositories/categoryRepository');
 const teamRepo = require('../repositories/teamRepository');
-const { categoryPayloadSchema } = require('../validators/management');
+const { categoryPayloadSchema, categoryUpdatePayloadSchema } = require('../validators/management');
 
 function handleError(res, error) {
   if (error instanceof ZodError) {
@@ -57,7 +57,7 @@ async function updateCategory(req, res) {
   try {
     const team = await ensureTeam(req, res);
     if (!team) return null;
-    const payload = categoryPayloadSchema.partial().parse(req.body || {});
+    const payload = categoryUpdatePayloadSchema.parse(req.body || {});
     const category = await categoryRepo.updateCategory(team.id, req.params.categoryId, payload);
     if (!category) return res.status(404).json({ success: false, error: 'Kategori bulunamadı' });
     return res.json({ success: true, category });

@@ -9,16 +9,31 @@ const teamPayloadSchema = z.object({
 
 const categorySelectionModeHintSchema = z.enum(['legacy', 'scan', 'svg', 'scan_map']).optional().nullable();
 
-const categoryPayloadSchema = z.object({
+function normalizeCategorySelectionHint(value) {
+  const v = String(value || '').trim().toLowerCase();
+  if (!v) return undefined;
+  if (v === 'scan-map') return 'scan_map';
+  if (['legacy', 'scan', 'svg', 'scan_map'].includes(v)) return v;
+  return undefined;
+}
+
+const categoryBaseSchema = z.object({
   label: z.string().optional(),
-  categoryTypeValue: z.string().min(1, 'Kategori zorunludur'),
+  // Accept both old/new field names from manual forms and scan-map flows.
+  categoryTypeValue: z.string().min(1, 'Kategori zorunludur').optional(),
+  categoryType: z.string().optional(),
   selectionModeHint: categorySelectionModeHintSchema,
+  selectionMode: z.string().optional().nullable(),
+  mode: z.string().optional().nullable(),
   svgBlockId: z.string().optional().nullable().transform((v) => (v == null ? '' : String(v).trim())),
-  isActive: z.boolean().optional().default(true),
+  blockId: z.string().optional().nullable(),
+  alternativeCategoryValue: z.string().optional().nullable(),
+  alternativeCategory: z.string().optional().nullable(),
+  isActive: z.boolean().optional(),
   ticketCount: z.union([z.number(), z.string()])
     .optional()
     .transform((val) => {
-      if (val === undefined || val === null || val === '') return 1;
+      if (val === undefined || val === null || val === '') return undefined;
       const n = typeof val === 'number' ? val : parseInt(String(val).trim(), 10);
       if (!Number.isFinite(n) || n < 1) return 1;
       return Math.min(Math.floor(n), 10);
@@ -26,19 +41,69 @@ const categoryPayloadSchema = z.object({
   adjacentSeats: z.union([z.boolean(), z.string()])
     .optional()
     .transform((val) => {
+      if (val === undefined || val === null || val === '') return undefined;
       if (val === true || val === 'true' || val === '1') return true;
       return false;
     }),
+});
+
+const categoryPayloadSchema = categoryBaseSchema.superRefine((data, ctx) => {
+  const baseValue = String(data.categoryTypeValue || data.categoryType || '').trim();
+  if (!baseValue) {
+    ctx.addIssue({ code: 'custom', path: ['categoryTypeValue'], message: 'Kategori zorunludur' });
+  }
 }).transform((data) => {
-  const value = String(data.categoryTypeValue || '').trim();
+  const value = String(data.categoryTypeValue || data.categoryType || '').trim();
   const label = String(data.label || '').trim() || value;
-  const svg = String(data.svgBlockId || '').trim();
+  const svg = String(data.svgBlockId || data.blockId || '').trim();
+  const hint =
+    normalizeCategorySelectionHint(data.selectionModeHint)
+    || normalizeCategorySelectionHint(data.selectionMode)
+    || normalizeCategorySelectionHint(data.mode);
   return {
-    ...data,
     label,
     categoryTypeValue: value,
+    selectionModeHint: hint,
+    alternativeCategoryValue: String(data.alternativeCategoryValue || data.alternativeCategory || '').trim(),
     svgBlockId: svg || undefined,
+    isActive: data.isActive === undefined ? true : data.isActive,
+    ticketCount: data.ticketCount === undefined ? 1 : data.ticketCount,
+    adjacentSeats: data.adjacentSeats === undefined ? false : data.adjacentSeats,
   };
+});
+
+const categoryUpdatePayloadSchema = categoryBaseSchema.transform((data) => {
+  const out = {};
+
+  const valueRaw = (data.categoryTypeValue ?? data.categoryType);
+  if (valueRaw !== undefined) {
+    const value = String(valueRaw || '').trim();
+    out.categoryTypeValue = value;
+    if (data.label === undefined) out.label = value;
+  }
+  if (data.label !== undefined || out.label !== undefined) {
+    out.label = String((data.label !== undefined ? data.label : out.label) || '').trim();
+  }
+
+  const hintRaw = (data.selectionModeHint ?? data.selectionMode ?? data.mode);
+  if (hintRaw !== undefined) {
+    out.selectionModeHint = normalizeCategorySelectionHint(hintRaw) || null;
+  }
+
+  const altRaw = (data.alternativeCategoryValue ?? data.alternativeCategory);
+  if (altRaw !== undefined) {
+    out.alternativeCategoryValue = String(altRaw || '').trim();
+  }
+
+  const svgRaw = (data.svgBlockId ?? data.blockId);
+  if (svgRaw !== undefined) {
+    const svg = String(svgRaw || '').trim();
+    out.svgBlockId = svg || undefined;
+  }
+  if (data.isActive !== undefined) out.isActive = data.isActive;
+  if (data.ticketCount !== undefined) out.ticketCount = data.ticketCount;
+  if (data.adjacentSeats !== undefined) out.adjacentSeats = data.adjacentSeats;
+  return out;
 });
 
 const credentialBaseSchema = z.object({
@@ -185,6 +250,7 @@ const scanMapClearSchema = z.object({
 
 module.exports = {
   categoryPayloadSchema,
+  categoryUpdatePayloadSchema,
   credentialCreateSchema,
   credentialUpdateSchema,
   idListSchema,
