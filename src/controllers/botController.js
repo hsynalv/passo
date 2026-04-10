@@ -3,6 +3,9 @@ const rebrowserPuppeteer = require('rebrowser-puppeteer-core');
 const axios = require('axios');
 const { randomUUID } = require('crypto');
 const fs = require('fs');
+const util = require('util');
+const treeKill = require('tree-kill');
+const treeKillAsync = util.promisify(treeKill);
 const { PNG } = require('pngjs');
 const { botRequestSchema } = require('../validators/botRequest');
 
@@ -1172,13 +1175,37 @@ async function closeAllPassobotBrowsers() {
     const list = Array.from(passobotActiveBrowsers);
     passobotActiveBrowsers.clear();
     for (const br of list) {
+        let pid = null;
+        try {
+            const proc = typeof br.process === 'function' ? br.process() : null;
+            pid = proc && Number.isFinite(proc.pid) ? proc.pid : null;
+        } catch {}
         try {
             const pages = await br.pages().catch(() => []);
-            await Promise.all((pages || []).map((p) => p.close().catch(() => {})));
+            await Promise.all((pages || []).map((p) => p.close({ runBeforeUnload: false }).catch(() => {})));
         } catch {}
         try {
-            await br.close();
+            await Promise.race([br.close().catch(() => {}), delay(12000)]);
         } catch {}
+        if (pid != null) {
+            try {
+                await treeKillAsync(pid, 'SIGKILL');
+            } catch {
+                try {
+                    if (process.platform === 'win32') {
+                        const { execFile } = require('child_process');
+                        const execFileAsync = util.promisify(execFile);
+                        await execFileAsync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+                    } else {
+                        try {
+                            process.kill(-pid, 'SIGKILL');
+                        } catch {
+                            process.kill(pid, 'SIGKILL');
+                        }
+                    }
+                } catch {}
+            }
+        }
     }
 }
 
@@ -1667,6 +1694,7 @@ async function getRunStatus(req, res) {
 async function killSessions(req, res) {
     const running = runStore.listRunning();
     const killedRunIds = runStore.killAllRunning();
+    const browserCloseCount = passobotActiveBrowsers.size;
 
     try {
         await closeAllPassobotBrowsers();
@@ -1679,6 +1707,7 @@ async function killSessions(req, res) {
     logger.info('KILL_SESSIONS: Aktif oturumlar kapatılıyor', {
         runningCount: running.length,
         killedRunIds,
+        browsersQueued: browserCloseCount,
         timestamp: new Date().toISOString()
     });
     logger.info('==================================================');
@@ -1690,11 +1719,22 @@ async function killSessions(req, res) {
         success: true,
         killedCount: killedRunIds.length,
         killedRunIds,
-        runningCount: running.length
+        runningCount: running.length,
+        browsersClosed: browserCloseCount
     });
 }
 
-module.exports = { startBot, startBotAsync, registerCAccount, requestFinalize, getRunStatus, killSessions, launchAndLogin };
+module.exports = {
+    startBot,
+    startBotAsync,
+    registerCAccount,
+    requestFinalize,
+    getRunStatus,
+    killSessions,
+    launchAndLogin,
+    registerPassobotBrowser,
+    unregisterPassobotBrowser,
+};
 
 // Global semaphore to avoid hammering captcha provider with too many parallel solves.
 // This helps reduce queueing and long tail solve times in multi-account runs.
@@ -3018,6 +3058,9 @@ async function connectStableBrowser({ chromePath, userDataDir, args, ignoreAllFl
 async function disposeBrowserAfterFailedLogin(browser, email, err) {
     if (!browser) return;
     try {
+        unregisterPassobotBrowser(browser);
+    } catch {}
+    try {
         const pages = await browser.pages().catch(() => []);
         for (const p of pages || []) {
             try {
@@ -3178,6 +3221,7 @@ async function launchAndLogin(options) {
                 })()
             });
         } catch {}
+        registerPassobotBrowser(browser, String(opts.runId || '').trim() || 'login-pending');
     if (proxyApplied && proxyUsername && proxyPassword) {
         try {
             await page.authenticate({username: String(proxyUsername), password: String(proxyPassword)});
@@ -7072,6 +7116,7 @@ async function startBotAfterValidation(req, res, validatedData) {
 
     const launchAndLoginWithManagedProxy = async (baseOpts, meta = {}) => {
         const opts = baseOpts && typeof baseOpts === 'object' ? { ...baseOpts } : {};
+        opts.runId = runId;
         const role = String(meta.role || '').trim();
         const idx = Number.isFinite(Number(meta.idx)) ? Number(meta.idx) : null;
         const emailForLog = String(opts.email || meta.email || '').trim();

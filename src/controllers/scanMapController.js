@@ -12,7 +12,7 @@ const scanMapRepo = require('../repositories/scanMapRepository');
 const teamRepo = require('../repositories/teamRepository');
 const { gotoWithRetry, openSeatMapStrict } = require('../helpers/page');
 const { decryptSecret } = require('../utils/credentialCrypto');
-const { launchAndLogin } = require('./botController');
+const { launchAndLogin, unregisterPassobotBrowser } = require('./botController');
 const logger = require('../utils/logger');
 const {
   scanMapClearSchema,
@@ -582,6 +582,7 @@ async function scanBlocksLive(req, res) {
         appendLiveScanLog(run, 'Tarayıcı açılıyor (ana bot akışı)...', { profileDir: liveProfileDir });
         appendLiveScanLog(run, 'Passo login + turnstile/captcha çözüm adımları başlatıldı...');
         const loginRet = await launchAndLogin({
+          runId: run.runId,
           email: credential.email,
           password: credential.password,
           userDataDir: liveProfileDir,
@@ -645,6 +646,9 @@ async function scanBlocksLive(req, res) {
       } finally {
         try {
           if (browser && typeof browser.close === 'function') {
+            try {
+              unregisterPassobotBrowser(browser);
+            } catch {}
             await browser.close();
           }
         } catch {}
