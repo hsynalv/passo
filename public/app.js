@@ -432,6 +432,19 @@ function shouldFlashPairCard(prev, next) {
   return false;
 }
 
+/** Çoklu koltuk: sunucu combinedAll / seatItemCount gönderirse özet satırında göster. */
+function formatPairSeatSummary(p) {
+  if (!p || typeof p !== 'object') return '—';
+  const all = String(p.combinedAll || '').trim();
+  if (all) return all;
+  const n = Number(p.seatItemCount);
+  const base = String(p.seatLabel || '').trim();
+  if (Number.isFinite(n) && n > 1) {
+    return base ? `${base} · ${n} bilet (sepet)` : `${n} bilet (sepet)`;
+  }
+  return base || '—';
+}
+
 function renderPairDashboard(dash) {
   const metaEl = $('pairDashboardMeta');
   const bodyEl = $('pairDashboardBody');
@@ -501,7 +514,7 @@ function renderPairDashboard(dash) {
       <div class="pairCardRow"><span>Ana</span> <code>${escapeHtml(p.aEmail || '—')}</code></div>
       <div class="pairCardRow"><span>Tutucu</span> <code>${escapeHtml(p.bEmail || '—')}</code></div>
       ${detailLines}
-      <div class="pairCardRow"><span>Özet</span> ${escapeHtml(p.seatLabel || '—')} <span class="muted">(id: ${escapeHtml(p.seatId || '—')})</span></div>
+      <div class="pairCardRow"><span>Özet</span> ${escapeHtml(formatPairSeatSummary(p))} <span class="muted">(id: ${escapeHtml(p.seatId || '—')})</span></div>
       <div class="pairCardRow"><span>Tutucu</span> <strong>${escapeHtml(who)}</strong></div>
       <div class="pairCardRow"><span>Sepet</span> <strong>${escapeHtml(basketStateLabel)}</strong></div>
       <div class="pairCardRow"><span>Kalan süre</span> <strong class="pairTimer${remainingTone ? ` ${remainingTone}` : ''}" data-basket-remaining-seconds="${escapeHtml(p.basketRemainingSeconds ?? '')}" data-basket-observed-at="${escapeHtml(p.basketObservedAt || '')}" data-basket-arrived-at-ms="${escapeHtml(p.basketArrivedAtMs ?? '')}" data-basket-holding-time-seconds="${escapeHtml(p.basketHoldingTimeSeconds ?? '')}">${escapeHtml(remainingLabel)}</strong></div>
@@ -562,9 +575,9 @@ const PANEL_CHECKBOX_KEYS = new Set([
 
 /** Bilet alımı — timeout / gecikme / çoklu hesap / sepet döngüsü / koltuk tarama. */
 const PANEL_FIELD_META = {
-  MULTI_A_CONCURRENCY: { label: 'Paralel ana hesap oturumu', hint: 'Aynı anda kaç ana hesap tarayıcısı.', section: 'multi' },
-  MULTI_B_CONCURRENCY: { label: 'Paralel tutucu hesap oturumu', hint: 'Aynı anda kaç tutucu hesap tarayıcısı.', section: 'multi' },
-  MULTI_STAGGER_MS: { label: 'Başlatma aralığı (ms)', hint: 'Oturumlar arası gecikme.', section: 'multi' },
+  MULTI_A_CONCURRENCY: { label: 'Paralel ana hesap oturumu', hint: 'Çoklu girişte düşük değer (ör. 3–5) Turnstile/Capsolver kuyruğu ve shell yükü için daha stabil.', section: 'multi' },
+  MULTI_B_CONCURRENCY: { label: 'Paralel tutucu hesap oturumu', hint: 'B hazırlığında aynı anda açılacak tarayıcı sayısı; yüksek eşzamanlılık CF riskini artırır.', section: 'multi' },
+  MULTI_STAGGER_MS: { label: 'Başlatma aralığı (ms)', hint: 'Her oturum arası gecikme; 600–1200 ms önerilir.', section: 'multi' },
 
   BASKET_LOOP_ENABLED: { label: 'Sepet döngüsü (basket loop)', hint: 'Transfer döngüsü aktif.', section: 'basket', type: 'checkbox' },
   BASKET_LOOP_MAX_HOPS: { label: 'Sepet döngüsü max adım', hint: 'Maksimum hop sayısı.', section: 'basket' },
@@ -574,6 +587,7 @@ const PANEL_FIELD_META = {
   EXPERIMENTAL_A_READD_COOLDOWN_SECONDS: { label: 'Ana hesap yeniden ekleme bekleme (sn)', hint: 'Tekrar arası minimum süre.', section: 'basket' },
 
   TURNSTILE_DETECTION_TIMEOUT: { label: 'Turnstile algılama timeout (ms)', hint: 'Widget bekleme.', section: 'timeouts' },
+  TURNSTILE_SOLVE_CONCURRENCY: { label: 'Turnstile çözüm eşzamanlılığı', hint: 'Aynı anda Capsolver/Turnstile çözümü; çoklu girişte 6–10 arası deneyin, rate limit görürseniz düşürün.', section: 'timeouts' },
   CLICK_BUY_RETRIES: { label: 'Satın al tıklama denemesi', hint: 'SATIN AL için tekrar.', section: 'timeouts' },
   CLICK_BUY_DELAY: { label: 'Satın al tıklama gecikmesi (ms)', hint: 'Denemeler arası.', section: 'timeouts' },
   SEAT_SELECTION_MAX_MS: { label: 'Koltuk seçimi max süre (ms)', hint: 'Blok başına üst süre.', section: 'timeouts' },
@@ -1109,7 +1123,28 @@ function statusTextFromAudit(eventKey, meta = {}) {
     } else if (meta?.source === 'pool' && Number(meta?.poolAssignableCount) > 1) {
       tail = ` — havuz: ${meta.poolAssignableCount} aktif`;
     }
-    return `🌐 ${actorPrefix}Proxy (${src}): ${endpoint}${proto}${pid}${tail}`;
+    const attemptTail = Number.isFinite(Number(meta?.poolAttempt)) && Number(meta.poolAttempt) > 1
+      ? ` · atama #${meta.poolAttempt}`
+      : '';
+    return `🌐 ${actorPrefix}Proxy (${src}): ${endpoint}${proto}${pid}${tail}${attemptTail}`;
+  }
+  if (event === 'proxy_pool_launch_retry') {
+    const stepInfo = {
+      raw: '',
+      body: '',
+      role: String(meta?.role || '').trim().toUpperCase(),
+      idx: Number.isFinite(Number(meta?.idx)) ? Number(meta.idx) : null,
+      pairIndex,
+      stageKey: '',
+    };
+    const actorPrefix = stepInfo.role ? `${formatStatusActor(stepInfo, meta)} · ` : prefix;
+    const n = Number(meta?.nextAttempt);
+    const kind = String(meta?.retryKind || '').toLowerCase();
+    const kindLabel =
+      kind === 'transport'
+        ? 'proxy/tünel bağlantı hatası'
+        : 'geçici hata (CF/shell/ulaşım)';
+    return `🔄 ${actorPrefix}Giriş: ${kindLabel}; tarayıcı kapatıldı, havuzdan farklı proxy deneniyor${Number.isFinite(n) ? ` (atama #${n})` : ''}`;
   }
   if (event === 'proxy_skipped') {
     const stepInfo = {
@@ -1142,7 +1177,10 @@ function statusTextFromAudit(eventKey, meta = {}) {
     const pid = meta?.proxyId ? ` · kayıt id: ${meta.proxyId}` : '';
     const reason = String(meta?.reason || '').trim();
     const shortReason = reason.length > 140 ? `${reason.slice(0, 137)}…` : reason;
-    return `⚠️ ${actorPrefix}Proxy ile giriş başarısız: ${endpoint}${pid}${shortReason ? ` — ${shortReason}` : ''}`;
+    const soft = meta?.softFailure === true;
+    const softNote = soft ? ' · blacklist sayacı artmadı' : '';
+    const retryNote = meta?.willRetryAnotherProxy ? ' · başka proxy denenecek' : '';
+    return `⚠️ ${actorPrefix}Proxy ile giriş başarısız: ${endpoint}${pid}${shortReason ? ` — ${shortReason}` : ''}${softNote}${retryNote}`;
   }
   return null;
 }

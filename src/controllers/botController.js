@@ -18,6 +18,10 @@ const teamRepo = require('../repositories/teamRepository');
 const { withRunCfg, getCfg } = require('../runCfg');
 const { buildProviderChain, hasCaptchaSolverCredentials, solveTurnstileProxyless, solveRecaptchaV2Proxyless } = require('../services/captchaSolver');
 const delay = require('../utils/delay');
+const {
+  isSoftProxyLoginFailure,
+  shouldRetryLoginWithAnotherPoolProxy
+} = require('../utils/proxyLoginFailure');
 const { evaluateSafe, waitForFunctionSafe } = require('../utils/browserEval');
 const { decryptSecret } = require('../utils/credentialCrypto');
 const logger = require('../utils/logger');
@@ -76,6 +80,17 @@ async function resolveCategoriesForCredential(teamId, selectedCategories, creden
       svgBlockId: item.svgBlockId
     }, categorySelectionMode))
     .filter(Boolean);
+}
+
+function snapshotLooksLikeCloudflareBlock(snap, httpStatus) {
+    if (!snap || typeof snap !== 'object') return false;
+    const t = String(snap.title || '').toLowerCase();
+    if (t.includes('attention required')) return true;
+    if (t.includes('just a moment')) return true;
+    if (t.includes('sorry, you have been blocked')) return true;
+    const ic = Number(snap.inputCount) || 0;
+    if (Number(httpStatus) === 403 && ic < 2) return true;
+    return false;
 }
 
 function buildCategoryRoamTexts(selectedCategories, fallbackCategoryType, fallbackAlternativeCategory) {
@@ -3298,8 +3313,7 @@ async function launchAndLogin(options) {
         logger.info('launchAndLogin: login document response', { email, doc: lastLoginDoc });
     } catch {}
 
-    try {
-        const snap0 = await evalOnPage(page, `
+    const loginSnapScript = `
             var bodyText = (document.body && document.body.innerText) ? String(document.body.innerText).toLowerCase() : '';
             var hasVerifyHuman = bodyText.indexOf('verify you are human') >= 0;
             var hasTurnstileWidget = !!document.querySelector('.cf-turnstile');
@@ -3322,60 +3336,75 @@ async function launchAndLogin(options) {
                 linkCount: linkCount,
                 bodyHtmlLen: bodyHtmlLen,
                 docHtmlLen: docHtmlLen
-            };
-        `);
+            };`;
+
+    try {
+        let snap0 = await evalOnPage(page, loginSnapScript);
         logger.info('launchAndLogin: login sayfası yüklendi', { email, snap: snap0 });
+
+        const passoHomeTrLogin = (() => {
+            try {
+                const u = String(getCfg().PASSO_LOGIN || '');
+                const h = u.replace(/\/tr\/giris.*$/i, '/tr').replace(/\/+$/, '');
+                return h && /^https?:\/\//i.test(h) ? h : 'https://www.passo.com.tr/tr';
+            } catch {
+                return 'https://www.passo.com.tr/tr';
+            }
+        })();
+
+        if (snapshotLooksLikeCloudflareBlock(snap0, lastLoginDoc?.status)) {
+            logger.warn('launchAndLogin: olası Cloudflare/403, ana sayfa → /giris kurtarma', {
+                email,
+                docStatus: lastLoginDoc?.status
+            });
+            for (let cfRound = 1; cfRound <= 2; cfRound++) {
+                try {
+                    await delay(1600 + cfRound * 400);
+                    await gotoWithRetry(page, passoHomeTrLogin, {
+                        retries: 1,
+                        waitUntil: 'domcontentloaded',
+                        timeoutMs: 55000,
+                        backoffMs: 500
+                    });
+                } catch {}
+                await delay(700);
+                const bustCf = `${getCfg().PASSO_LOGIN}${getCfg().PASSO_LOGIN.includes('?') ? '&' : '?'}pb_cfrecover=${Date.now()}_${cfRound}`;
+                try {
+                    await gotoWithRetry(page, bustCf, {
+                        retries: 1,
+                        waitUntil: cfRound % 2 === 0 ? 'networkidle2' : 'domcontentloaded',
+                        expectedUrlIncludes: '/giris',
+                        timeoutMs: 65000,
+                        backoffMs: 500
+                    });
+                } catch {}
+                await dismissPassoLoginShellOverlays(page, email, `cf_recover_${cfRound}`);
+                await delay(1100 + cfRound * 200);
+                snap0 = await evalOnPage(page, loginSnapScript);
+                logger.info('launchAndLogin: CF kurtarma sonrası snapshot', { email, cfRound, snap: snap0 });
+                if (!snapshotLooksLikeCloudflareBlock(snap0, lastLoginDoc?.status)) break;
+            }
+        }
 
         // Passo SPA: bazen /giris açılır ama sadece shell (logo) kalır; inputCount=0 iken body büyük olabilir.
         // Eski kod yalnızca bodyHtmlLen<500 iken reload ediyordu — bu yüzden form hiç gelmeyebiliyordu.
         const girisUrlNow = (() => { try { return String(page.url() || ''); } catch { return ''; } })();
         const noLoginFieldsYet = (s) => ((s?.inputCount || 0) === 0 && (s?.formCount || 0) === 0);
         if (/\/giris(\?|$)/i.test(girisUrlNow) && noLoginFieldsYet(snap0)) {
-            const snapScript = `
-                var bodyText = (document.body && document.body.innerText) ? String(document.body.innerText).toLowerCase() : '';
-                var hasVerifyHuman = bodyText.indexOf('verify you are human') >= 0;
-                var hasTurnstileWidget = !!document.querySelector('.cf-turnstile');
-                var hasTurnstileTokenField = !!document.querySelector('input[name="cf-turnstile-response"]');
-                var title = document.title || '';
-                var inputCount = document.querySelectorAll('input').length;
-                var formCount = document.querySelectorAll('form').length;
-                var scriptCount = document.querySelectorAll('script').length;
-                var linkCount = document.querySelectorAll('link[rel="stylesheet"], link[as="style"], style').length;
-                var bodyHtmlLen = (document.body && document.body.innerHTML) ? document.body.innerHTML.length : 0;
-                var docHtmlLen = (document.documentElement && document.documentElement.outerHTML) ? document.documentElement.outerHTML.length : 0;
-                return {
-                    title: title,
-                    hasVerifyHuman: hasVerifyHuman,
-                    hasTurnstileWidget: hasTurnstileWidget,
-                    hasTurnstileTokenField: hasTurnstileTokenField,
-                    inputCount: inputCount,
-                    formCount: formCount,
-                    scriptCount: scriptCount,
-                    linkCount: linkCount,
-                    bodyHtmlLen: bodyHtmlLen,
-                    docHtmlLen: docHtmlLen
-                };`;
-            const passoHomeTr = (() => {
-                try {
-                    const u = String(getCfg().PASSO_LOGIN || '');
-                    const h = u.replace(/\/tr\/giris.*$/i, '/tr').replace(/\/+$/, '');
-                    return h && /^https?:\/\//i.test(h) ? h : 'https://www.passo.com.tr/tr';
-                } catch {
-                    return 'https://www.passo.com.tr/tr';
-                }
-            })();
+            const snapScript = loginSnapScript;
+            const passoHomeTr = passoHomeTrLogin;
             let lastSnap = snap0;
             await dismissPassoLoginShellOverlays(page, email, 'shell_once_before_loop');
             lastSnap = await evalOnPage(page, snapScript);
             logger.info('launchAndLogin: çerez sonrası snapshot', { email, snap: lastSnap });
-            for (let attempt = 1; attempt <= 8 && noLoginFieldsYet(lastSnap); attempt++) {
+            for (let attempt = 1; attempt <= 12 && noLoginFieldsYet(lastSnap); attempt++) {
                 logger.warn('launchAndLogin: giriş formu henüz yok (SPA/shell), zorla yenileme', {
                     email,
                     attempt,
                     bodyHtmlLen: lastSnap.bodyHtmlLen,
                     docHtmlLen: lastSnap.docHtmlLen
                 });
-                if (attempt === 3 || attempt === 6) {
+                if (attempt === 3 || attempt === 6 || attempt === 9) {
                     logger.warn('launchAndLogin: ana sayfa üzerinden router sıfırlanıyor', { email, attempt, passoHomeTr });
                     try {
                         await gotoWithRetry(page, passoHomeTr, {
@@ -3406,12 +3435,24 @@ async function launchAndLogin(options) {
                         });
                     } catch {}
                 }
-                await delay(800 + attempt * 200);
+                await delay(900 + attempt * 220);
+                if (snapshotLooksLikeCloudflareBlock(lastSnap, lastLoginDoc?.status)) {
+                    try {
+                        await delay(1200);
+                        await gotoWithRetry(page, passoHomeTr, {
+                            retries: 1,
+                            waitUntil: 'domcontentloaded',
+                            timeoutMs: 55000,
+                            backoffMs: 500
+                        });
+                    } catch {}
+                    await delay(600);
+                }
                 await dismissPassoLoginShellOverlays(page, email, `shell_${attempt}`);
                 try {
                     await page.waitForSelector(
                         'input[type="password"], input[autocomplete="current-password"], input[autocomplete="username"], quick-form[name="loginform"]',
-                        { timeout: 14000 }
+                        { timeout: 18000 }
                     ).catch(() => {});
                 } catch {}
                 lastSnap = await evalOnPage(page, snapScript);
@@ -3468,7 +3509,7 @@ async function launchAndLogin(options) {
         return !!await findLoginContext();
     };
 
-    const tryEnsureLoginForm = async (timeoutMs = 12000) => {
+    const tryEnsureLoginForm = async (timeoutMs = 15000) => {
         const start = Date.now();
         let lastDismiss = 0;
         while (Date.now() - start < timeoutMs) {
@@ -3486,8 +3527,8 @@ async function launchAndLogin(options) {
     };
 
     const ensureLoginFormWithReload = async () => {
-        for (let attempt = 1; attempt <= 8; attempt++) {
-            const ctx = await tryEnsureLoginForm(16000);
+        for (let attempt = 1; attempt <= 10; attempt++) {
+            const ctx = await tryEnsureLoginForm(20000);
             if (ctx) return ctx;
             logger.warn('launchAndLogin: form hâlâ yok, tekrar giriş URL + yenileme', { email, attempt });
             try {
@@ -3510,10 +3551,10 @@ async function launchAndLogin(options) {
             try {
                 await page.waitForSelector(
                     'input[type="password"], input[autocomplete="current-password"], input[autocomplete="username"], quick-form[name="loginform"]',
-                    { timeout: 14000 }
+                    { timeout: 18000 }
                 ).catch(() => {});
             } catch {}
-            const backoff = 500 * attempt;
+            const backoff = 550 * attempt;
             try { await delay(backoff); } catch {}
             await tryRevealLoginForm().catch(() => false);
             const u = (() => { try { return page.url(); } catch { return ''; } })();
@@ -3564,6 +3605,14 @@ async function launchAndLogin(options) {
             `);
             logger.warn('launchAndLogin: login formu bulunamadı (diagnostic)', { email, url: u, diag });
         } catch {}
+        try {
+            const finalSnap = await evalOnPage(page, loginSnapScript);
+            if (snapshotLooksLikeCloudflareBlock(finalSnap, lastLoginDoc?.status)) {
+                throw new Error('Login blocked: Cloudflare veya kenar ağı (403/shell); farklı proxy denenebilir');
+            }
+        } catch (e) {
+            if (String(e?.message || '').includes('Login blocked:')) throw e;
+        }
         throw new Error('Login formu bulunamadı');
     }
 
@@ -7177,18 +7226,33 @@ async function startBotAfterValidation(req, res, validatedData) {
                 proxy: `${manualProxyLaunchConfig.proxyHost}:${manualProxyLaunchConfig.proxyPort}`,
                 protocol: 'manual'
             });
-        } else {
-            if (manualProxyLaunchConfig && !useManualSingleBrowserOnly) {
-                audit('proxy_manual_skipped_multi_browser', {
-                    runId,
-                    role,
-                    idx,
-                    email: emailForLog,
-                    launchSerial: managedProxyLaunchSerial,
-                    reason: 'her_tarayici_ayri_proxy_havuz'
-                });
+            try {
+                return await launchAndLogin(opts);
+            } catch (error) {
+                throw error;
             }
-            if (shouldUseProxyPool) {
+        }
+
+        if (manualProxyLaunchConfig && !useManualSingleBrowserOnly) {
+            audit('proxy_manual_skipped_multi_browser', {
+                runId,
+                role,
+                idx,
+                email: emailForLog,
+                launchSerial: managedProxyLaunchSerial,
+                reason: 'her_tarayici_ayri_proxy_havuz'
+            });
+        }
+
+        if (shouldUseProxyPool) {
+            const maxPoolAttempts = Math.max(
+                1,
+                Math.min(8, Number(getCfg()?.TIMEOUTS?.PROXY_POOL_LOGIN_MAX_ATTEMPTS) || 3)
+            );
+            let lastErr = null;
+            for (let poolAttempt = 1; poolAttempt <= maxPoolAttempts; poolAttempt++) {
+                activeProxy = null;
+                fromPool = false;
                 try {
                     await auditProxyPoolLayoutOnce();
                 } catch {}
@@ -7219,50 +7283,76 @@ async function startBotAfterValidation(req, res, validatedData) {
                     proxy: `${activeProxy.host}:${activeProxy.port}`,
                     protocol: activeProxy.protocol,
                     poolAssignableCount: poolAssignableCountSnapshot,
-                    singleProxyPoolShared: singleShared
+                    singleProxyPoolShared: singleShared,
+                    poolAttempt
                 });
-            } else if (manualProxyLaunchConfig && !useManualSingleBrowserOnly) {
-                throw new Error(
-                    'Birden fazla tarayıcı açılıyor; her hesap için farklı proxy kullanılmalıdır. Proxy havuzunu açın ve tarayıcı sayısından az olmayacak kadar aktif proxy ekleyin. (Tek hesap + panelde tek proxy yalnızca tek tarayıcı koşusunda geçerli.)'
-                );
-            } else {
-                audit('proxy_skipped', {
-                    runId,
-                    role,
-                    idx,
-                    email: emailForLog,
-                    reason: 'useProxyPool=false'
-                });
+                try {
+                    const result = await launchAndLogin(opts);
+                    if (activeProxy?.id) {
+                        try { await proxyRepo.markLoginSuccess(activeProxy.id); } catch {}
+                    }
+                    return result;
+                } catch (error) {
+                    lastErr = error;
+                    const soft = isSoftProxyLoginFailure(error?.message);
+                    const retryAnotherProxy =
+                        shouldRetryLoginWithAnotherPoolProxy(error?.message) && poolAttempt < maxPoolAttempts;
+                    if (activeProxy?.id) {
+                        try {
+                            const updated = await proxyRepo.markLoginFailure(activeProxy.id, {
+                                threshold: 3,
+                                reason: error?.message || 'login_failed',
+                                soft
+                            });
+                            audit('proxy_login_failed', {
+                                runId,
+                                role,
+                                idx,
+                                email: emailForLog,
+                                proxyId: activeProxy.id,
+                                proxy: `${activeProxy.host}:${activeProxy.port}`,
+                                blacklistedUntil: updated?.blacklistUntil || null,
+                                reason: error?.message || String(error),
+                                softFailure: soft,
+                                poolAttempt,
+                                willRetryAnotherProxy: retryAnotherProxy
+                            }, 'warn');
+                        } catch {}
+                    }
+                    if (retryAnotherProxy) {
+                        audit('proxy_pool_launch_retry', {
+                            runId,
+                            role,
+                            idx,
+                            email: emailForLog,
+                            poolAttempt,
+                            nextAttempt: poolAttempt + 1,
+                            retryKind: soft ? 'soft' : 'transport',
+                            note: 'launchAndLogin basarisiz: tarayici kapatildi, havuzdan yeni proxy ile tekrar'
+                        });
+                        await delay(400 + Math.floor(Math.random() * 500));
+                        continue;
+                    }
+                    throw error;
+                }
             }
+            throw lastErr || new Error('Proxy havuz girisi basarisiz');
         }
 
-        try {
-            const result = await launchAndLogin(opts);
-            if (fromPool && activeProxy?.id) {
-                try { await proxyRepo.markLoginSuccess(activeProxy.id); } catch {}
-            }
-            return result;
-        } catch (error) {
-            if (fromPool && activeProxy?.id) {
-                try {
-                    const updated = await proxyRepo.markLoginFailure(activeProxy.id, {
-                        threshold: 3,
-                        reason: error?.message || 'login_failed'
-                    });
-                    audit('proxy_login_failed', {
-                        runId,
-                        role,
-                        idx,
-                        email: emailForLog,
-                        proxyId: activeProxy.id,
-                        proxy: `${activeProxy.host}:${activeProxy.port}`,
-                        blacklistedUntil: updated?.blacklistUntil || null,
-                        reason: error?.message || String(error)
-                    }, 'warn');
-                } catch {}
-            }
-            throw error;
+        if (manualProxyLaunchConfig && !useManualSingleBrowserOnly) {
+            throw new Error(
+                'Birden fazla tarayıcı açılıyor; her hesap için farklı proxy kullanılmalıdır. Proxy havuzunu açın ve tarayıcı sayısından az olmayacak kadar aktif proxy ekleyin. (Tek hesap + panelde tek proxy yalnızca tek tarayıcı koşusunda geçerli.)'
+            );
         }
+
+        audit('proxy_skipped', {
+            runId,
+            role,
+            idx,
+            email: emailForLog,
+            reason: 'useProxyPool=false'
+        });
+        return launchAndLogin(opts);
     };
 
     let currentHolder = null; // 'A' | 'B'
@@ -7425,6 +7515,12 @@ async function startBotAfterValidation(req, res, validatedData) {
                         row.tribune = currentSeatInfo.tribune ?? row.tribune ?? null;
                         row.seatRow = currentSeatInfo.row ?? row.seatRow ?? null;
                         row.seatNumber = currentSeatInfo.seat ?? row.seatNumber ?? null;
+                        if (currentSeatInfo.combinedAll) {
+                            row.combinedAll = String(currentSeatInfo.combinedAll).trim();
+                        }
+                        if (Number.isFinite(Number(currentSeatInfo.itemCount)) && Number(currentSeatInfo.itemCount) > 1) {
+                            row.seatItemCount = Math.floor(Number(currentSeatInfo.itemCount));
+                        }
                     }
                 }
                 return row;
@@ -7466,6 +7562,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                         next.tribune = seatInfo.tribune ?? next.tribune ?? null;
                         next.seatRow = seatInfo.row ?? next.seatRow ?? null;
                         next.seatNumber = seatInfo.seat ?? next.seatNumber ?? null;
+                        if (seatInfo.combinedAll) next.combinedAll = String(seatInfo.combinedAll).trim();
+                        if (Number.isFinite(Number(seatInfo.itemCount)) && Number(seatInfo.itemCount) > 1) {
+                            next.seatItemCount = Math.floor(Number(seatInfo.itemCount));
+                        }
                     }
                     return next;
                 });
@@ -7923,6 +8023,10 @@ async function startBotAfterValidation(req, res, validatedData) {
             holder: 'A',
             seatId: seatInfoOnA?.seatId ? String(seatInfoOnA.seatId) : null,
             seatLabel: fmtSeatLabel(seatInfoOnA),
+            combinedAll: seatInfoOnA?.combinedAll ? String(seatInfoOnA.combinedAll).trim() : null,
+            seatItemCount: Number.isFinite(Number(seatInfoOnA?.itemCount)) && Number(seatInfoOnA.itemCount) > 1
+                ? Math.floor(Number(seatInfoOnA.itemCount))
+                : null,
             tribune: seatInfoOnA?.tribune ?? null,
             seatRow: seatInfoOnA?.row ?? null,
             seatNumber: seatInfoOnA?.seat ?? null,
@@ -8191,12 +8295,17 @@ async function startBotAfterValidation(req, res, validatedData) {
             lastBRemoveDiag: removeDiag || null,
             ...basketTimingPatch
         });
+        const multiSeatSrc = seatBInfo || aCtx?.seatInfo || null;
         upsertDashboardPairRow(idx, {
             aEmail: aCtx?.email || '',
             bEmail: bCtx?.email || '',
             holder: 'B',
             seatId: seatBInfo?.seatId ? String(seatBInfo.seatId) : (aCtx?.seatInfo?.seatId ? String(aCtx.seatInfo.seatId) : null),
             seatLabel: fmtSeatLabel(seatBInfo),
+            combinedAll: multiSeatSrc?.combinedAll ? String(multiSeatSrc.combinedAll).trim() : null,
+            seatItemCount: Number.isFinite(Number(multiSeatSrc?.itemCount)) && Number(multiSeatSrc.itemCount) > 1
+                ? Math.floor(Number(multiSeatSrc.itemCount))
+                : null,
             tribune: seatBInfo?.tribune ?? null,
             seatRow: seatBInfo?.row ?? null,
             seatNumber: seatBInfo?.seat ?? null,
@@ -9629,6 +9738,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                     holder: 'A',
                     seatId: seatInfo?.seatId ? String(seatInfo.seatId) : null,
                     seatLabel: fmtSeatLabel(seatInfo),
+                    combinedAll: seatInfo?.combinedAll ? String(seatInfo.combinedAll).trim() : null,
+                    seatItemCount: Number.isFinite(Number(seatInfo?.itemCount)) && Number(seatInfo.itemCount) > 1
+                        ? Math.floor(Number(seatInfo.itemCount))
+                        : null,
                     tribune: seatInfo?.tribune ?? null,
                     seatRow: seatInfo?.row ?? null,
                     seatNumber: seatInfo?.seat ?? null,
@@ -9734,6 +9847,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                         holder: ctx?.seatInfo?.seatId ? 'A' : null,
                         seatId: ctx?.seatInfo?.seatId ? String(ctx.seatInfo.seatId) : null,
                         seatLabel: fmtSeatLabel(ctx?.seatInfo),
+                        combinedAll: ctx?.seatInfo?.combinedAll ? String(ctx.seatInfo.combinedAll).trim() : null,
+                        seatItemCount: Number.isFinite(Number(ctx?.seatInfo?.itemCount)) && Number(ctx.seatInfo.itemCount) > 1
+                            ? Math.floor(Number(ctx.seatInfo.itemCount))
+                            : null,
                         phase: ctx?.canPay === false ? 'C finalize bekliyor' : (hasCardInfo ? 'A ödeme kuyruğunda' : 'Sepette tutuluyor'),
                         paymentOwnerRole: ctx?.canPay === false ? 'C' : 'A',
                         paymentEligible: ctx?.canPay !== false,
@@ -9933,6 +10050,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                         holder: 'A',
                         seatId: aCtx?.seatInfo?.seatId ? String(aCtx.seatInfo.seatId) : null,
                         seatLabel: fmtSeatLabel(aCtx?.seatInfo),
+                        combinedAll: aCtx?.seatInfo?.combinedAll ? String(aCtx.seatInfo.combinedAll).trim() : null,
+                        seatItemCount: Number.isFinite(Number(aCtx?.seatInfo?.itemCount)) && Number(aCtx.seatInfo.itemCount) > 1
+                            ? Math.floor(Number(aCtx.seatInfo.itemCount))
+                            : null,
                         tribune: aCtx?.seatInfo?.tribune ?? null,
                         seatRow: aCtx?.seatInfo?.row ?? null,
                         seatNumber: aCtx?.seatInfo?.seat ?? null,
@@ -10910,6 +11031,10 @@ async function startBotAfterValidation(req, res, validatedData) {
             holder: 'A',
             seatId: seatInfoA?.seatId ? String(seatInfoA.seatId) : null,
             seatLabel: fmtSeatLabel(seatInfoA),
+            combinedAll: seatInfoA?.combinedAll ? String(seatInfoA.combinedAll).trim() : null,
+            seatItemCount: Number.isFinite(Number(seatInfoA?.itemCount)) && Number(seatInfoA.itemCount) > 1
+                ? Math.floor(Number(seatInfoA.itemCount))
+                : null,
             tribune: seatInfoA?.tribune ?? null,
             seatRow: seatInfoA?.row ?? null,
             seatNumber: seatInfoA?.seat ?? null,

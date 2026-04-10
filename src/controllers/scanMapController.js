@@ -15,6 +15,10 @@ const { decryptSecret } = require('../utils/credentialCrypto');
 const { launchAndLogin, unregisterPassobotBrowser } = require('./botController');
 const logger = require('../utils/logger');
 const {
+  isSoftProxyLoginFailure,
+  shouldRetryLoginWithAnotherPoolProxy
+} = require('../utils/proxyLoginFailure');
+const {
   scanMapClearSchema,
   scanMapQuerySchema,
   scanMapSaveAsCategoriesSchema,
@@ -564,36 +568,79 @@ async function scanBlocksLive(req, res) {
         const seatUrl = normalizeSeatUrl(payload.eventAddress);
         if (!seatUrl) throw new Error('SCAN_EVENT_URL_REQUIRED');
 
-        if (useProxy) {
-          activeProxy = await proxyRepo.acquireNextActiveProxy();
-          if (!activeProxy) {
-            throw new Error('Aktif proxy bulunamadı (scan map canlı akışı için proxy açık).');
-          }
-          appendLiveScanLog(run, 'Proxy seçildi', {
-            proxyId: activeProxy.id,
-            proxy: `${activeProxy.host}:${activeProxy.port}`,
-            protocol: activeProxy.protocol,
-          });
-        } else {
-          appendLiveScanLog(run, 'Proxy kullanımı kapalı, doğrudan bağlantı deneniyor', null, 'warn');
-        }
-
         liveProfileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'passo-scan-live-'));
         appendLiveScanLog(run, 'Tarayıcı açılıyor (ana bot akışı)...', { profileDir: liveProfileDir });
         appendLiveScanLog(run, 'Passo login + turnstile/captcha çözüm adımları başlatıldı...');
-        const loginRet = await launchAndLogin({
-          runId: run.runId,
-          email: credential.email,
-          password: credential.password,
-          userDataDir: liveProfileDir,
-          proxyHost: activeProxy ? normalizeProxyHostForLaunch(activeProxy.host, activeProxy.protocol || 'socks5') : undefined,
-          proxyPort: activeProxy ? activeProxy.port : undefined,
-          proxyUsername: activeProxy ? (activeProxy.username || '') : undefined,
-          proxyPassword: activeProxy ? (activeProxy.password || '') : undefined,
-        });
-        loginSucceeded = true;
-        if (activeProxy?.id) {
-          await proxyRepo.markLoginSuccess(activeProxy.id).catch(() => null);
+
+        const maxProxyAttempts = Math.max(
+          1,
+          Math.min(8, Number(cfg.TIMEOUTS?.PROXY_POOL_LOGIN_MAX_ATTEMPTS) || 3)
+        );
+        let loginRet = null;
+
+        if (useProxy) {
+          let lastLoginErr = null;
+          for (let proxyAttempt = 1; proxyAttempt <= maxProxyAttempts; proxyAttempt++) {
+            activeProxy = await proxyRepo.acquireNextActiveProxy();
+            if (!activeProxy) {
+              throw new Error('Aktif proxy bulunamadı (scan map canlı akışı için proxy açık).');
+            }
+            appendLiveScanLog(run, 'Proxy seçildi', {
+              proxyId: activeProxy.id,
+              proxy: `${activeProxy.host}:${activeProxy.port}`,
+              protocol: activeProxy.protocol,
+              proxyAttempt,
+              maxProxyAttempts
+            });
+            try {
+              loginRet = await launchAndLogin({
+                runId: run.runId,
+                email: credential.email,
+                password: credential.password,
+                userDataDir: liveProfileDir,
+                proxyHost: normalizeProxyHostForLaunch(activeProxy.host, activeProxy.protocol || 'socks5'),
+                proxyPort: activeProxy.port,
+                proxyUsername: activeProxy.username || '',
+                proxyPassword: activeProxy.password || ''
+              });
+              loginSucceeded = true;
+              if (activeProxy.id) {
+                await proxyRepo.markLoginSuccess(activeProxy.id).catch(() => null);
+              }
+              break;
+            } catch (e) {
+              lastLoginErr = e;
+              if (activeProxy.id) {
+                await proxyRepo.markLoginFailure(activeProxy.id, {
+                  threshold: 3,
+                  reason: e?.message || 'scan_live_login_failed',
+                  soft: isSoftProxyLoginFailure(e?.message)
+                }).catch(() => null);
+              }
+              const retry =
+                shouldRetryLoginWithAnotherPoolProxy(e?.message) && proxyAttempt < maxProxyAttempts;
+              if (retry) {
+                appendLiveScanLog(
+                  run,
+                  'Proxy ile giriş başarısız; tarayıcı kapatıldı, farklı proxy deneniyor',
+                  { proxyAttempt, reason: e?.message || String(e) },
+                  'warn'
+                );
+                continue;
+              }
+              throw e;
+            }
+          }
+          if (!loginSucceeded) throw lastLoginErr || new Error('SCAN_LIVE_LOGIN_FAILED');
+        } else {
+          appendLiveScanLog(run, 'Proxy kullanımı kapalı, doğrudan bağlantı deneniyor', null, 'warn');
+          loginRet = await launchAndLogin({
+            runId: run.runId,
+            email: credential.email,
+            password: credential.password,
+            userDataDir: liveProfileDir
+          });
+          loginSucceeded = true;
         }
         browser = loginRet?.browser || null;
         const page = loginRet?.page || (browser ? await browser.newPage() : null);
@@ -632,6 +679,7 @@ async function scanBlocksLive(req, res) {
           await proxyRepo.markLoginFailure(activeProxy.id, {
             threshold: 3,
             reason: error?.message || 'scan_live_login_failed',
+            soft: isSoftProxyLoginFailure(error?.message),
           }).catch(() => null);
         }
         run.status = 'failed';

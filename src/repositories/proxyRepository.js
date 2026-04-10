@@ -282,9 +282,11 @@ async function markLoginFailure(id, options = {}) {
   const existing = await proxies().findOne({ _id: oid });
   if (!existing) return null;
 
+  const soft = options.soft === true;
   const threshold = Math.max(1, Number(options.threshold) || FAILURE_THRESHOLD);
   const failCount = (Number(existing.failCount) || 0) + 1;
-  const consecutive = (Number(existing.consecutiveLoginFailures) || 0) + 1;
+  const prevConsecutive = Number(existing.consecutiveLoginFailures) || 0;
+  const consecutive = soft ? prevConsecutive : prevConsecutive + 1;
 
   const next = {
     failCount,
@@ -293,7 +295,7 @@ async function markLoginFailure(id, options = {}) {
     updatedAt: nowIso,
   };
 
-  if (consecutive >= threshold) {
+  if (!soft && consecutive >= threshold) {
     const until = new Date(now.getTime() + BLACKLIST_MS).toISOString();
     next.blacklistUntil = until;
     next.blacklistReason = options.reason ? String(options.reason).slice(0, 500) : 'login_failure_threshold';
