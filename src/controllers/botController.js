@@ -3190,12 +3190,12 @@ async function launchAndLogin(options) {
         `);
         logger.info('launchAndLogin: login sayfası yüklendi', { email, snap: snap0 });
 
-        // If page is basically empty (no inputs/forms) try a stronger reload
-        if ((snap0.inputCount || 0) === 0 && (snap0.formCount || 0) === 0 && (snap0.bodyHtmlLen || 0) < 500) {
-            logger.warn('launchAndLogin: login sayfası boş görünüyor, reload(networkidle2) deneniyor', { email, snap: snap0 });
-            try { await page.reload({ waitUntil: 'networkidle2', timeout: 60000 }); } catch {}
-            await delay(800);
-            const snap1 = await evalOnPage(page, `
+        // Passo SPA: bazen /giris açılır ama sadece shell (logo) kalır; inputCount=0 iken body büyük olabilir.
+        // Eski kod yalnızca bodyHtmlLen<500 iken reload ediyordu — bu yüzden form hiç gelmeyebiliyordu.
+        const girisUrlNow = (() => { try { return String(page.url() || ''); } catch { return ''; } })();
+        const noLoginFieldsYet = (s) => ((s?.inputCount || 0) === 0 && (s?.formCount || 0) === 0);
+        if (/\/giris(\?|$)/i.test(girisUrlNow) && noLoginFieldsYet(snap0)) {
+            const snapScript = `
                 var bodyText = (document.body && document.body.innerText) ? String(document.body.innerText).toLowerCase() : '';
                 var hasVerifyHuman = bodyText.indexOf('verify you are human') >= 0;
                 var hasTurnstileWidget = !!document.querySelector('.cf-turnstile');
@@ -3218,9 +3218,43 @@ async function launchAndLogin(options) {
                     linkCount: linkCount,
                     bodyHtmlLen: bodyHtmlLen,
                     docHtmlLen: docHtmlLen
-                };
-            `);
-            logger.info('launchAndLogin: login reload sonrası snapshot', { email, snap: snap1 });
+                };`;
+            let lastSnap = snap0;
+            for (let attempt = 1; attempt <= 8 && noLoginFieldsYet(lastSnap); attempt++) {
+                logger.warn('launchAndLogin: giriş formu henüz yok (SPA/shell), zorla yenileme', {
+                    email,
+                    attempt,
+                    bodyHtmlLen: lastSnap.bodyHtmlLen,
+                    docHtmlLen: lastSnap.docHtmlLen
+                });
+                const baseLogin = getCfg().PASSO_LOGIN;
+                const bustUrl = `${baseLogin}${baseLogin.includes('?') ? '&' : '?'}pb_hydrate=${Date.now()}`;
+                try {
+                    await gotoWithRetry(page, bustUrl, {
+                        retries: 1,
+                        waitUntil: attempt % 2 === 0 ? 'networkidle2' : 'domcontentloaded',
+                        expectedUrlIncludes: '/giris',
+                        timeoutMs: 65000,
+                        backoffMs: 500
+                    });
+                } catch {
+                    try {
+                        await page.reload({
+                            waitUntil: attempt % 2 === 0 ? 'networkidle2' : 'domcontentloaded',
+                            timeout: 65000
+                        });
+                    } catch {}
+                }
+                await delay(800 + attempt * 200);
+                try {
+                    await page.waitForSelector(
+                        'input[type="password"], input[autocomplete="current-password"], input[autocomplete="username"], quick-form[name="loginform"]',
+                        { timeout: 14000 }
+                    ).catch(() => {});
+                } catch {}
+                lastSnap = await evalOnPage(page, snapScript);
+                logger.info('launchAndLogin: shell yenileme sonrası snapshot', { email, attempt, snap: lastSnap });
+            }
         }
     } catch {}
 
@@ -3284,21 +3318,33 @@ async function launchAndLogin(options) {
     };
 
     const ensureLoginFormWithReload = async () => {
-        for (let attempt = 1; attempt <= 5; attempt++) {
-            const ctx = await tryEnsureLoginForm(12000);
+        for (let attempt = 1; attempt <= 8; attempt++) {
+            const ctx = await tryEnsureLoginForm(16000);
             if (ctx) return ctx;
+            logger.warn('launchAndLogin: form hâlâ yok, tekrar giriş URL + yenileme', { email, attempt });
             try {
                 await gotoWithRetry(page, `${getCfg().PASSO_LOGIN}${getCfg().PASSO_LOGIN.includes('?') ? '&' : '?'}pb_retry=${Date.now()}`, {
                     retries: 1,
-                    waitUntil: 'networkidle2',
+                    waitUntil: attempt % 2 === 0 ? 'networkidle2' : 'domcontentloaded',
                     expectedUrlIncludes: '/giris',
-                    timeoutMs: 60000,
+                    timeoutMs: 65000,
                     backoffMs: 400
                 });
             } catch {
-                try { await page.reload({ waitUntil: 'networkidle2', timeout: 60000 }); } catch {}
+                try {
+                    await page.reload({
+                        waitUntil: attempt % 2 === 0 ? 'networkidle2' : 'domcontentloaded',
+                        timeout: 65000
+                    });
+                } catch {}
             }
-            const backoff = 600 * attempt;
+            try {
+                await page.waitForSelector(
+                    'input[type="password"], input[autocomplete="current-password"], input[autocomplete="username"], quick-form[name="loginform"]',
+                    { timeout: 14000 }
+                ).catch(() => {});
+            } catch {}
+            const backoff = 500 * attempt;
             try { await delay(backoff); } catch {}
             await tryRevealLoginForm().catch(() => false);
             const u = (() => { try { return page.url(); } catch { return ''; } })();
