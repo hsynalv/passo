@@ -3039,6 +3039,98 @@ async function disposeBrowserAfterFailedLogin(browser, email, err) {
     }
 }
 
+/** Çerez / EFILLI / OneTrust overlay giriş SPA'sını kilitliyebilir; tıkla veya overlay'i devre dışı bırak. */
+async function dismissPassoLoginShellOverlays(page, email, tag) {
+    if (!page) return;
+    try {
+        const summary = await page.evaluate(() => {
+            const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+            const wants = (t) => {
+                const x = norm(t);
+                return (
+                    x.includes('kabul') ||
+                    x.includes('accept') ||
+                    x.includes('onay') ||
+                    x.includes('tamam') ||
+                    x.includes('anlad') ||
+                    x.includes('allow') ||
+                    x.includes('agree') ||
+                    x.includes('tümünü') ||
+                    x.includes('tumunu') ||
+                    (x.includes('devam') && x.length < 28) ||
+                    x === 'evet'
+                );
+            };
+            let clicks = 0;
+            const clickIf = (el) => {
+                if (!el) return;
+                try {
+                    el.click();
+                    clicks++;
+                } catch {}
+            };
+            try {
+                clickIf(document.querySelector('#onetrust-accept-btn-handler'));
+                clickIf(document.querySelector('#accept-recommended-btn-handler'));
+            } catch {}
+            try {
+                const swal = document.querySelector('.swal2-container.swal2-shown');
+                clickIf(swal?.querySelector('button.swal2-confirm, button.swal2-cancel, button'));
+            } catch {}
+            for (const b of Array.from(document.querySelectorAll('button, a, [role="button"], [role="link"]'))) {
+                const t = b.innerText || b.textContent || b.getAttribute('aria-label') || '';
+                if (wants(t)) {
+                    clickIf(b);
+                    break;
+                }
+            }
+            const tryClickActions = (root) => {
+                if (!root || !root.querySelectorAll) return 0;
+                for (const el of Array.from(root.querySelectorAll('button, a, div[role="button"], span[role="button"], [aria-label]'))) {
+                    const t = el.innerText || el.textContent || el.getAttribute('aria-label') || '';
+                    if (!wants(t)) continue;
+                    try {
+                        el.click();
+                        return 1;
+                    } catch {}
+                }
+                return 0;
+            };
+            const walk = (root) => {
+                if (!root) return 0;
+                let c = tryClickActions(root);
+                if (c) return c;
+                for (const el of Array.from(root.querySelectorAll('*'))) {
+                    const sr = el.shadowRoot;
+                    if (sr) {
+                        c = walk(sr);
+                        if (c) return c;
+                    }
+                }
+                return 0;
+            };
+            const efs = Array.from(
+                document.querySelectorAll('efilli-layout-dynamic, efilli-layout, efilli-consent, [id*="efilli" i], [class*="efilli" i]')
+            );
+            for (const ef of efs) {
+                clicks += walk(ef.shadowRoot);
+                try {
+                    ef.style.setProperty('pointer-events', 'none', 'important');
+                    ef.style.setProperty('visibility', 'hidden', 'important');
+                } catch {}
+            }
+            return { clicks };
+        });
+        if (summary && summary.clicks > 0) {
+            logger.info('launchAndLogin: çerez/overlay kapatıldı', { email, tag, clicks: summary.clicks });
+        }
+    } catch {}
+    try {
+        await page.keyboard.press('Escape');
+    } catch {}
+    await delay(400);
+}
+
 async function launchAndLogin(options) {
     const opts = options && typeof options === 'object' ? options : {};
     const email = opts.email;
@@ -3219,7 +3311,19 @@ async function launchAndLogin(options) {
                     bodyHtmlLen: bodyHtmlLen,
                     docHtmlLen: docHtmlLen
                 };`;
+            const passoHomeTr = (() => {
+                try {
+                    const u = String(getCfg().PASSO_LOGIN || '');
+                    const h = u.replace(/\/tr\/giris.*$/i, '/tr').replace(/\/+$/, '');
+                    return h && /^https?:\/\//i.test(h) ? h : 'https://www.passo.com.tr/tr';
+                } catch {
+                    return 'https://www.passo.com.tr/tr';
+                }
+            })();
             let lastSnap = snap0;
+            await dismissPassoLoginShellOverlays(page, email, 'shell_once_before_loop');
+            lastSnap = await evalOnPage(page, snapScript);
+            logger.info('launchAndLogin: çerez sonrası snapshot', { email, snap: lastSnap });
             for (let attempt = 1; attempt <= 8 && noLoginFieldsYet(lastSnap); attempt++) {
                 logger.warn('launchAndLogin: giriş formu henüz yok (SPA/shell), zorla yenileme', {
                     email,
@@ -3227,6 +3331,19 @@ async function launchAndLogin(options) {
                     bodyHtmlLen: lastSnap.bodyHtmlLen,
                     docHtmlLen: lastSnap.docHtmlLen
                 });
+                if (attempt === 3 || attempt === 6) {
+                    logger.warn('launchAndLogin: ana sayfa üzerinden router sıfırlanıyor', { email, attempt, passoHomeTr });
+                    try {
+                        await gotoWithRetry(page, passoHomeTr, {
+                            retries: 1,
+                            waitUntil: 'domcontentloaded',
+                            timeoutMs: 55000,
+                            backoffMs: 500
+                        });
+                    } catch {}
+                    await dismissPassoLoginShellOverlays(page, email, `shell_home_${attempt}`);
+                    await delay(700);
+                }
                 const baseLogin = getCfg().PASSO_LOGIN;
                 const bustUrl = `${baseLogin}${baseLogin.includes('?') ? '&' : '?'}pb_hydrate=${Date.now()}`;
                 try {
@@ -3246,6 +3363,7 @@ async function launchAndLogin(options) {
                     } catch {}
                 }
                 await delay(800 + attempt * 200);
+                await dismissPassoLoginShellOverlays(page, email, `shell_${attempt}`);
                 try {
                     await page.waitForSelector(
                         'input[type="password"], input[autocomplete="current-password"], input[autocomplete="username"], quick-form[name="loginform"]',
@@ -3308,9 +3426,15 @@ async function launchAndLogin(options) {
 
     const tryEnsureLoginForm = async (timeoutMs = 12000) => {
         const start = Date.now();
+        let lastDismiss = 0;
         while (Date.now() - start < timeoutMs) {
             let ctx = await findLoginContext();
             if (ctx) return ctx;
+            const now = Date.now();
+            if (now - start > 1200 && now - lastDismiss > 4500) {
+                await dismissPassoLoginShellOverlays(page, email, 'login_form_poll');
+                lastDismiss = now;
+            }
             if (Date.now() - start > 3000) await tryRevealLoginForm();
             await delay(500);
         }
@@ -3338,6 +3462,7 @@ async function launchAndLogin(options) {
                     });
                 } catch {}
             }
+            await dismissPassoLoginShellOverlays(page, email, `ensure_reload_${attempt}`);
             try {
                 await page.waitForSelector(
                     'input[type="password"], input[autocomplete="current-password"], input[autocomplete="username"], quick-form[name="loginform"]',
