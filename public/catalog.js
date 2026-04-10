@@ -234,9 +234,10 @@
       const meta = document.createElement('div');
       meta.className = 'credentialPickMeta';
       const notePrev = formatNotePreview(item.notes);
+      const phoneDispPick = item.phone ? item.phone.replace(/(\d{3})(\d{3})(\d{2})(\d{2})/, '$1 $2 $3 $4') : '—';
       meta.innerHTML = `<strong>${escapeHtml(item.email || `${roleLabel === 'A' ? 'Ana hesap' : 'Tutucu hesap'} üyeliği`)}</strong>
         ${badges.length ? `<div class="credentialRoleBadgeRow">${badges.join('')}</div>` : ''}
-        <span>TCKN: ${escapeHtml(item.identity || '—')} • Fan Card: ${escapeHtml(item.fanCardCode || '—')} • Sicil: ${escapeHtml(item.sicilNo || '—')} • Önc. kod: ${escapeHtml(item.priorityTicketCode || '—')}</span>
+        <span>TCKN: ${escapeHtml(item.identity || '—')} • Tel: ${escapeHtml(phoneDispPick)} • Fan Card: ${escapeHtml(item.fanCardCode || '—')} • Sicil: ${escapeHtml(item.sicilNo || '—')} • Önc. kod: ${escapeHtml(item.priorityTicketCode || '—')}</span>
         ${notePrev ? `<span class="credentialNotePreview">Not: ${escapeHtml(notePrev)}</span>` : ''}`;
 
       const controls = document.createElement('div');
@@ -360,6 +361,7 @@
     $('credentialPasswordInput').value = '';
     $('credentialIdentityInput').value = '';
     $('credentialFanCardInput').value = '';
+    if ($('credentialPhoneInput')) $('credentialPhoneInput').value = '';
     if ($('credentialSicilNoInput')) $('credentialSicilNoInput').value = '';
     if ($('credentialPriorityTicketCodeInput')) $('credentialPriorityTicketCodeInput').value = '';
     if ($('credentialNotesInput')) $('credentialNotesInput').value = '';
@@ -460,8 +462,9 @@
       const noteBlock = notePrev
         ? `<br><span class="credentialNotePreview">Not: ${escapeHtml(notePrev)}</span>`
         : '';
+      const phoneDisp = item.phone ? item.phone.replace(/(\d{3})(\d{3})(\d{2})(\d{2})/, '$1 $2 $3 $4') : '—';
       meta.innerHTML = `<strong>${escapeHtml(item.email || '')}</strong>
-        <div class="itemCardMeta">TCKN: ${escapeHtml(item.identity || '—')} · Fan Card: ${escapeHtml(item.fanCardCode || '—')} · Sicil: ${escapeHtml(item.sicilNo || '—')} · Önc. kod: ${escapeHtml(item.priorityTicketCode || '—')}<br>Kategoriler: ${catLabel}${noteBlock}</div>`;
+        <div class="itemCardMeta">TCKN: ${escapeHtml(item.identity || '—')} · Tel: ${escapeHtml(phoneDisp)} · Fan Card: ${escapeHtml(item.fanCardCode || '—')} · Sicil: ${escapeHtml(item.sicilNo || '—')} · Önc. kod: ${escapeHtml(item.priorityTicketCode || '—')}<br>Kategoriler: ${catLabel}${noteBlock}</div>`;
       const actions = document.createElement('div');
       actions.className = 'itemCardActions';
       actions.innerHTML = `<button type="button" data-action="edit" data-credential-id="${escapeHtml(item.id)}" class="btnMuted">Düzenle</button>
@@ -714,6 +717,7 @@
       email: String($('credentialEmailInput').value || '').trim(),
       password: String($('credentialPasswordInput').value || '').trim(),
       identity: String($('credentialIdentityInput').value || '').trim(),
+      phone: String($('credentialPhoneInput')?.value || '').replace(/\D/g, '').slice(0, 15),
       fanCardCode: String($('credentialFanCardInput').value || '').trim(),
       sicilNo: String($('credentialSicilNoInput')?.value || '').trim(),
       priorityTicketCode: String($('credentialPriorityTicketCodeInput')?.value || '').trim(),
@@ -768,6 +772,7 @@
     $('credentialPasswordInput').value = '';
     $('credentialIdentityInput').value = item.identity || '';
     $('credentialFanCardInput').value = item.fanCardCode || '';
+    if ($('credentialPhoneInput')) $('credentialPhoneInput').value = item.phone || '';
     if ($('credentialSicilNoInput')) $('credentialSicilNoInput').value = item.sicilNo || '';
     if ($('credentialPriorityTicketCodeInput')) $('credentialPriorityTicketCodeInput').value = item.priorityTicketCode || '';
     if ($('credentialNotesInput')) $('credentialNotesInput').value = item.notes || '';

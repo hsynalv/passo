@@ -1441,7 +1441,19 @@ async function pollRunStatus(runId) {
   for (;;) {
     const j = await refreshRunStatus(runId);
     const st = j?.run?.status;
-    if (st && st !== 'running') return;
+    if (st && st !== 'running') {
+      if (st === 'error') {
+        const errMsg = j?.run?.error || 'Bot çalışırken bir hata oluştu.';
+        showToast('Bot Hatası', errMsg, 'error', 9000);
+        setActiveStep('setup');
+        showSetupIssues('Bot Hatası', [errMsg]);
+      } else if (st === 'killed') {
+        const killedMsg = j?.run?.error || 'Oturum panelden sonlandırıldı.';
+        showToast('Oturum Kapatıldı', killedMsg, 'info', 6000);
+        setActiveStep('setup');
+      }
+      return;
+    }
     await new Promise((res) => setTimeout(res, 350));
   }
 }

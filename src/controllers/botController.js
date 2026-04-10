@@ -1333,6 +1333,7 @@ async function buildCredentialBackedAccountLists(validatedData) {
             email: String(item.email || ''),
             password: decryptSecret(item.encryptedPassword),
             identity: item.identity || null,
+            phone: item.phone || null,
             fanCardCode: item.fanCardCode || null,
             sicilNo: item.sicilNo || null,
             priorityTicketCode: item.priorityTicketCode || null,
@@ -1352,6 +1353,7 @@ async function buildCredentialBackedAccountLists(validatedData) {
             email: String(item.email || ''),
             password: decryptSecret(item.encryptedPassword),
             identity: item.identity || null,
+            phone: item.phone || null,
             fanCardCode: item.fanCardCode || null,
             sicilNo: item.sicilNo || null,
             priorityTicketCode: item.priorityTicketCode || null,
@@ -1367,6 +1369,7 @@ async function buildCredentialBackedAccountLists(validatedData) {
             email: String(a.email || ''),
             password: String(a.password || ''),
             identity: (a && Object.prototype.hasOwnProperty.call(a, 'identity')) ? a.identity : null,
+            phone: (a && Object.prototype.hasOwnProperty.call(a, 'phone')) ? a.phone : null,
             fanCardCode: (a && Object.prototype.hasOwnProperty.call(a, 'fanCardCode')) ? a.fanCardCode : null,
             sicilNo: (a && Object.prototype.hasOwnProperty.call(a, 'sicilNo')) ? a.sicilNo : null,
             priorityTicketCode: (a && Object.prototype.hasOwnProperty.call(a, 'priorityTicketCode')) ? a.priorityTicketCode : null,
@@ -1375,19 +1378,20 @@ async function buildCredentialBackedAccountLists(validatedData) {
         }))
         : (aAccountsFromTeam.length
             ? aAccountsFromTeam
-            : [{ email: (a0Raw?.email || email || '').toString(), password: (a0Raw?.password || password || '').toString(), identity: identity ?? null, fanCardCode: fanCardCode ?? null, sicilNo: sicilNo ?? null, priorityTicketCode: priorityTicketCode ?? null, transferPurpose: normalizeTransferPurpose(a0Raw?.transferPurpose, false), canPay: normalizeTransferPurpose(a0Raw?.transferPurpose, false) ? false : normalizeCanPay(a0Raw?.canPay, false) }]);
+            : [{ email: (a0Raw?.email || email || '').toString(), password: (a0Raw?.password || password || '').toString(), identity: identity ?? null, phone: null, fanCardCode: fanCardCode ?? null, sicilNo: sicilNo ?? null, priorityTicketCode: priorityTicketCode ?? null, transferPurpose: normalizeTransferPurpose(a0Raw?.transferPurpose, false), canPay: normalizeTransferPurpose(a0Raw?.transferPurpose, false) ? false : normalizeCanPay(a0Raw?.canPay, false) }]);
     const bList = (Array.isArray(bAccounts) && bAccounts.length)
         ? bAccounts.map(b => ({
             email: String(b.email || ''),
             password: String(b.password || ''),
             identity: (b && Object.prototype.hasOwnProperty.call(b, 'identity')) ? b.identity : null,
+            phone: (b && Object.prototype.hasOwnProperty.call(b, 'phone')) ? b.phone : null,
             fanCardCode: (b && Object.prototype.hasOwnProperty.call(b, 'fanCardCode')) ? b.fanCardCode : null,
             sicilNo: (b && Object.prototype.hasOwnProperty.call(b, 'sicilNo')) ? b.sicilNo : null,
             priorityTicketCode: (b && Object.prototype.hasOwnProperty.call(b, 'priorityTicketCode')) ? b.priorityTicketCode : null
         }))
         : (bAccountsFromTeam.length
             ? bAccountsFromTeam
-            : [{ email: (b0Raw?.email || email2 || '').toString(), password: (b0Raw?.password || password2 || '').toString(), identity: identity ?? null, fanCardCode: fanCardCode ?? null, sicilNo: sicilNo ?? null, priorityTicketCode: priorityTicketCode ?? null }]);
+            : [{ email: (b0Raw?.email || email2 || '').toString(), password: (b0Raw?.password || password2 || '').toString(), identity: identity ?? null, phone: null, fanCardCode: fanCardCode ?? null, sicilNo: sicilNo ?? null, priorityTicketCode: priorityTicketCode ?? null }]);
 
     const hasRealB = bList.some(b => (b.email || '').trim() && (b.password || '').trim());
     return { ok: true, aList, bList, hasRealB };
@@ -1423,12 +1427,24 @@ function normalizePriorityFormDigits(s) {
 
 function validateGsPlusPremiumAccounts(aList, bList, hasRealB, prioritySale, priorityPhone) {
     if (typeof prioritySale !== 'string' || !isGsPlusPremiumPriorityCategory(prioritySale)) return null;
-    void aList;
-    void bList;
-    void hasRealB;
-    const d = normalizePriorityFormDigits(priorityPhone);
-    if (d.length < 10) {
-        return 'GS PLUS Premium önceliği: başlatma formunda geçerli cep telefonu gerekir (en az 10 hane).';
+    const globalPhone = normalizePriorityFormDigits(priorityPhone);
+    // Her A hesabı için: önce hesapta kayıtlı phone, yoksa form değeri
+    for (const acc of aList) {
+        const accPhone = normalizePriorityFormDigits(acc.phone);
+        const effective = accPhone.length >= 10 ? accPhone : globalPhone;
+        if (effective.length < 10) {
+            return `GS PLUS Premium önceliği: "${acc.email || 'A hesabı'}" için üyelikte cep telefonu kayıtlı değil ve başlatma formunda ortak telefon girilmemiş.`;
+        }
+    }
+    if (hasRealB) {
+        for (const acc of bList) {
+            if (!(String(acc.email || '').trim() && String(acc.password || '').trim())) continue;
+            const accPhone = normalizePriorityFormDigits(acc.phone);
+            const effective = accPhone.length >= 10 ? accPhone : globalPhone;
+            if (effective.length < 10) {
+                return `GS PLUS Premium önceliği: "${acc.email || 'B hesabı'}" için üyelikte cep telefonu kayıtlı değil ve başlatma formunda ortak telefon girilmemiş.`;
+            }
+        }
     }
     return null;
 }
@@ -1506,6 +1522,21 @@ async function startBotAsync(req, res) {
     if (gsParaPreflightErr) {
         return res.status(400).json({ error: gsParaPreflightErr });
     }
+
+    // Proxy havuzu ön kontrolü: manuel proxy girilmemişse havuz boşsa 400 dön (step 2'ye geçmeden önce)
+    const _preManualProxy = !!(String(validatedData.proxyHost || '').trim() && String(validatedData.proxyPort || '').trim());
+    const _preUsePool = validatedData.useProxyPool !== false;
+    if (_preUsePool && !_preManualProxy) {
+        try {
+            const _proxyCount = await proxyRepo.countAssignableProxies();
+            if (_proxyCount === 0) {
+                return res.status(400).json({ error: 'Proxy havuzu boş. Lütfen Proxy Yönetimi\'nden en az bir aktif proxy ekleyin.' });
+            }
+        } catch (_proxyCheckErr) {
+            logger.warnSafe('proxy_preflight_count_failed', { error: _proxyCheckErr?.message || String(_proxyCheckErr) });
+        }
+    }
+
     accountListsWarmCache.set(validatedData, {
         aList: builtLists.aList,
         bList: builtLists.bList,
@@ -1602,7 +1633,7 @@ async function startBotAsync(req, res) {
         json: (payload) => {
             if (resLikeStatusCode >= 400) {
                 runStore.upsert(runId, {
-                    status: resLikeStatusCode >= 500 ? 'error' : 'completed',
+                    status: 'error',
                     result: payload || null,
                     error: payload?.error || null
                 });
@@ -8083,7 +8114,7 @@ async function startBotAfterValidation(req, res, validatedData) {
             identity: aIdentity,
             sicilNo: aSicilNo,
             priorityTicketCode: aPriorityTicketCode,
-            priorityPhone,
+            priorityPhone: runtime?.idProfileA?.phone ?? priorityPhone,
             priorityTckn
         });
         await ensureUrlContains(pageA, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
@@ -8969,6 +9000,8 @@ async function startBotAfterValidation(req, res, validatedData) {
 
     const ensureFinalizeWatcher = () => {
         if (finalizeWatch) return;
+        let finalizeFailedAt = null;
+        const FINALIZE_RETRY_COOLDOWN_MS = 15000;
         finalizeWatch = setInterval(() => {
             try {
                 const stKill = runStore.get(runId);
@@ -8979,6 +9012,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                 }
                 if (finalizedToCResult) return;
                 if (finalizeInFlight) return;
+                // Hata sonrası cooldown: aynı hata tekrar tekrar denenmesini önle.
+                if (finalizeFailedAt && (Date.now() - finalizeFailedAt) < FINALIZE_RETRY_COOLDOWN_MS) return;
                 const fin = getFinalizeRequest();
                 if (!fin?.requested) return;
                 if (!fin?.cAccount?.email || !fin?.cAccount?.password) return;
@@ -8988,7 +9023,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                     try {
                         return await finalizeToC();
                     } catch (e) {
-                        try { audit('finalize_failed', { error: e?.message || String(e), seatId: currentSeatInfo?.seatId || null }, 'warn'); } catch {}
+                        finalizeFailedAt = Date.now();
+                        try { audit('finalize_failed', { error: e?.message || String(e), seatId: currentSeatInfo?.seatId || null, cooldownMs: FINALIZE_RETRY_COOLDOWN_MS }, 'warn'); } catch {}
                         try {
                             const failPairIndex = Math.max(1, Math.floor(Number(dashboardMeta.activePairIndex || fin?.cTransferPairIndex || 1)));
                             await persistFailureForPair(failPairIndex, {
@@ -9488,7 +9524,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.clickBuy.done`);
                 audit('account_click_buy_done', { role: 'B', idx: i, email: acc.email, url: (() => { try { return page.url(); } catch { return null; } })() });
 
-                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
+                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode, priorityPhone: acc?.phone ?? priorityPhone, priorityTckn });
 
                 setStep(`${label}.postBuy.ensureUrl.start`);
                 await ensureUrlContains(page, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
@@ -9500,7 +9536,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.postBuy.reloginCheck.done`, { snap: await snapshotPage(page, `${label}.afterReloginCheck`) });
 
                 // Priority sale modal can appear after redirect/login on /koltuk-secim as well.
-                const ps2 = await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
+                const ps2 = await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode, priorityPhone: acc?.phone ?? priorityPhone, priorityTckn });
                 if (ps2) {
                     try { await ensureUrlContains(page, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 }); } catch {}
                 }
@@ -9648,7 +9684,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.clickBuy.done`);
                 audit('account_click_buy_done', { role: 'A', idx: i, email: acc.email, url: (() => { try { return page.url(); } catch { return null; } })() });
 
-                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
+                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode, priorityPhone: acc?.phone ?? priorityPhone, priorityTckn });
 
                 setStep(`${label}.postBuy.ensureUrl.start`);
                 await ensureUrlContains(page, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
@@ -9660,7 +9696,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 setStep(`${label}.postBuy.reloginCheck.done`, { snap: await snapshotPage(page, `${label}.afterReloginCheck`) });
 
                 // Priority sale modal can appear after redirect/login on /koltuk-secim as well.
-                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
+                await handlePrioritySaleModal(page, { prioritySale, fanCardCode: acc?.fanCardCode ?? fanCardCode, identity: acc?.identity ?? identity, sicilNo: acc?.sicilNo ?? sicilNo, priorityTicketCode: acc?.priorityTicketCode ?? priorityTicketCode, priorityPhone: acc?.phone ?? priorityPhone, priorityTckn });
 
                 // Guard: session drift may leave us on / or /giris; ensure we are back on seat selection.
                 try {
@@ -9818,8 +9854,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                             if (cbRes2 && cbRes2.svgBlockId) {
                                 try { catBlock = { ...(catBlock || {}), svgBlockId: cbRes2.svgBlockId }; } catch {}
                             }
-                            if (ticketCount > 1) {
-                                const qtyRes2 = await applyTicketQuantityDropdown(page, `${label}:postCategoryRetry`, ticketCount);
+                            const catMinTickets2 = (cbRes2?.chosenCategory?.ticketCount && cbRes2.chosenCategory.ticketCount > 1) ? cbRes2.chosenCategory.ticketCount : 1;
+                            const effectiveTicketCount2 = Math.max(ticketCount, catMinTickets2);
+                            if (effectiveTicketCount2 > 1) {
+                                const qtyRes2 = await applyTicketQuantityDropdown(page, `${label}:postCategoryRetry`, effectiveTicketCount2);
                                 ticketQuantityPrimed = qtyRes2?.ok === true;
                             }
                             // Reselect can take time (loader). Reset the seat-pick deadline so we don't fail early.
@@ -10020,18 +10058,20 @@ async function startBotAfterValidation(req, res, validatedData) {
                         : [];
                     if (!pend.length) return;
                     const head = String(pend.shift() || '').trim();
+                    if (!head || !teamId) return;
+                    const docs = await credentialRepo.getCredentialsByIds(teamId, [head]);
+                    if (!docs.length) {
+                        logger.warnSafe('hot_account_credential_missing', { runId, credentialId: head });
+                        // ID'yi geri kuyruğa ekleme — silinmiş/pasif credential, kayıt kaybı yok
+                        return;
+                    }
+                    // Doğrulama geçti; şimdi store'dan kaldır
                     runStore.upsert(runId, {
                         pendingHotAccounts: {
                             ...(cur.pendingHotAccounts || {}),
                             aCredentialIds: pend
                         }
                     });
-                    if (!head || !teamId) return;
-                    const docs = await credentialRepo.getCredentialsByIds(teamId, [head]);
-                    if (!docs.length) {
-                        logger.warnSafe('hot_account_credential_missing', { runId, credentialId: head });
-                        return;
-                    }
                     const item = docs[0];
                     const payerSet = new Set(
                         Array.isArray(cur.pendingHotAccounts?.payerACredentialIds)
@@ -10175,6 +10215,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                     logger.info('A-only mod: Kart bilgisi yok, sepette tutuluyor');
                     audit('a_only_holding', { email: emailA, seatId: seatInfoA?.seatId });
                 }
+
+                // A-only koşu tamamlanıyor: sıcak hesap zamanlayıcısını durdur
+                try { if (hotAccountIngestTimer) clearInterval(hotAccountIngestTimer); } catch {}
+                hotAccountIngestTimer = null;
 
                 const finalStatus = basketTimer.getStatus();
                 try { runStore.upsert(runId, { status: 'completed', result: { success: true, mode: 'a_only', aEmail: emailA, seatInfo: seatInfoA, basketStatus: finalStatus, payment: hasCardInfo ? 'ready' : 'no_card' } }); } catch {}
@@ -10435,6 +10479,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                     }
                 };
 
+                // A oturumu hold sırasında bitmiş olabilir; sepete gitmeden önce yeniden giriş kontrolü yap.
+                try { await reloginIfRedirected(aCtx.page, aCtx.email, aCtx.password); } catch {}
                 try {
                     await gotoWithRetry(aCtx.page, 'https://www.passo.com.tr/tr/sepet', {
                         retries: 1,
@@ -10456,6 +10502,16 @@ async function startBotAfterValidation(req, res, validatedData) {
                     removed = removeDiag?.ok === true;
                     if (removed) break;
                     try { await delay(1500); } catch {}
+                }
+
+                // Sepet zaten boşsa (oturum bitmişse veya süre dolmuşsa) yanlış success — uyar.
+                if (removed && removeDiag?.initialCount === 0 && removeDiag?.removedClicks === 0) {
+                    audit('a_remove_basket_was_already_empty', {
+                        idx: i,
+                        aEmail: aCtx.email,
+                        seatId: aCtx.seatInfo.seatId,
+                        note: 'Sepet boş geldi — oturum süresi bitmiş veya bilet daha önce düşmüş olabilir'
+                    }, 'warn');
                 }
 
                 if (!removed) {
@@ -10802,7 +10858,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         setStep('A.clickBuy.done');
         audit('account_click_buy_done', { role: 'A', idx: 0, email: emailA, url: (() => { try { return pageA.url(); } catch { return null; } })() });
 
-        await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity, sicilNo: a0?.sicilNo ?? sicilNo, priorityTicketCode: a0?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
+        await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity, sicilNo: a0?.sicilNo ?? sicilNo, priorityTicketCode: a0?.priorityTicketCode ?? priorityTicketCode, priorityPhone: a0?.phone ?? priorityPhone, priorityTckn });
         logger.info('A hesabı SATIN AL butonuna tıkladı');
 
         setStep('A.waitNavAfterBuy.start');
@@ -10828,7 +10884,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         const aRelog = await reloginIfRedirected(pageA, emailA, passwordA);
         setStep('A.postBuy.reloginCheck.done', { relogged: aRelog, snap: await snapshotPage(pageA, 'A.afterReloginCheck') });
 
-        const psA2 = await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity, sicilNo: a0?.sicilNo ?? sicilNo, priorityTicketCode: a0?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
+        const psA2 = await handlePrioritySaleModal(pageA, { prioritySale, fanCardCode: a0?.fanCardCode ?? fanCardCode, identity: a0?.identity ?? identity, sicilNo: a0?.sicilNo ?? sicilNo, priorityTicketCode: a0?.priorityTicketCode ?? priorityTicketCode, priorityPhone: a0?.phone ?? priorityPhone, priorityTckn });
         if (psA2) {
             try { await ensureUrlContains(pageA, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 }); } catch {}
         }
@@ -11170,8 +11226,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                     if (cbResA2 && cbResA2.svgBlockId) {
                         try { catBlockA = { ...(catBlockA || {}), svgBlockId: cbResA2.svgBlockId }; } catch {}
                     }
-                    if (ticketCount > 1) {
-                        const qtyResA2 = await applyTicketQuantityDropdown(pageA, 'A:postCategoryRetry', ticketCount);
+                    const catMinTicketsA2 = (cbResA2?.chosenCategory?.ticketCount && cbResA2.chosenCategory.ticketCount > 1) ? cbResA2.chosenCategory.ticketCount : 1;
+                    const effectiveTicketCountA2 = Math.max(ticketCount, catMinTicketsA2);
+                    if (effectiveTicketCountA2 > 1) {
+                        const qtyResA2 = await applyTicketQuantityDropdown(pageA, 'A:postCategoryRetry', effectiveTicketCountA2);
                         ticketQuantityPrimedA = qtyResA2?.ok === true;
                     }
                     setStep('A.categoryBlock.reselect.done', { cycle, snap: await snapshotPage(pageA, `A.afterReselect_${cycle}`) });
@@ -11439,7 +11497,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         setStep('B.clickBuy.done');
         logger.info('B hesabı SATIN AL butonuna tıkladı');
 
-        await handlePrioritySaleModal(pageB, { prioritySale, fanCardCode: b0?.fanCardCode ?? fanCardCode, identity: b0?.identity ?? identity, sicilNo: b0?.sicilNo ?? sicilNo, priorityTicketCode: b0?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
+        await handlePrioritySaleModal(pageB, { prioritySale, fanCardCode: b0?.fanCardCode ?? fanCardCode, identity: b0?.identity ?? identity, sicilNo: b0?.sicilNo ?? sicilNo, priorityTicketCode: b0?.priorityTicketCode ?? priorityTicketCode, priorityPhone: b0?.phone ?? priorityPhone, priorityTckn });
 
         setStep('B.waitNavAfterBuy.start');
         const bPreUrl = (() => { try { return pageB.url(); } catch { return null; } })();
@@ -11463,7 +11521,7 @@ async function startBotAfterValidation(req, res, validatedData) {
         const bRelog = await reloginIfRedirected(pageB, emailB, passwordB);
         setStep('B.postBuy.reloginCheck.done', { relogged: bRelog, snap: await snapshotPage(pageB, 'B.afterReloginCheck') });
 
-        const psB2 = await handlePrioritySaleModal(pageB, { prioritySale, fanCardCode: b0?.fanCardCode ?? fanCardCode, identity: b0?.identity ?? identity, sicilNo: b0?.sicilNo ?? sicilNo, priorityTicketCode: b0?.priorityTicketCode ?? priorityTicketCode, priorityPhone, priorityTckn });
+        const psB2 = await handlePrioritySaleModal(pageB, { prioritySale, fanCardCode: b0?.fanCardCode ?? fanCardCode, identity: b0?.identity ?? identity, sicilNo: b0?.sicilNo ?? sicilNo, priorityTicketCode: b0?.priorityTicketCode ?? priorityTicketCode, priorityPhone: b0?.phone ?? priorityPhone, priorityTckn });
         if (psB2) {
             try { await ensureUrlContains(pageB, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 }); } catch {}
         }
@@ -12067,7 +12125,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                                 const toFan = (toRole === 'A') ? (idProfileA?.fanCardCode ?? fanCardCode) : (idProfileB?.fanCardCode ?? fanCardCode);
                                 const toSicil = (toRole === 'A') ? (idProfileA?.sicilNo ?? sicilNo) : (idProfileB?.sicilNo ?? sicilNo);
                                 const toPriorityTicket = (toRole === 'A') ? (idProfileA?.priorityTicketCode ?? priorityTicketCode) : (idProfileB?.priorityTicketCode ?? priorityTicketCode);
-                                await handlePrioritySaleModal(toPage, { prioritySale, fanCardCode: toFan, identity: toIdentity, sicilNo: toSicil, priorityTicketCode: toPriorityTicket, priorityPhone, priorityTckn });
+                                const toPhone = (toRole === 'A') ? (idProfileA?.phone ?? priorityPhone) : (idProfileB?.phone ?? priorityPhone);
+                                await handlePrioritySaleModal(toPage, { prioritySale, fanCardCode: toFan, identity: toIdentity, sicilNo: toSicil, priorityTicketCode: toPriorityTicket, priorityPhone: toPhone, priorityTckn });
 
                                 await ensureUrlContains(toPage, '/koltuk-secim', { retries: 2, waitMs: 9000, backoffMs: 450 });
                                 const u = (() => { try { return String(toPage.url()); } catch { return ''; } })();

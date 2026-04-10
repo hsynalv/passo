@@ -18,6 +18,7 @@ function mapCredential(doc) {
     teamId: String(doc.teamId),
     email: String(doc.email || ''),
     identity: doc.identity ? String(doc.identity) : '',
+    phone: doc.phone ? String(doc.phone) : '',
     fanCardCode: doc.fanCardCode ? String(doc.fanCardCode) : '',
     sicilNo: doc.sicilNo ? String(doc.sicilNo) : '',
     priorityTicketCode: doc.priorityTicketCode ? String(doc.priorityTicketCode) : '',
@@ -64,6 +65,7 @@ async function createCredential(teamId, payload) {
     email: String(payload.email || '').trim().toLowerCase(),
     encryptedPassword: String(payload.encryptedPassword || ''),
     identity: payload.identity ? String(payload.identity).trim() : '',
+    phone: payload.phone ? String(payload.phone).replace(/\D/g, '').slice(0, 15) : '',
     fanCardCode: payload.fanCardCode ? String(payload.fanCardCode).trim() : '',
     sicilNo: payload.sicilNo ? String(payload.sicilNo).trim() : '',
     priorityTicketCode: payload.priorityTicketCode ? String(payload.priorityTicketCode).trim() : '',
@@ -88,6 +90,9 @@ async function updateCredential(teamId, credentialId, payload) {
   const next = {
     email: payload.email !== undefined ? String(payload.email || '').trim().toLowerCase() : String(existing.email || ''),
     identity: payload.identity !== undefined ? String(payload.identity || '').trim() : String(existing.identity || ''),
+    phone: payload.phone !== undefined
+      ? String(payload.phone || '').replace(/\D/g, '').slice(0, 15)
+      : (existing.phone ? String(existing.phone) : ''),
     fanCardCode: payload.fanCardCode !== undefined ? String(payload.fanCardCode || '').trim() : String(existing.fanCardCode || ''),
     sicilNo: payload.sicilNo !== undefined ? String(payload.sicilNo || '').trim() : String(existing.sicilNo || ''),
     priorityTicketCode: payload.priorityTicketCode !== undefined ? String(payload.priorityTicketCode || '').trim() : String(existing.priorityTicketCode || ''),

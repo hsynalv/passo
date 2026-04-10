@@ -28,6 +28,7 @@ function toPublicCredential(doc) {
     teamId: doc.teamId,
     email: doc.email,
     identity: doc.identity || '',
+    phone: doc.phone || '',
     fanCardCode: doc.fanCardCode || '',
     sicilNo: doc.sicilNo || '',
     priorityTicketCode: doc.priorityTicketCode || '',

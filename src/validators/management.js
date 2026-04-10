@@ -116,10 +116,20 @@ const credentialNotesSchema = z
     return s.length > 4000 ? s.slice(0, 4000) : s;
   });
 
+const credentialPhoneSchema = z
+  .union([z.string(), z.null()])
+  .optional()
+  .transform((val) => {
+    if (val === undefined || val === null) return undefined;
+    const digits = String(val).replace(/\D/g, '').slice(0, 15);
+    return digits || undefined;
+  });
+
 const credentialBaseSchema = z.object({
   email: z.string().email('Gecerli bir email giriniz'),
   password: z.string().optional(),
   identity: z.string().optional().nullable(),
+  phone: credentialPhoneSchema,
   fanCardCode: z.string().optional().nullable(),
   sicilNo: z.string().optional().nullable(),
   priorityTicketCode: z.string().optional().nullable(),
