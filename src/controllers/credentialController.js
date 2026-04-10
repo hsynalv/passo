@@ -33,6 +33,7 @@ function toPublicCredential(doc) {
     priorityTicketCode: doc.priorityTicketCode || '',
     isActive: doc.isActive !== false,
     categoryIds: Array.isArray(doc.categoryIds) ? doc.categoryIds.map(String) : [],
+    notes: doc.notes != null ? String(doc.notes) : '',
     hasPassword: !!doc.encryptedPassword,
     maskedPassword: doc.encryptedPassword ? '***' : '',
     createdAt: doc.createdAt || null,

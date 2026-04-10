@@ -24,6 +24,7 @@ function mapCredential(doc) {
     encryptedPassword: String(doc.encryptedPassword || ''),
     isActive: doc.isActive !== false,
     categoryIds: Array.isArray(doc.categoryIds) ? doc.categoryIds.map(String) : [],
+    notes: doc.notes != null ? String(doc.notes) : '',
     createdAt: doc.createdAt || null,
     updatedAt: doc.updatedAt || null,
   };
@@ -68,6 +69,9 @@ async function createCredential(teamId, payload) {
     priorityTicketCode: payload.priorityTicketCode ? String(payload.priorityTicketCode).trim() : '',
     isActive: payload.isActive !== false,
     categoryIds: Array.isArray(payload.categoryIds) ? payload.categoryIds.map(String) : [],
+    notes: payload.notes !== undefined && payload.notes !== null
+      ? String(payload.notes).slice(0, 4000)
+      : '',
     createdAt: now,
     updatedAt: now,
   };
@@ -91,6 +95,9 @@ async function updateCredential(teamId, credentialId, payload) {
     categoryIds: payload.categoryIds !== undefined
       ? (Array.isArray(payload.categoryIds) ? payload.categoryIds.map(String) : [])
       : (Array.isArray(existing.categoryIds) ? existing.categoryIds.map(String) : []),
+    notes: payload.notes !== undefined
+      ? String(payload.notes || '').slice(0, 4000)
+      : (existing.notes != null ? String(existing.notes) : ''),
     updatedAt: new Date().toISOString(),
   };
   if (payload.encryptedPassword !== undefined) {

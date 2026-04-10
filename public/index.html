@@ -488,9 +488,9 @@
     </div>
   </div>
 
-  <div id="catalogModal" class="modalRoot" hidden>
+  <div id="catalogModal" class="modalRoot modalRootCatalog" hidden>
     <div class="modalBackdrop" id="catalogModalBackdrop"></div>
-    <div class="modalDialog modalDialogWide" role="dialog" aria-modal="true" aria-labelledby="catalogModalTitle">
+    <div class="modalDialog modalDialogCatalogFull" role="dialog" aria-modal="true" aria-labelledby="catalogModalTitle">
       <div class="modalHead">
         <h2 id="catalogModalTitle">Takım, Kategori ve Üyelik Yönetimi</h2>
         <button type="button" class="modalClose" id="btnCloseCatalogModal" aria-label="Kapat">×</button>
@@ -604,9 +604,14 @@
                   <input id="credentialPriorityTicketCodeInput" type="text" placeholder="" />
                 </div>
                 <div class="row">
+                  <label>Not</label>
+                  <div class="hint" style="margin-top:0">Hesaba özel hatırlatma; yalnızca panelde görünür (şifrelenmez, takım üyelik kaydında saklanır).</div>
+                  <textarea id="credentialNotesInput" rows="3" maxlength="4000" placeholder="Örn. hangi maç / koltuk tercihi / iletişim…"></textarea>
+                </div>
+                <div class="row">
                   <label>Atanmış Kategoriler</label>
                   <div class="hint">Boş bırakılırsa tüm kategorilerden alır. Seçilirse sadece o kategorilerden alır.</div>
-                  <div id="credentialCategoryPicker" class="checkList" style="max-height:120px;overflow-y:auto"></div>
+                  <div id="credentialCategoryPicker" class="checkList checkListCatalogCredentialCats"></div>
                 </div>
                 </div>
                 <div class="actions">

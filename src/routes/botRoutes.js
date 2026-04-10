@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { startBot, startBotAsync, registerCAccount, requestFinalize, getRunStatus, killSessions } = require('../controllers/botController');
+const { startBot, startBotAsync, registerCAccount, enqueueHotAccountsForRun, requestFinalize, getRunStatus, killSessions } = require('../controllers/botController');
 const { createTeam, deleteTeam, listTeams, updateTeam } = require('../controllers/teamController');
 const { createCategory, deleteCategory, listCategories, updateCategory } = require('../controllers/categoryController');
 const { createCredential, deleteCredential, listCredentials, updateCredential } = require('../controllers/credentialController');
@@ -92,6 +92,7 @@ router.get('/logs/stream', (req, res) => {
 
 router.get('/run/:runId/status', getRunStatus);
 router.post('/run/:runId/c/register', registerCAccount);
+router.post('/run/:runId/accounts/add', botRateLimiter, enqueueHotAccountsForRun);
 router.post('/run/:runId/finalize', requestFinalize);
 
 module.exports = router;

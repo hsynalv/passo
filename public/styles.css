@@ -23,6 +23,95 @@ html,body{margin:0;padding:0;height:100%;overflow:auto;font-family:ui-sans-serif
 .modalBody{padding:10px 14px 14px;overflow:auto;flex:1;min-height:0}
 .modalFoot{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 14px;border-top:1px solid rgba(27,42,75,0.85)}
 .modalFootSpacer{flex:1}
+
+/* Takım havuzu modalı — tam ekran, içerik alanı genişler */
+.modalRootCatalog{
+  display:block;
+  padding:0;
+  overflow:hidden;
+}
+.modalDialogCatalogFull{
+  position:relative;
+  z-index:1;
+  width:100%;
+  max-width:none;
+  min-height:100vh;
+  min-height:100dvh;
+  max-height:none;
+  margin:0;
+  border-radius:0;
+  border-left:none;
+  border-right:none;
+  box-shadow:none;
+}
+.modalRootCatalog .modalHead{
+  padding:14px 22px;
+  flex-shrink:0;
+}
+.modalRootCatalog .modalHead h2{
+  font-size:16px;
+}
+.modalRootCatalog .modalIntro{
+  padding:12px 22px;
+  font-size:12px;
+  line-height:1.5;
+  flex-shrink:0;
+}
+.modalRootCatalog .modalBody{
+  flex:1;
+  min-height:0;
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+  padding:16px 22px 22px;
+}
+.modalRootCatalog .modalFoot{
+  padding:12px 22px;
+  flex-shrink:0;
+}
+.modalRootCatalog .managerWorkspace{
+  flex:1;
+  min-height:0;
+  grid-template-columns:minmax(280px,22vw) minmax(0,1fr);
+  gap:20px 28px;
+  align-items:stretch;
+}
+.modalRootCatalog .managerSidebar{
+  min-height:0;
+  overflow-y:auto;
+  overflow-x:hidden;
+  padding-right:6px;
+}
+.modalRootCatalog .managerContent{
+  min-height:0;
+  overflow-y:auto;
+  overflow-x:hidden;
+  gap:16px;
+}
+.modalRootCatalog .itemList{
+  max-height:min(48vh,560px);
+}
+.modalRootCatalog .teamList{
+  max-height:min(42vh,520px);
+}
+.modalRootCatalog .managerSection{
+  padding:14px 16px;
+}
+.modalRootCatalog .managerSection h3{
+  font-size:13px;
+  margin-bottom:10px;
+}
+.modalRootCatalog .managerGridContent{
+  gap:20px;
+}
+.checkListCatalogCredentialCats{
+  max-height:min(28vh,240px);
+}
+@media (max-width:960px){
+  .modalRootCatalog .managerWorkspace{
+    grid-template-columns:1fr;
+  }
+}
 .settingsSection{margin-bottom:14px}
 .settingsSection h3{margin:0 0 8px 0;font-size:11px;color:var(--accent);text-transform:uppercase;letter-spacing:0.04em}
 .settingsGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
@@ -221,6 +310,9 @@ select[multiple]{min-height:140px;line-height:1.35;padding:8px}
 .credentialPickMeta{display:flex;flex-direction:column;gap:3px;min-width:0}
 .credentialPickMeta strong{font-size:12px;color:#dbeafe;word-break:break-all}
 .credentialPickMeta span{font-size:10px;color:var(--muted);line-height:1.45}
+.credentialNotePreview{display:block;margin-top:4px;font-size:10px;color:rgba(251,191,36,0.88);font-style:italic;word-break:break-word;line-height:1.35}
+.itemCardMeta .credentialNotePreview{display:inline;margin-top:0}
+#credentialNotesInput{width:100%;max-width:100%;box-sizing:border-box;resize:vertical;min-height:68px;font-family:inherit;font-size:12px;line-height:1.4}
 .credentialRoleBadgeRow{display:flex;flex-wrap:wrap;gap:6px;margin-top:2px}
 .credentialRoleBadge{display:inline-flex;align-items:center;justify-content:center;padding:2px 8px;border-radius:999px;border:1px solid rgba(138,160,194,0.24);font-size:9px;font-weight:700;letter-spacing:.02em}
 .credentialRoleBadge.roleA{color:#cfe3ff;background:rgba(96,165,250,0.1);border-color:rgba(96,165,250,0.28)}

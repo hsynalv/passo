@@ -106,6 +106,16 @@ const categoryUpdatePayloadSchema = categoryBaseSchema.transform((data) => {
   return out;
 });
 
+const credentialNotesSchema = z
+  .union([z.string(), z.null()])
+  .optional()
+  .transform((val) => {
+    if (val === undefined) return undefined;
+    if (val === null) return '';
+    const s = String(val);
+    return s.length > 4000 ? s.slice(0, 4000) : s;
+  });
+
 const credentialBaseSchema = z.object({
   email: z.string().email('Gecerli bir email giriniz'),
   password: z.string().optional(),
@@ -113,6 +123,7 @@ const credentialBaseSchema = z.object({
   fanCardCode: z.string().optional().nullable(),
   sicilNo: z.string().optional().nullable(),
   priorityTicketCode: z.string().optional().nullable(),
+  notes: credentialNotesSchema,
   isActive: z.boolean().optional().default(true),
   categoryIds: z.array(z.string().min(1)).optional().default([]),
 });

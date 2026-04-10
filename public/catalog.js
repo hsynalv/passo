@@ -233,9 +233,11 @@
 
       const meta = document.createElement('div');
       meta.className = 'credentialPickMeta';
+      const notePrev = formatNotePreview(item.notes);
       meta.innerHTML = `<strong>${escapeHtml(item.email || `${roleLabel === 'A' ? 'Ana hesap' : 'Tutucu hesap'} üyeliği`)}</strong>
         ${badges.length ? `<div class="credentialRoleBadgeRow">${badges.join('')}</div>` : ''}
-        <span>TCKN: ${escapeHtml(item.identity || '—')} • Fan Card: ${escapeHtml(item.fanCardCode || '—')} • Sicil: ${escapeHtml(item.sicilNo || '—')} • Önc. kod: ${escapeHtml(item.priorityTicketCode || '—')}</span>`;
+        <span>TCKN: ${escapeHtml(item.identity || '—')} • Fan Card: ${escapeHtml(item.fanCardCode || '—')} • Sicil: ${escapeHtml(item.sicilNo || '—')} • Önc. kod: ${escapeHtml(item.priorityTicketCode || '—')}</span>
+        ${notePrev ? `<span class="credentialNotePreview">Not: ${escapeHtml(notePrev)}</span>` : ''}`;
 
       const controls = document.createElement('div');
       controls.className = 'credentialPickControls';
@@ -360,6 +362,7 @@
     $('credentialFanCardInput').value = '';
     if ($('credentialSicilNoInput')) $('credentialSicilNoInput').value = '';
     if ($('credentialPriorityTicketCodeInput')) $('credentialPriorityTicketCodeInput').value = '';
+    if ($('credentialNotesInput')) $('credentialNotesInput').value = '';
     renderCredentialCategoryPicker([]);
   }
 
@@ -453,8 +456,12 @@
         return cat ? (cat.label || cat.categoryTypeValue || cid) : cid;
       });
       const catLabel = catNames.length ? catNames.map(escapeHtml).join(', ') : 'Tüm kategoriler';
+      const notePrev = formatNotePreview(item.notes);
+      const noteBlock = notePrev
+        ? `<br><span class="credentialNotePreview">Not: ${escapeHtml(notePrev)}</span>`
+        : '';
       meta.innerHTML = `<strong>${escapeHtml(item.email || '')}</strong>
-        <div class="itemCardMeta">TCKN: ${escapeHtml(item.identity || '—')} · Fan Card: ${escapeHtml(item.fanCardCode || '—')} · Sicil: ${escapeHtml(item.sicilNo || '—')} · Önc. kod: ${escapeHtml(item.priorityTicketCode || '—')}<br>Kategoriler: ${catLabel}</div>`;
+        <div class="itemCardMeta">TCKN: ${escapeHtml(item.identity || '—')} · Fan Card: ${escapeHtml(item.fanCardCode || '—')} · Sicil: ${escapeHtml(item.sicilNo || '—')} · Önc. kod: ${escapeHtml(item.priorityTicketCode || '—')}<br>Kategoriler: ${catLabel}${noteBlock}</div>`;
       const actions = document.createElement('div');
       actions.className = 'itemCardActions';
       actions.innerHTML = `<button type="button" data-action="edit" data-credential-id="${escapeHtml(item.id)}" class="btnMuted">Düzenle</button>
@@ -583,6 +590,14 @@
       .replace(/"/g, '&quot;');
   }
 
+  /** Tek satır önizleme (liste / seçici) */
+  function formatNotePreview(notes) {
+    const s = String(notes || '').trim();
+    if (!s) return '';
+    const oneLine = s.replace(/\s+/g, ' ').trim();
+    return oneLine.length > 120 ? `${oneLine.slice(0, 120)}…` : oneLine;
+  }
+
   async function handleCreateTeam() {
     const name = String($('teamNameInput').value || '').trim();
     if (!name) {
@@ -702,6 +717,7 @@
       fanCardCode: String($('credentialFanCardInput').value || '').trim(),
       sicilNo: String($('credentialSicilNoInput')?.value || '').trim(),
       priorityTicketCode: String($('credentialPriorityTicketCodeInput')?.value || '').trim(),
+      notes: String($('credentialNotesInput')?.value || '').slice(0, 4000),
       isActive: true,
       categoryIds: getCredentialCategoryIdsFromPicker(),
     };
@@ -754,6 +770,7 @@
     $('credentialFanCardInput').value = item.fanCardCode || '';
     if ($('credentialSicilNoInput')) $('credentialSicilNoInput').value = item.sicilNo || '';
     if ($('credentialPriorityTicketCodeInput')) $('credentialPriorityTicketCodeInput').value = item.priorityTicketCode || '';
+    if ($('credentialNotesInput')) $('credentialNotesInput').value = item.notes || '';
     renderCredentialCategoryPicker(item.categoryIds || []);
     renderManageCredentialList();
   }

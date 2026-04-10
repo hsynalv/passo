@@ -1668,6 +1668,61 @@ async function registerCAccount(req, res) {
     return res.json({ success: true, runId });
 }
 
+/**
+ * Çoklu koşu çalışırken ek A hesapları (credential id) kuyruğa alınır; bot aynı multi akışta işler.
+ * Body: { teamId, aCredentialIds: string[], payerACredentialIds?: string[], transferACredentialIds?: string[] }
+ */
+async function enqueueHotAccountsForRun(req, res) {
+    const runId = runStore.safeRunId(req?.params?.runId);
+    if (!runId) return res.status(400).json({ error: 'Invalid runId' });
+    const cur = runStore.get(runId);
+    if (!cur) return res.status(404).json({ error: 'runId not found' });
+    if (cur.status !== 'running') {
+        return res.status(409).json({ error: 'Run is not active', status: cur.status });
+    }
+    if (cur.runMode !== 'multi' && cur.pairDashboard?.mode !== 'multi') {
+        return res.status(400).json({ error: 'Hot account enqueue is only supported for multi runs' });
+    }
+    const teamIdBody = String(req?.body?.teamId || '').trim();
+    if (!teamIdBody || teamIdBody !== String(cur.teamId || '').trim()) {
+        return res.status(403).json({ error: 'teamId mismatch' });
+    }
+    const rawIds = req?.body?.aCredentialIds ?? req?.body?.credentialIds;
+    const ids = Array.isArray(rawIds) ? rawIds.map((x) => String(x || '').trim()).filter(Boolean) : [];
+    if (!ids.length) return res.status(400).json({ error: 'aCredentialIds required' });
+    const prev = cur.pendingHotAccounts || {};
+    const existingA = Array.isArray(prev.aCredentialIds) ? prev.aCredentialIds.slice() : [];
+    const newPayer = Array.isArray(req?.body?.payerACredentialIds)
+        ? req.body.payerACredentialIds.map((x) => String(x || '').trim()).filter(Boolean)
+        : [];
+    const newTransfer = Array.isArray(req?.body?.transferACredentialIds)
+        ? req.body.transferACredentialIds.map((x) => String(x || '').trim()).filter(Boolean)
+        : [];
+    const payerACredentialIds = [
+        ...(Array.isArray(prev.payerACredentialIds) ? prev.payerACredentialIds.map((x) => String(x || '').trim()).filter(Boolean) : []),
+        ...newPayer
+    ];
+    const transferACredentialIds = [
+        ...(Array.isArray(prev.transferACredentialIds) ? prev.transferACredentialIds.map((x) => String(x || '').trim()).filter(Boolean) : []),
+        ...newTransfer
+    ];
+    const nextA = existingA.concat(ids);
+    runStore.upsert(runId, {
+        pendingHotAccounts: {
+            ...prev,
+            aCredentialIds: nextA,
+            payerACredentialIds,
+            transferACredentialIds
+        }
+    });
+    return res.json({
+        success: true,
+        runId,
+        queued: ids.length,
+        pendingCount: nextA.length
+    });
+}
+
 async function requestFinalize(req, res) {
     const runId = runStore.safeRunId(req?.params?.runId);
     if (!runId) return res.status(400).json({ error: 'Invalid runId' });
@@ -1788,6 +1843,7 @@ module.exports = {
     startBot,
     startBotAsync,
     registerCAccount,
+    enqueueHotAccountsForRun,
     requestFinalize,
     getRunStatus,
     killSessions,
@@ -7190,6 +7246,28 @@ async function startBotAfterValidation(req, res, validatedData) {
         }
     };
 
+    try {
+        const prevRun = runStore.get(runId) || {};
+        runStore.upsert(runId, {
+            ...prevRun,
+            status: prevRun.status === 'completed' || prevRun.status === 'error' ? prevRun.status : 'running',
+            teamId: teamId || prevRun.teamId || null,
+            eventAddress: String(eventAddress || '').slice(0, 800) || prevRun.eventAddress || null,
+            runMode: isMulti ? 'multi' : 'single',
+            pendingHotAccounts: {
+                aCredentialIds: Array.isArray(prevRun.pendingHotAccounts?.aCredentialIds)
+                    ? prevRun.pendingHotAccounts.aCredentialIds
+                    : [],
+                payerACredentialIds: Array.isArray(prevRun.pendingHotAccounts?.payerACredentialIds)
+                    ? prevRun.pendingHotAccounts.payerACredentialIds
+                    : [],
+                transferACredentialIds: Array.isArray(prevRun.pendingHotAccounts?.transferACredentialIds)
+                    ? prevRun.pendingHotAccounts.transferACredentialIds
+                    : []
+            }
+        });
+    } catch {}
+
     const attachProtocolToHost = (host, fallbackProtocol = 'socks5') => {
         const h = String(host || '').trim();
         if (!h) return '';
@@ -8965,6 +9043,8 @@ async function startBotAfterValidation(req, res, validatedData) {
     let browserA, pageA, browserB, pageB;
     let browserC, pageC;
     let multiBrowsers = [];
+    /** Çoklu koşuda POST /run/:id/accounts/add ile eklenen A hesapları */
+    let hotAccountIngestTimer = null;
     let basketTimer;
     let basketMonitor;
     let basketHeartbeatWatch;
@@ -9522,11 +9602,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                 return bCtxOk;
             };
 
-            const aCtxList = await (async () => {
-                // Run A accounts in parallel pool to add seats to basket and park on /sepet
-                setStep('MULTI.A.hold.start', { aCount: aList.length, concurrency: multiAConcurrency, multiStaggerMs });
-                audit('multi_a_hold_start', { aCount: aList.length, concurrency: multiAConcurrency, multiStaggerMs });
-                const aCtxList = await poolMap(aList, multiAConcurrency, async (acc, i) => {
+            let dynamicMultiAIndex = aList.length;
+            let hotIngestBusy = false;
+
+            async function runOneMultiAHold(acc, i) {
                 const label = `A${i}`;
                 let aBrowser = null;
                 try {
@@ -9737,7 +9816,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                             const mode2 = (baseMode === 'svg') ? categorySelectionMode : ((roamEvery > 0 && (cycle % roamEvery) === 0) ? 'scan' : categorySelectionMode);
                             const cbRes2 = await accountCategoryChooser.choose(page, resolvedCategoryType, resolvedAlternativeCategory, mode2);
                             if (cbRes2 && cbRes2.svgBlockId) {
-                                try { catBlockA = { ...(catBlockA || {}), svgBlockId: cbRes2.svgBlockId }; } catch {}
+                                try { catBlock = { ...(catBlock || {}), svgBlockId: cbRes2.svgBlockId }; } catch {}
                             }
                             if (ticketCount > 1) {
                                 const qtyRes2 = await applyTicketQuantityDropdown(page, `${label}:postCategoryRetry`, ticketCount);
@@ -9753,8 +9832,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                 if (!seatInfo) throw new Error(formatError('SEAT_SELECTION_FAILED_A'));
                 // Persist SVG block id onto seatInfo so transfer flows can deterministically mount seatmap.
                 try {
-                    if (catBlockA && catBlockA.svgBlockId && !seatInfo.svgBlockId) {
-                        seatInfo.svgBlockId = String(catBlockA.svgBlockId);
+                    if (catBlock && catBlock.svgBlockId && !seatInfo.svgBlockId) {
+                        seatInfo.svgBlockId = String(catBlock.svgBlockId);
                     }
                 } catch {}
                 const sidNet = await netSeat;
@@ -9899,20 +9978,112 @@ async function startBotAfterValidation(req, res, validatedData) {
                     try { if (aBrowser) { unregisterPassobotBrowser(aBrowser); await aBrowser.close().catch(() => {}); const bIdx = multiBrowsers.indexOf(aBrowser); if (bIdx >= 0) multiBrowsers.splice(bIdx, 1); } } catch {}
                     return null;
                 }
-                });
-                const aCtxOk = aCtxList.filter(x => x !== null);
-                const aFailedCount = aCtxList.length - aCtxOk.length;
-                if (aCtxOk.length === 0) {
-                    throw new Error('Tüm A hesapları başarısız oldu — devam edilemiyor');
+            }
+
+            setStep('MULTI.A.hold.start', { aCount: aList.length, concurrency: multiAConcurrency, multiStaggerMs });
+            audit('multi_a_hold_start', { aCount: aList.length, concurrency: multiAConcurrency, multiStaggerMs });
+            const rawMultiA = await poolMap(aList, multiAConcurrency, runOneMultiAHold);
+            let aCtxList = [];
+            for (let ri = 0; ri < rawMultiA.length; ri++) {
+                if (rawMultiA[ri]) aCtxList.push(rawMultiA[ri]);
+            }
+
+            const aFailedCount = aList.length - aCtxList.length;
+            if (aCtxList.length === 0) {
+                throw new Error('Tüm A hesapları başarısız oldu — devam edilemiyor');
+            }
+            if (aFailedCount > 0) {
+                audit('multi_a_partial_failure', { total: aList.length, ok: aCtxList.length, failed: aFailedCount });
+                logger.warn(`${aFailedCount}/${aList.length} A hesabı başarısız, ${aCtxList.length} hesapla devam ediliyor`);
+            }
+            setStep('MULTI.A.hold.done', { aCount: aCtxList.length, failedCount: aFailedCount });
+            audit('multi_a_hold_done', { aCount: aCtxList.length, failedCount: aFailedCount, aEmails: aCtxList.map(x => x?.email).filter(Boolean) });
+
+            async function processHotAccountQueueTick() {
+                if (hotIngestBusy) return;
+                const st = runStore.get(runId);
+                if (!st || st.status === 'killed' || st.status === 'completed' || st.status === 'error') {
+                    try { if (hotAccountIngestTimer) clearInterval(hotAccountIngestTimer); } catch {}
+                    hotAccountIngestTimer = null;
+                    return;
                 }
-                if (aFailedCount > 0) {
-                    audit('multi_a_partial_failure', { total: aList.length, ok: aCtxOk.length, failed: aFailedCount });
-                    logger.warn(`${aFailedCount}/${aList.length} A hesabı başarısız, ${aCtxOk.length} hesapla devam ediliyor`);
+                const cur0 = st;
+                const pendAll = Array.isArray(cur0.pendingHotAccounts?.aCredentialIds)
+                    ? cur0.pendingHotAccounts.aCredentialIds
+                    : [];
+                if (!pendAll.length) return;
+                hotIngestBusy = true;
+                try {
+                    const cur = runStore.get(runId) || cur0;
+                    const pend = Array.isArray(cur.pendingHotAccounts?.aCredentialIds)
+                        ? [...cur.pendingHotAccounts.aCredentialIds]
+                        : [];
+                    if (!pend.length) return;
+                    const head = String(pend.shift() || '').trim();
+                    runStore.upsert(runId, {
+                        pendingHotAccounts: {
+                            ...(cur.pendingHotAccounts || {}),
+                            aCredentialIds: pend
+                        }
+                    });
+                    if (!head || !teamId) return;
+                    const docs = await credentialRepo.getCredentialsByIds(teamId, [head]);
+                    if (!docs.length) {
+                        logger.warnSafe('hot_account_credential_missing', { runId, credentialId: head });
+                        return;
+                    }
+                    const item = docs[0];
+                    const payerSet = new Set(
+                        Array.isArray(cur.pendingHotAccounts?.payerACredentialIds)
+                            ? cur.pendingHotAccounts.payerACredentialIds.map((x) => String(x || '').trim()).filter(Boolean)
+                            : []
+                    );
+                    const transferSet = new Set(
+                        Array.isArray(cur.pendingHotAccounts?.transferACredentialIds)
+                            ? cur.pendingHotAccounts.transferACredentialIds.map((x) => String(x || '').trim()).filter(Boolean)
+                            : []
+                    );
+                    const credId = String(item.id || '');
+                    const acc = {
+                        email: String(item.email || ''),
+                        password: decryptSecret(item.encryptedPassword),
+                        identity: item.identity || null,
+                        fanCardCode: item.fanCardCode || null,
+                        sicilNo: item.sicilNo || null,
+                        priorityTicketCode: item.priorityTicketCode || null,
+                        categoryIds: Array.isArray(item.categoryIds) ? item.categoryIds.map(String) : [],
+                        canPay: payerSet.has(credId),
+                        transferPurpose: transferSet.has(credId)
+                    };
+                    const useIdx = dynamicMultiAIndex;
+                    audit('hot_a_account_start', { email: acc.email, idx: useIdx });
+                    const ctx = await runOneMultiAHold(acc, useIdx);
+                    dynamicMultiAIndex += 1;
+                    if (ctx) {
+                        aCtxList.push(ctx);
+                        upsertPaymentQueueEntry({
+                            pairIndex: ctx.idx + 1,
+                            paymentOwnerRole: ctx?.canPay === false ? 'C' : 'A',
+                            paymentEligible: ctx?.canPay !== false,
+                            paymentState: ctx?.canPay === false ? 'waiting' : (hasCardInfo ? 'queued' : 'waiting'),
+                            aEmail: ctx?.email || '',
+                            bEmail: null
+                        });
+                        try { syncDashboardToRunStore(); } catch {}
+                    }
+                    audit('hot_a_account_done', { email: acc.email, ok: !!ctx });
+                } catch (e) {
+                    try {
+                        logger.warnSafe('hot_account_ingest_failed', { runId, error: e?.message || String(e) });
+                    } catch {}
+                } finally {
+                    hotIngestBusy = false;
                 }
-                setStep('MULTI.A.hold.done', { aCount: aCtxOk.length, failedCount: aFailedCount });
-                audit('multi_a_hold_done', { aCount: aCtxOk.length, failedCount: aFailedCount, aEmails: aCtxOk.map(x => x?.email).filter(Boolean) });
-                return aCtxOk;
-            })();
+            }
+
+            hotAccountIngestTimer = setInterval(() => {
+                processHotAccountQueueTick().catch(() => {});
+            }, 3200);
 
             // B hesabı yoksa: transfer loop yok, direkt ödeme veya hold
             if (!hasRealB) {
@@ -12247,6 +12418,8 @@ async function startBotAfterValidation(req, res, validatedData) {
         try { if (finalizeWatch) clearInterval(finalizeWatch); } catch {}
         try { if (paymentQueueWatch) clearInterval(paymentQueueWatch); } catch {}
         try { if (deferredPayableTransferWatch) clearInterval(deferredPayableTransferWatch); } catch {}
+        try { if (hotAccountIngestTimer) clearInterval(hotAccountIngestTimer); } catch {}
+        hotAccountIngestTimer = null;
         // Cleanup: Tarayıcıları kapat (KEEP_BROWSERS_OPEN=true ise açık bırak)
         const shouldKeepOpen = getCfg().FLAGS.KEEP_BROWSERS_OPEN === true;
         
