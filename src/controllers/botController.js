@@ -18,6 +18,7 @@ const teamRepo = require('../repositories/teamRepository');
 const { withRunCfg, getCfg } = require('../runCfg');
 const { buildProviderChain, hasCaptchaSolverCredentials, solveTurnstileProxyless, solveRecaptchaV2Proxyless } = require('../services/captchaSolver');
 const delay = require('../utils/delay');
+const categoryLoadRegistry = require('../utils/categoryLoadRegistry');
 const {
   isSoftProxyLoginFailure,
   shouldRetryLoginWithAnotherPoolProxy
@@ -617,13 +618,43 @@ async function prepareSeatSelectionControls(page, logContext = 'seatPrep') {
     }
 }
 
-function createCategoryChooser(selectedCategories, fallbackCategoryType, fallbackAlternativeCategory, defaultMode = 'scan') {
+function createCategoryChooser(selectedCategories, fallbackCategoryType, fallbackAlternativeCategory, defaultMode = 'scan', balanceOpts = null) {
     const normalized = (Array.isArray(selectedCategories) ? selectedCategories : [])
         .map((item) => normalizeSelectedCategory(item, defaultMode))
         .filter(Boolean);
+    const balanceRunId = balanceOpts && String(balanceOpts.runId || '').trim();
+    const balanceTicketCount = Number(balanceOpts?.ticketCount);
+    const workerIndex = Number.isFinite(Number(balanceOpts?.workerIndex)) ? Number(balanceOpts.workerIndex) : null;
+    const useLoadBalance = !!(balanceRunId && balanceTicketCount === 1 && normalized.length > 1);
+
     let nextIndex = 0;
+    if (!useLoadBalance && workerIndex != null && normalized.length > 0) {
+        nextIndex = workerIndex % normalized.length;
+    }
     /** Son başarılı kategori indeksi; seatmap recover’da nextIndex ilerlemesin diye */
     let lastCommittedCategoryIndex = null;
+    let lastLoadKey = null;
+
+    const releaseLoadKey = () => {
+        if (balanceRunId && lastLoadKey) {
+            categoryLoadRegistry.adjustLoad(balanceRunId, lastLoadKey, -1);
+            lastLoadKey = null;
+        }
+    };
+
+    const pickBalancedIndex = () => {
+        let bestJ = 0;
+        let bestLoad = Infinity;
+        for (let j = 0; j < normalized.length; j++) {
+            const k = categoryLoadRegistry.slotKeyFromCategory(normalized[j]);
+            const L = categoryLoadRegistry.getLoad(balanceRunId, k);
+            if (L < bestLoad) {
+                bestLoad = L;
+                bestJ = j;
+            }
+        }
+        return bestJ;
+    };
 
     const peekNext = () => {
         const chosen = normalized[nextIndex] || normalized[0] || null;
@@ -656,15 +687,23 @@ function createCategoryChooser(selectedCategories, fallbackCategoryType, fallbac
                 );
             }
             const nlen = normalized.length;
-            const idx = reapplyLast
-                ? (lastCommittedCategoryIndex != null
+            let idx;
+            if (reapplyLast) {
+                idx = lastCommittedCategoryIndex != null
                     ? lastCommittedCategoryIndex
-                    : (nlen ? (nextIndex + nlen - 1) % nlen : 0))
-                : nextIndex;
-            const chosen = normalized[idx] || normalized[0];
-            if (!reapplyLast) {
-                nextIndex = normalized.length > 1 ? ((nextIndex + 1) % normalized.length) : 0;
+                    : (nlen ? (nextIndex + nlen - 1) % nlen : 0);
+            } else if (useLoadBalance) {
+                releaseLoadKey();
+                idx = pickBalancedIndex();
+                const k = categoryLoadRegistry.slotKeyFromCategory(normalized[idx]);
+                categoryLoadRegistry.adjustLoad(balanceRunId, k, 1);
+                lastLoadKey = k;
+                nextIndex = (idx + 1) % nlen;
+            } else {
+                idx = nextIndex;
+                nextIndex = normalized.length > 1 ? ((nextIndex + 1) % nlen) : 0;
             }
+            const chosen = normalized[idx] || normalized[0];
             const mode = String(selectionMode || chosen.selectionModeHint || defaultMode || 'scan').trim().toLowerCase();
             logger.info('categoryBlock:selected_category_candidate', {
                 categoryId: chosen.id || null,
@@ -676,7 +715,9 @@ function createCategoryChooser(selectedCategories, fallbackCategoryType, fallbac
                 nextIndex,
                 total: normalized.length,
                 reapplyLastCommitted: reapplyLast || false,
-                usedIndex: idx
+                usedIndex: idx,
+                categoryLoadBalance: useLoadBalance || false,
+                categorySlotKey: useLoadBalance && !reapplyLast ? categoryLoadRegistry.slotKeyFromCategory(chosen) : null
             });
             const svgBid = String(chosen.svgBlockId || '').trim();
             if (svgBid) {
@@ -7518,8 +7559,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                         if (currentSeatInfo.combinedAll) {
                             row.combinedAll = String(currentSeatInfo.combinedAll).trim();
                         }
-                        if (Number.isFinite(Number(currentSeatInfo.itemCount)) && Number(currentSeatInfo.itemCount) > 1) {
-                            row.seatItemCount = Math.floor(Number(currentSeatInfo.itemCount));
+                        if (Number.isFinite(Number(currentSeatInfo.itemCount)) && Number(currentSeatInfo.itemCount) >= 2) {
+                            const ic = Math.floor(Number(currentSeatInfo.itemCount));
+                            row.seatItemCount = ic;
+                            row.basketItemCount = ic;
                         }
                     }
                 }
@@ -7563,8 +7606,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                         next.seatRow = seatInfo.row ?? next.seatRow ?? null;
                         next.seatNumber = seatInfo.seat ?? next.seatNumber ?? null;
                         if (seatInfo.combinedAll) next.combinedAll = String(seatInfo.combinedAll).trim();
-                        if (Number.isFinite(Number(seatInfo.itemCount)) && Number(seatInfo.itemCount) > 1) {
-                            next.seatItemCount = Math.floor(Number(seatInfo.itemCount));
+                        if (Number.isFinite(Number(seatInfo.itemCount)) && Number(seatInfo.itemCount) >= 2) {
+                            const ic = Math.floor(Number(seatInfo.itemCount));
+                            next.seatItemCount = ic;
+                            next.basketItemCount = ic;
                         }
                     }
                     return next;
@@ -9577,7 +9622,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                     accountAllowedCategories,
                     resolvedCategoryType,
                     resolvedAlternativeCategory,
-                    categorySelectionMode
+                    categorySelectionMode,
+                    isMulti
+                        ? { runId, ticketCount, workerIndex: i }
+                        : null
                 );
                 let ticketQuantityPrimed = false;
                 const targetCategory = accountCategoryChooser.peekNext ? accountCategoryChooser.peekNext() : null;
@@ -9724,12 +9772,31 @@ async function startBotAfterValidation(req, res, validatedData) {
                     await page.waitForSelector('.basket-list-detail, .basket-list, .basket, [data-testid*="basket" i], [data-testid*="sepet" i]', { timeout: 15000 }).catch(() => {});
                     basketArrivedAtMs = Date.now();
                 } catch {}
+                try {
+                    const bd = await readBasketData(page).catch(() => null);
+                    if (bd) {
+                        const ic = Math.max(Number(seatInfo?.itemCount) || 0, Number(bd.itemCount) || 0);
+                        let combinedAll = seatInfo?.combinedAll ? String(seatInfo.combinedAll).trim() : '';
+                        if (Array.isArray(bd.heldSeats) && bd.heldSeats.length >= 2) {
+                            combinedAll = bd.heldSeats.map((h) => String(h.combined || '').trim()).filter(Boolean).join(' · ');
+                        } else if (!combinedAll && ic >= 2 && bd.combined) {
+                            combinedAll = `${ic} ürün (sepet) · ${bd.combined}`;
+                        }
+                        seatInfo = {
+                            ...seatInfo,
+                            itemCount: ic > 0 ? ic : seatInfo.itemCount,
+                            ...(combinedAll ? { combinedAll } : {}),
+                            ...(Array.isArray(bd.heldSeats) && bd.heldSeats.length ? { heldSeats: bd.heldSeats } : {})
+                        };
+                    }
+                } catch {}
                 const basketTimingPatch = buildBasketTimingPatch({
                     basketArrivedAtMs,
                     remainingSeconds: seatInfo?.remainingTime,
                     observedAtMs: Date.now()
                 });
 
+                const dashItemCount = Number.isFinite(Number(seatInfo?.itemCount)) ? Math.floor(Number(seatInfo.itemCount)) : 0;
                 audit('a_hold_in_basket', { idx: i, email: acc.email, seatId: seatInfo?.seatId || null, url: (() => { try { return page.url(); } catch { return null; } })() });
                 upsertDashboardPairRow(i + 1, {
                     aEmail: acc.email || '',
@@ -9739,9 +9806,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                     seatId: seatInfo?.seatId ? String(seatInfo.seatId) : null,
                     seatLabel: fmtSeatLabel(seatInfo),
                     combinedAll: seatInfo?.combinedAll ? String(seatInfo.combinedAll).trim() : null,
-                    seatItemCount: Number.isFinite(Number(seatInfo?.itemCount)) && Number(seatInfo.itemCount) > 1
-                        ? Math.floor(Number(seatInfo.itemCount))
-                        : null,
+                    seatItemCount: dashItemCount >= 2 ? dashItemCount : null,
+                    basketItemCount: dashItemCount >= 2 ? dashItemCount : null,
                     tribune: seatInfo?.tribune ?? null,
                     seatRow: seatInfo?.row ?? null,
                     seatNumber: seatInfo?.seat ?? null,
@@ -12155,6 +12221,7 @@ async function startBotAfterValidation(req, res, validatedData) {
             urlB: (() => { try { return pageB?.url?.(); } catch { return null; } })()
         });
     } finally {
+        try { categoryLoadRegistry.removeRun(runId); } catch {}
         try { if (basketMonitor) clearInterval(basketMonitor); } catch {}
         try { if (basketHeartbeatWatch) clearInterval(basketHeartbeatWatch); } catch {}
         try { clearPassiveSessionWatch(); } catch {}

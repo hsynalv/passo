@@ -432,15 +432,20 @@ function shouldFlashPairCard(prev, next) {
   return false;
 }
 
-/** Çoklu koltuk: sunucu combinedAll / seatItemCount gönderirse özet satırında göster. */
+/** Çoklu koltuk / sepet: combinedAll, seatItemCount veya canlı basketItemCount ile özet (bilet adedi 1 olsa bile sepette 2+ ürün göster). */
 function formatPairSeatSummary(p) {
   if (!p || typeof p !== 'object') return '—';
   const all = String(p.combinedAll || '').trim();
-  if (all) return all;
-  const n = Number(p.seatItemCount);
+  const basketN = Number(p.basketItemCount);
+  const seatN = Number(p.seatItemCount);
+  const n = Number.isFinite(basketN) && basketN >= 2 ? basketN : (Number.isFinite(seatN) && seatN >= 2 ? seatN : NaN);
+  if (all) {
+    if (Number.isFinite(n) && n >= 2) return `${all} (${n} ürün, sepet)`;
+    return all;
+  }
   const base = String(p.seatLabel || '').trim();
-  if (Number.isFinite(n) && n > 1) {
-    return base ? `${base} · ${n} bilet (sepet)` : `${n} bilet (sepet)`;
+  if (Number.isFinite(n) && n >= 2) {
+    return base ? `${base} · ${n} ürün (sepet)` : `${n} ürün (sepet)`;
   }
   return base || '—';
 }

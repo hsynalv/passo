@@ -5,6 +5,33 @@ const { openSeatMapStrict, readBasketData, clickContinueInsidePage, ensureUrlCon
 const logger = require('../utils/logger');
 const { confirmSwalYes } = require('./swal');
 
+/** Koltuk haritasında ardışık tıklamalar arasında Turnstile token’ı için kısa bekle (çift sepet / çift seçim riski). */
+async function awaitTurnstileGapForSeatMap(page, context, email, ensureTurnstileFn, tag) {
+  if (!page) return;
+  const maxMs = 6500;
+  const poll = 300;
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxMs) {
+    const st = await page.evaluate(() => {
+      const w = !!document.querySelector('.cf-turnstile');
+      const f = document.querySelector('input[name="cf-turnstile-response"]');
+      const tok = f && f.value && String(f.value).length >= 80;
+      return { hasWidget: w, hasToken: tok };
+    }).catch(() => ({ hasWidget: false, hasToken: true }));
+    if (st.hasWidget && !st.hasToken) {
+      if (typeof ensureTurnstileFn === 'function' && email) {
+        try {
+          await ensureTurnstileFn(page, email, `seatPick:${context}:mapGap:${tag}`, { background: true, recaptchaFallback: false });
+        } catch {}
+      }
+      await delay(poll);
+      continue;
+    }
+    await delay(380);
+    return;
+  }
+}
+
 const SELECTED_SEAT_SELECTOR = (
   'circle.seat-circle.selected,' +
   'circle.seat-circle[aria-pressed="true"],' +
@@ -698,7 +725,11 @@ async function applyTicketQuantityDropdown(page, context, desiredCount, options 
 }
 
 /** Adet değişince Passo bazen mevcut koltuk seçimini yenilemeyi bekler (tek koltuk × N bilet). Tek gerçek mouse tıklaması (çift tık seçimi kaldırmasın). */
-async function reclickActiveSeatAfterQuantityChange(page, context) {
+async function reclickActiveSeatAfterQuantityChange(page, context, gapOpts = null) {
+  const gap = gapOpts && typeof gapOpts === 'object' ? gapOpts : null;
+  try {
+    await awaitTurnstileGapForSeatMap(page, context, gap?.email, gap?.ensureTurnstileFn, 'qtyReclick');
+  } catch {}
   try {
     const pt = await page.evaluate(() => {
       const rect =
@@ -1073,6 +1104,9 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
   const POST_CONTINUE_TRANSITION_GRACE_MS = 60000;
 
   const tryPickAdditionalSeat = async () => {
+    try {
+      await awaitTurnstileGapForSeatMap(page, context, email, ensureTurnstileFn, 'beforeAdditionalSeat');
+    } catch {}
     try {
       const info = await page.evaluate(() => {
         const normFill = (r) => {
@@ -1782,7 +1816,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
               });
               if (ddR && ddR.ok) {
                 if (quantitySelectionMode === 'duringSeat') {
-                  await reclickActiveSeatAfterQuantityChange(page, context);
+                  await reclickActiveSeatAfterQuantityChange(page, context, { email, ensureTurnstileFn });
                 }
                 const needR = ticketCount;
                 const maxAvR = Number(ddR.maxAvailable) || needR;
@@ -2013,7 +2047,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
         if (earlyDd?.ok) {
           ticketQtyPrimed = true;
           const hasSelEarly = await page.evaluate((sel) => !!document.querySelector(sel), SELECTED_SEAT_SELECTOR);
-          if (hasSelEarly) await reclickActiveSeatAfterQuantityChange(page, context);
+          if (hasSelEarly) await reclickActiveSeatAfterQuantityChange(page, context, { email, ensureTurnstileFn });
         }
         if (earlyDd?.appearPollExhausted) skipQtyAppearLongWait = true;
       }
@@ -2253,6 +2287,10 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
               await delay(80);
           }
 
+          try {
+            await awaitTurnstileGapForSeatMap(page, context, email, ensureTurnstileFn, 'afterSeatMapClick');
+          } catch {}
+
           const picked = await page.evaluate((sel) => !!document.querySelector(sel), SELECTED_SEAT_SELECTOR);
           if (!picked) {
             const selDiag = await getSelectionState();
@@ -2372,7 +2410,7 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
           });
           if (dd && dd.ok) {
             if (quantitySelectionMode === 'duringSeat') {
-              await reclickActiveSeatAfterQuantityChange(page, context);
+              await reclickActiveSeatAfterQuantityChange(page, context, { email, ensureTurnstileFn });
             }
             const need = ticketCount;
             const maxAv = Number(dd.maxAvailable) || need;
