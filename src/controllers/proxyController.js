@@ -36,14 +36,37 @@ function parseBulkText(rawText, fallbackProtocol = 'socks5') {
 
     const urlMatch = normalized.match(/^(?:(https?|socks4|socks5):\/\/)?([^\s:]+):(\d+)(?::([^\s:]+):([^\s:]+))?$/i);
     if (urlMatch) {
-      items.push({
-        protocol: (urlMatch[1] || fallbackProtocol || 'socks5').toLowerCase(),
-        host: urlMatch[2],
-        port: Number(urlMatch[3]),
-        username: urlMatch[4] || '',
-        password: urlMatch[5] || '',
-      });
-      continue;
+      const portNum = Number(urlMatch[3]);
+      if (Number.isFinite(portNum) && portNum >= 1 && portNum <= 65535) {
+        items.push({
+          protocol: (urlMatch[1] || fallbackProtocol || 'socks5').toLowerCase(),
+          host: urlMatch[2],
+          port: portNum,
+          username: urlMatch[4] || '',
+          password: urlMatch[5] || '',
+        });
+        continue;
+      }
+    }
+
+    // host:port:user:pass (iki nokta üst üste ile ayraç; şifre içinde ':' olabilir)
+    // Örn: 82.21.33.119:7870:mdtjtxog:gxga3nux5ood
+    if (!/^(https?|socks4|socks5):\/\//i.test(normalized)) {
+      const colonAuth = normalized.match(/^([^:]+):(\d+):([^:]*):(.*)$/);
+      if (colonAuth) {
+        const portNum = Number(colonAuth[2]);
+        const hostPart = String(colonAuth[1] || '').trim();
+        if (hostPart && Number.isFinite(portNum) && portNum >= 1 && portNum <= 65535) {
+          items.push({
+            protocol: String(fallbackProtocol || 'socks5').toLowerCase(),
+            host: hostPart,
+            port: portNum,
+            username: String(colonAuth[3] || '').trim(),
+            password: String(colonAuth[4] ?? '').trim(),
+          });
+          continue;
+        }
+      }
     }
 
     const parts = normalized.split(' ');

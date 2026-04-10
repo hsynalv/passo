@@ -1058,6 +1058,60 @@ function statusTextFromAudit(eventKey, meta = {}) {
   if (event === 'basket_presence_lost') return `⚠️ ${prefix}sepette bilet artık görünmüyor`;
   if (event === 'basket_presence_restored') return `✅ ${prefix}sepette bilet tekrar göründü`;
   if (event === 'holder_updated') return `↔️ ${prefix}tutucu güncellendi: ${meta?.holder || '—'}`;
+
+  if (event === 'proxy_selected') {
+    const stepInfo = {
+      raw: '',
+      body: '',
+      role: String(meta?.role || '').trim().toUpperCase(),
+      idx: Number.isFinite(Number(meta?.idx)) ? Number(meta.idx) : null,
+      pairIndex,
+      stageKey: '',
+    };
+    const actorPrefix = stepInfo.role
+      ? `${formatStatusActor(stepInfo, meta)} · `
+      : prefix;
+    const src = meta?.source === 'manual' ? 'form (manuel)' : 'havuz';
+    const endpoint = String(meta?.proxy || '—').trim() || '—';
+    const proto = meta?.protocol && String(meta.protocol).trim() && meta.protocol !== 'manual'
+      ? ` · ${meta.protocol}`
+      : '';
+    const pid = meta?.proxyId ? ` · kayıt id: ${meta.proxyId}` : '';
+    return `🌐 ${actorPrefix}Proxy (${src}): ${endpoint}${proto}${pid}`;
+  }
+  if (event === 'proxy_skipped') {
+    const stepInfo = {
+      raw: '',
+      body: '',
+      role: String(meta?.role || '').trim().toUpperCase(),
+      idx: Number.isFinite(Number(meta?.idx)) ? Number(meta.idx) : null,
+      pairIndex,
+      stageKey: '',
+    };
+    const actorPrefix = stepInfo.role
+      ? `${formatStatusActor(stepInfo, meta)} · `
+      : prefix;
+    const why = String(meta?.reason || '').trim() || 'proxy kullanılmıyor';
+    return `🌐 ${actorPrefix}Doğrudan bağlantı (${why})`;
+  }
+  if (event === 'proxy_login_failed') {
+    const stepInfo = {
+      raw: '',
+      body: '',
+      role: String(meta?.role || '').trim().toUpperCase(),
+      idx: Number.isFinite(Number(meta?.idx)) ? Number(meta.idx) : null,
+      pairIndex,
+      stageKey: '',
+    };
+    const actorPrefix = stepInfo.role
+      ? `${formatStatusActor(stepInfo, meta)} · `
+      : prefix;
+    const endpoint = String(meta?.proxy || '—').trim() || '—';
+    const pid = meta?.proxyId ? ` · kayıt id: ${meta.proxyId}` : '';
+    const reason = String(meta?.reason || '').trim();
+    const shortReason = reason.length > 140 ? `${reason.slice(0, 137)}…` : reason;
+    return `⚠️ ${actorPrefix}Proxy ile giriş başarısız: ${endpoint}${pid}${shortReason ? ` — ${shortReason}` : ''}`;
+  }
   return null;
 }
 

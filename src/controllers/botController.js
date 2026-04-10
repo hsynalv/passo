@@ -3014,6 +3014,31 @@ async function connectStableBrowser({ chromePath, userDataDir, args, ignoreAllFl
     }
 }
 
+/** Giriş aşamasında hata olunca açık kalan Chromium sürecini kapat (proxy/network hatalarında zombi pencereleri önler). */
+async function disposeBrowserAfterFailedLogin(browser, email, err) {
+    if (!browser) return;
+    try {
+        const pages = await browser.pages().catch(() => []);
+        for (const p of pages || []) {
+            try {
+                await p.close({ runBeforeUnload: false });
+            } catch {}
+        }
+    } catch {}
+    try {
+        await browser.close();
+        logger.info('launchAndLogin: tarayıcı kapatıldı (giriş başarısız)', {
+            email,
+            reason: err?.message || String(err)
+        });
+    } catch (e) {
+        logger.warn('launchAndLogin: tarayıcı kapatılamadı', {
+            email,
+            error: e?.message || String(e)
+        });
+    }
+}
+
 async function launchAndLogin(options) {
     const opts = options && typeof options === 'object' ? options : {};
     const email = opts.email;
@@ -3043,16 +3068,24 @@ async function launchAndLogin(options) {
     });
     const ret = await connectStableBrowser({ chromePath, userDataDir, args, ignoreAllFlags: useMinimalArgs });
     const browser = ret.browser;
-    const page = ret.page || await ensurePage(browser);
+    let page;
     try {
-        logger.debug('launchAndLogin: browser/page hazır', {
-            email,
-            hasInitialPage: !!ret.page,
-            currentUrl: (() => {
-                try { return page.url(); } catch { return null; }
-            })()
-        });
-    } catch {}
+        page = ret.page || await ensurePage(browser);
+    } catch (ensureErr) {
+        await disposeBrowserAfterFailedLogin(browser, email, ensureErr);
+        throw ensureErr;
+    }
+
+    try {
+        try {
+            logger.debug('launchAndLogin: browser/page hazır', {
+                email,
+                hasInitialPage: !!ret.page,
+                currentUrl: (() => {
+                    try { return page.url(); } catch { return null; }
+                })()
+            });
+        } catch {}
     if (proxyApplied && proxyUsername && proxyPassword) {
         try {
             await page.authenticate({username: String(proxyUsername), password: String(proxyPassword)});
@@ -3838,6 +3871,10 @@ async function launchAndLogin(options) {
     }
 
     return {browser, page};
+    } catch (loginFlowErr) {
+        await disposeBrowserAfterFailedLogin(browser, email, loginFlowErr);
+        throw loginFlowErr;
+    }
 }
 
 async function reloginIfRedirected(page, email, password) {
@@ -6872,6 +6909,16 @@ async function startBotAfterValidation(req, res, validatedData) {
 
         if (manualProxyLaunchConfig) {
             Object.assign(opts, manualProxyLaunchConfig);
+            audit('proxy_selected', {
+                runId,
+                role,
+                idx,
+                email: emailForLog,
+                source: 'manual',
+                proxyId: null,
+                proxy: `${manualProxyLaunchConfig.proxyHost}:${manualProxyLaunchConfig.proxyPort}`,
+                protocol: 'manual'
+            });
         } else if (shouldUseProxyPool) {
             try {
                 activeProxy = await proxyRepo.acquireNextActiveProxy();
@@ -6893,6 +6940,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                 role,
                 idx,
                 email: emailForLog,
+                source: 'pool',
                 proxyId: activeProxy.id,
                 proxy: `${activeProxy.host}:${activeProxy.port}`,
                 protocol: activeProxy.protocol
