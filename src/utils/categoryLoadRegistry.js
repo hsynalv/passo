@@ -12,18 +12,18 @@ function ensureRunMap(runId) {
   return loadsByRun.get(id);
 }
 
+/**
+ * Aynı Passo kategorisini temsil eden iki panel satırı (farklı label, aynı type) tek slot’ta birleşsin.
+ */
 function slotKeyFromCategory(chosen) {
   if (!chosen || typeof chosen !== 'object') return '';
   const id = String(chosen.id || '').trim();
   if (id) return `id:${id}`;
-  const ct = String(chosen.categoryType || '').trim().slice(0, 120);
-  const ac = String(chosen.alternativeCategory || '').trim().slice(0, 120);
-  const lb = String(chosen.label || '').trim().slice(0, 120);
   const svg = String(chosen.svgBlockId || '').trim();
-  const core = ct || lb || 'cat';
-  const alt = ac ? `|alt:${ac}` : '';
-  const svgPart = svg ? `|svg:${svg.slice(0, 48)}` : '';
-  return `t:${core}${alt}${svgPart}`;
+  if (svg) return `svg:${svg.slice(0, 64)}`;
+  const ct = String(chosen.categoryType || '').trim().toLowerCase().slice(0, 160);
+  const ac = String(chosen.alternativeCategory || '').trim().toLowerCase().slice(0, 160);
+  return `t:${ct}|a:${ac}`;
 }
 
 function getLoad(runId, key) {
@@ -44,9 +44,20 @@ function removeRun(runId) {
   loadsByRun.delete(String(runId || '').trim());
 }
 
+/** Kategori seçildi (yük id:t…); blok belli olunca aynı run’da anahtarı bloklu anahtara taşı — aynı kategoride farklı bloklara dağılım. */
+function migrateKey(runId, fromKey, toKey) {
+  const m = ensureRunMap(runId);
+  if (!m || !fromKey || !toKey || fromKey === toKey) return;
+  const n = m.get(fromKey) || 0;
+  if (n <= 0) return;
+  adjustLoad(runId, fromKey, -1);
+  adjustLoad(runId, toKey, 1);
+}
+
 module.exports = {
   slotKeyFromCategory,
   getLoad,
   adjustLoad,
-  removeRun
+  removeRun,
+  migrateKey
 };

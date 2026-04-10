@@ -51,9 +51,9 @@ const DEFAULTS = {
   EXPERIMENTAL_A_READD_COOLDOWN_SECONDS: '60',
   BASKET_LOOP_ENABLED: '1',
   BASKET_LOOP_MAX_HOPS: '4',
-  MULTI_A_CONCURRENCY: '4',
-  MULTI_B_CONCURRENCY: '4',
-  MULTI_STAGGER_MS: '900',
+  MULTI_A_CONCURRENCY: '3',
+  MULTI_B_CONCURRENCY: '3',
+  MULTI_STAGGER_MS: '1200',
   SEAT_SELECTION_CYCLES: '200',
   SEAT_SNIPE_MAX_MS: '15000',
   SEAT_SNIPE_POLL_MS: '200',
@@ -69,7 +69,7 @@ const DEFAULTS = {
   TURNSTILE_SOLVE_TIMEOUT_MS: '120000',
   TURNSTILE_SOLVE_CONCURRENCY: '8',
   /** Proxy havuzunda giriş hatasında en fazla kaç farklı proxy denensin (launchAndLogin her seferinde tarayıcıyı kapatır). */
-  PROXY_POOL_LOGIN_MAX_ATTEMPTS: '3',
+  PROXY_POOL_LOGIN_MAX_ATTEMPTS: '4',
   TURNSTILE_MAX_ATTEMPTS: '2',
   TURNSTILE_SEAT_SITEKEY_POLL_MS: '12000',
   SEAT_WAIT_UNTIL_FOUND: '0',
@@ -188,7 +188,7 @@ function buildConfigFromEnv(env = process.env) {
 
     MULTI: {
       A_CONCURRENCY: parseInt(env.MULTI_A_CONCURRENCY || '4', 10),
-      B_CONCURRENCY: parseInt(env.MULTI_B_CONCURRENCY || '2', 10),
+      B_CONCURRENCY: parseInt(env.MULTI_B_CONCURRENCY || '3', 10),
       STAGGER_MS: parseInt(env.MULTI_STAGGER_MS || '0', 10)
     },
 

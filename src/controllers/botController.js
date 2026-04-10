@@ -1,7 +1,7 @@
 const { connect: realBrowserConnect } = require('puppeteer-real-browser');
 const rebrowserPuppeteer = require('rebrowser-puppeteer-core');
 const axios = require('axios');
-const { randomUUID } = require('crypto');
+const { randomUUID, randomInt } = require('crypto');
 const fs = require('fs');
 const util = require('util');
 const treeKill = require('tree-kill');
@@ -643,17 +643,14 @@ function createCategoryChooser(selectedCategories, fallbackCategoryType, fallbac
     };
 
     const pickBalancedIndex = () => {
-        let bestJ = 0;
-        let bestLoad = Infinity;
-        for (let j = 0; j < normalized.length; j++) {
-            const k = categoryLoadRegistry.slotKeyFromCategory(normalized[j]);
-            const L = categoryLoadRegistry.getLoad(balanceRunId, k);
-            if (L < bestLoad) {
-                bestLoad = L;
-                bestJ = j;
-            }
-        }
-        return bestJ;
+        const loads = normalized.map((c, j) => ({
+            j,
+            L: categoryLoadRegistry.getLoad(balanceRunId, categoryLoadRegistry.slotKeyFromCategory(c))
+        }));
+        const minL = loads.length ? Math.min(...loads.map((x) => x.L)) : 0;
+        const ties = loads.filter((x) => x.L === minL).map((x) => x.j);
+        if (!ties.length) return 0;
+        return ties[randomInt(0, ties.length)];
     };
 
     const peekNext = () => {
@@ -671,10 +668,17 @@ function createCategoryChooser(selectedCategories, fallbackCategoryType, fallbac
         };
     };
 
+    const rebindLoadKey = (newKeyFull) => {
+        if (!useLoadBalance || !balanceRunId || !lastLoadKey || !newKeyFull || newKeyFull === lastLoadKey) return;
+        categoryLoadRegistry.migrateKey(balanceRunId, lastLoadKey, newKeyFull);
+        lastLoadKey = newKeyFull;
+    };
+
     return {
         list: normalized,
         peekNext,
         getRoamTexts: () => buildCategoryRoamTexts(normalized, fallbackCategoryType, fallbackAlternativeCategory),
+        rebindLoadKey: useLoadBalance ? rebindLoadKey : () => {},
         async choose(page, categoryType, alternativeCategory, selectionMode, opts = null) {
             const reapplyLast = opts && opts.reapplyLastCommitted === true;
             if (!normalized.length) {
@@ -3398,7 +3402,7 @@ async function launchAndLogin(options) {
                 email,
                 docStatus: lastLoginDoc?.status
             });
-            for (let cfRound = 1; cfRound <= 2; cfRound++) {
+            for (let cfRound = 1; cfRound <= 3; cfRound++) {
                 try {
                     await delay(1600 + cfRound * 400);
                     await gotoWithRetry(page, passoHomeTrLogin, {
@@ -3438,14 +3442,14 @@ async function launchAndLogin(options) {
             await dismissPassoLoginShellOverlays(page, email, 'shell_once_before_loop');
             lastSnap = await evalOnPage(page, snapScript);
             logger.info('launchAndLogin: çerez sonrası snapshot', { email, snap: lastSnap });
-            for (let attempt = 1; attempt <= 12 && noLoginFieldsYet(lastSnap); attempt++) {
+            for (let attempt = 1; attempt <= 15 && noLoginFieldsYet(lastSnap); attempt++) {
                 logger.warn('launchAndLogin: giriş formu henüz yok (SPA/shell), zorla yenileme', {
                     email,
                     attempt,
                     bodyHtmlLen: lastSnap.bodyHtmlLen,
                     docHtmlLen: lastSnap.docHtmlLen
                 });
-                if (attempt === 3 || attempt === 6 || attempt === 9) {
+                if (attempt === 4 || attempt === 8 || attempt === 12) {
                     logger.warn('launchAndLogin: ana sayfa üzerinden router sıfırlanıyor', { email, attempt, passoHomeTr });
                     try {
                         await gotoWithRetry(page, passoHomeTr, {
@@ -3568,8 +3572,8 @@ async function launchAndLogin(options) {
     };
 
     const ensureLoginFormWithReload = async () => {
-        for (let attempt = 1; attempt <= 10; attempt++) {
-            const ctx = await tryEnsureLoginForm(20000);
+        for (let attempt = 1; attempt <= 12; attempt++) {
+            const ctx = await tryEnsureLoginForm(24000);
             if (ctx) return ctx;
             logger.warn('launchAndLogin: form hâlâ yok, tekrar giriş URL + yenileme', { email, attempt });
             try {
@@ -9665,6 +9669,20 @@ async function startBotAfterValidation(req, res, validatedData) {
                         catBlock = { ...(c || catBlock), svgBlockId: catBlock?.svgBlockId };
                     } catch {}
                     await delay(350);
+                }
+
+                if (Number(ticketCount) === 1 && cbRes?.chosenCategory) {
+                    const blk =
+                        String(catBlock?.blockVal || '').trim() ||
+                        String(catBlock?.blockText || '').trim().slice(0, 120);
+                    if (blk) {
+                        const base = categoryLoadRegistry.slotKeyFromCategory(cbRes.chosenCategory);
+                        if (base) {
+                            try {
+                                accountCategoryChooser.rebindLoadKey(`${base}|b:${blk.slice(0, 120)}`);
+                            } catch {}
+                        }
+                    }
                 }
 
                 if (ticketCount > 1) {
