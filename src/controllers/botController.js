@@ -7114,16 +7114,58 @@ async function startBotAfterValidation(req, res, validatedData) {
         : null;
     const shouldUseProxyPool = useProxyPool !== false;
 
+    /** Tek listede tek hesap ve tekli (çift) mod; birden fazla A/B veya çoklu mod değil — finalize C vb. sonradan ek tarayıcı sayılmaz. */
+    const onlyOneListedAccountSlot = !isMulti && (aList.length + bList.length) <= 1;
+
+    let managedProxyLaunchSerial = 0;
+
+    /** Bu koşuda havuzdan kaç tarayıcı açılacağına dair tahmin (A+B listeleri; finalize C ayrıca +1 olabilir). */
+    const estimatedBrowsersUsingPool = Math.max(1, (aList?.length || 0) + (bList?.length || 0));
+
+    let proxyPoolLayoutAudited = false;
+    let poolAssignableCountSnapshot = null;
+
+    const auditProxyPoolLayoutOnce = async () => {
+        if (proxyPoolLayoutAudited) return;
+        proxyPoolLayoutAudited = true;
+        try {
+            const assignableProxyCount = await proxyRepo.countAssignableProxies();
+            poolAssignableCountSnapshot = assignableProxyCount;
+            const estimatedLaunches = estimatedBrowsersUsingPool;
+            const singleProxyAllBrowsersShare = assignableProxyCount === 1 && estimatedLaunches > 1;
+            const underprovisioned = assignableProxyCount > 0 && assignableProxyCount < estimatedLaunches;
+            audit('proxy_pool_scan', {
+                runId,
+                assignableProxyCount,
+                estimatedBrowserLaunches: estimatedLaunches,
+                singleProxyAllBrowsersShare,
+                underprovisioned,
+                distributionMode: 'least_recently_used',
+                note: 'Paralel açılışlarda aynı anda farklı proxy; tek proxy varsa tüm tarayıcılar mecburen paylaşır.'
+            });
+        } catch (e) {
+            audit('proxy_pool_scan_failed', { runId, error: e?.message || String(e) }, 'warn');
+        }
+    };
+
     const launchAndLoginWithManagedProxy = async (baseOpts, meta = {}) => {
         const opts = baseOpts && typeof baseOpts === 'object' ? { ...baseOpts } : {};
         opts.runId = runId;
+        managedProxyLaunchSerial += 1;
         const role = String(meta.role || '').trim();
         const idx = Number.isFinite(Number(meta.idx)) ? Number(meta.idx) : null;
         const emailForLog = String(opts.email || meta.email || '').trim();
         let activeProxy = null;
         let fromPool = false;
 
-        if (manualProxyLaunchConfig) {
+        // Paneldeki tek manuel proxy yalnızca tek tarayıcılı koşuda (tek A/B kaydı); aksi halde her launch havuzdan ayrı proxy.
+        const useManualSingleBrowserOnly = !!(
+            manualProxyLaunchConfig &&
+            managedProxyLaunchSerial === 1 &&
+            onlyOneListedAccountSlot
+        );
+
+        if (useManualSingleBrowserOnly) {
             Object.assign(opts, manualProxyLaunchConfig);
             audit('proxy_selected', {
                 runId,
@@ -7135,40 +7177,63 @@ async function startBotAfterValidation(req, res, validatedData) {
                 proxy: `${manualProxyLaunchConfig.proxyHost}:${manualProxyLaunchConfig.proxyPort}`,
                 protocol: 'manual'
             });
-        } else if (shouldUseProxyPool) {
-            try {
-                activeProxy = await proxyRepo.acquireNextActiveProxy();
-            } catch (e) {
-                throw new Error(`Proxy havuzu okunamadi: ${e?.message || String(e)}`);
-            }
-            if (!activeProxy) {
-                throw new Error('Aktif proxy bulunamadi (proxy havuzu bos ya da blacklistte).');
-            }
-            fromPool = true;
-            Object.assign(opts, {
-                proxyHost: attachProtocolToHost(activeProxy.host, activeProxy.protocol || 'socks5'),
-                proxyPort: activeProxy.port,
-                proxyUsername: activeProxy.username || '',
-                proxyPassword: activeProxy.password || ''
-            });
-            audit('proxy_selected', {
-                runId,
-                role,
-                idx,
-                email: emailForLog,
-                source: 'pool',
-                proxyId: activeProxy.id,
-                proxy: `${activeProxy.host}:${activeProxy.port}`,
-                protocol: activeProxy.protocol
-            });
         } else {
-            audit('proxy_skipped', {
-                runId,
-                role,
-                idx,
-                email: emailForLog,
-                reason: 'useProxyPool=false'
-            });
+            if (manualProxyLaunchConfig && !useManualSingleBrowserOnly) {
+                audit('proxy_manual_skipped_multi_browser', {
+                    runId,
+                    role,
+                    idx,
+                    email: emailForLog,
+                    launchSerial: managedProxyLaunchSerial,
+                    reason: 'her_tarayici_ayri_proxy_havuz'
+                });
+            }
+            if (shouldUseProxyPool) {
+                try {
+                    await auditProxyPoolLayoutOnce();
+                } catch {}
+                try {
+                    activeProxy = await proxyRepo.acquireNextActiveProxy();
+                } catch (e) {
+                    throw new Error(`Proxy havuzu okunamadi: ${e?.message || String(e)}`);
+                }
+                if (!activeProxy) {
+                    throw new Error('Aktif proxy bulunamadi (proxy havuzu bos ya da blacklistte).');
+                }
+                fromPool = true;
+                Object.assign(opts, {
+                    proxyHost: attachProtocolToHost(activeProxy.host, activeProxy.protocol || 'socks5'),
+                    proxyPort: activeProxy.port,
+                    proxyUsername: activeProxy.username || '',
+                    proxyPassword: activeProxy.password || ''
+                });
+                const singleShared =
+                    poolAssignableCountSnapshot === 1 && estimatedBrowsersUsingPool > 1;
+                audit('proxy_selected', {
+                    runId,
+                    role,
+                    idx,
+                    email: emailForLog,
+                    source: 'pool',
+                    proxyId: activeProxy.id,
+                    proxy: `${activeProxy.host}:${activeProxy.port}`,
+                    protocol: activeProxy.protocol,
+                    poolAssignableCount: poolAssignableCountSnapshot,
+                    singleProxyPoolShared: singleShared
+                });
+            } else if (manualProxyLaunchConfig && !useManualSingleBrowserOnly) {
+                throw new Error(
+                    'Birden fazla tarayıcı açılıyor; her hesap için farklı proxy kullanılmalıdır. Proxy havuzunu açın ve tarayıcı sayısından az olmayacak kadar aktif proxy ekleyin. (Tek hesap + panelde tek proxy yalnızca tek tarayıcı koşusunda geçerli.)'
+                );
+            } else {
+                audit('proxy_skipped', {
+                    runId,
+                    role,
+                    idx,
+                    email: emailForLog,
+                    reason: 'useProxyPool=false'
+                });
+            }
         }
 
         try {
@@ -7215,10 +7280,23 @@ async function startBotAfterValidation(req, res, validatedData) {
     const fmtSeatLabel = (si) => {
         if (!si) return '—';
         try {
-            if (si.combined) return String(si.combined).trim();
-            const parts = [si.row, si.seat].filter(Boolean).map(String);
+            const seats = normalizeHeldSeats(si);
+            if (seats.length > 1) {
+                return seats
+                    .map((s) => {
+                        if (s.combined) return String(s.combined).trim();
+                        const parts = [s.row, s.seat].filter(Boolean).map(String);
+                        if (parts.length) return parts.join(' / ');
+                        return s.seatId ? String(s.seatId) : '';
+                    })
+                    .filter(Boolean)
+                    .join(' · ');
+            }
+            const one = seats[0] || si;
+            if (one.combined) return String(one.combined).trim();
+            const parts = [one.row, one.seat].filter(Boolean).map(String);
             if (parts.length) return parts.join(' / ');
-            if (si.seatId) return String(si.seatId);
+            if (one.seatId) return String(one.seatId);
         } catch {}
         return '—';
     };
@@ -7337,7 +7415,12 @@ async function startBotAfterValidation(req, res, validatedData) {
                 if (isActivePair || (!activePair && isTarget)) {
                     row.holder = currentHolder;
                     row.seatLabel = fmtSeatLabel(currentSeatInfo) || row.seatLabel || '—';
-                    row.seatId = currentSeatInfo?.seatId ? String(currentSeatInfo.seatId) : row.seatId;
+                    const heldIds = normalizeHeldSeats(currentSeatInfo)
+                        .map((s) => s.seatId)
+                        .filter(Boolean);
+                    row.seatId = heldIds.length > 1
+                        ? heldIds.join(', ')
+                        : (currentSeatInfo?.seatId ? String(currentSeatInfo.seatId) : row.seatId);
                     if (currentSeatInfo) {
                         row.tribune = currentSeatInfo.tribune ?? row.tribune ?? null;
                         row.seatRow = currentSeatInfo.row ?? row.seatRow ?? null;
@@ -7377,7 +7460,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                     if (Number(p.pairIndex) !== targetPair) return p;
                     const next = { ...p, holder: role };
                     if (seatInfo) {
-                        next.seatId = seatInfo.seatId ? String(seatInfo.seatId) : next.seatId;
+                        const ids = normalizeHeldSeats(seatInfo).map((s) => s.seatId).filter(Boolean);
+                        next.seatId = ids.length > 1 ? ids.join(', ') : (seatInfo.seatId ? String(seatInfo.seatId) : next.seatId);
                         next.seatLabel = fmtSeatLabel(seatInfo) || next.seatLabel || '—';
                         next.tribune = seatInfo.tribune ?? next.tribune ?? null;
                         next.seatRow = seatInfo.row ?? next.seatRow ?? null;

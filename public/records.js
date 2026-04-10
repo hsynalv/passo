@@ -27,6 +27,31 @@ function formatDateTime(value) {
   return date.toLocaleString('tr-TR');
 }
 
+function formatSeatSummary(seat) {
+  if (!seat || typeof seat !== 'object') return '—';
+  const all = String(seat.combinedAll || '').trim();
+  if (all) return all;
+  const held = Array.isArray(seat.heldSeats) ? seat.heldSeats : [];
+  if (held.length > 1) {
+    return held
+      .map((h) => {
+        const c = String(h.combined || '').trim();
+        if (c) return c;
+        const parts = [h.row, h.seatNumber].filter(Boolean).map((x) => String(x).trim()).filter(Boolean);
+        if (parts.length) return parts.join(' / ');
+        return String(h.seatId || '').trim();
+      })
+      .filter(Boolean)
+      .join(' · ');
+  }
+  return (
+    String(seat.combined || '').trim() ||
+    [seat.row, seat.seatNumber].filter(Boolean).map((x) => String(x).trim()).filter(Boolean).join(' / ') ||
+    String(seat.seatId || '').trim() ||
+    '—'
+  );
+}
+
 function setConn(text, ok) {
   if (!connEl) return;
   connEl.textContent = text;
@@ -148,7 +173,7 @@ function renderList() {
 
   listEl.innerHTML = visible.map((record) => {
     const active = record.id === state.selectedId ? ' active' : '';
-    const seatLabel = record?.seat?.combined || [record?.seat?.row, record?.seat?.seatNumber].filter(Boolean).join(' / ') || record?.seat?.seatId || '—';
+    const seatLabel = formatSeatSummary(record?.seat);
     const hasFailureLogs = Number(record.sessionLogCount || 0) > 0;
     const holderText = record.holderRole === 'A' ? 'Ana Hesap' : record.holderRole === 'B' ? 'Tutucu Hesap' : record.holderRole || '—';
     const paymentOwnerText = record.paymentOwnerRole === 'A' ? 'Ana Hesap' : record.paymentOwnerRole === 'B' ? 'Tutucu Hesap' : record.paymentOwnerRole || '—';
@@ -239,8 +264,19 @@ function renderDetail(record) {
       </div>
       <div class="recordDetailBlock">
         <h3>Koltuk ve Kategori</h3>
+        <div class="recordDetailRow"><span>Bilet adedi</span><strong>${escapeHtml(String(seat.itemCount || (Array.isArray(seat.heldSeats) ? seat.heldSeats.length : 0) || (seat.combined || seat.seatId ? 1 : 0)))}</strong></div>
+        <div class="recordDetailRow"><span>Ozet (tumu)</span><strong>${escapeHtml(formatSeatSummary(seat))}</strong></div>
         <div class="recordDetailRow"><span>Seat ID</span><strong>${escapeHtml(seat.seatId || '—')}</strong></div>
-        <div class="recordDetailRow"><span>Combined</span><strong>${escapeHtml(seat.combined || '—')}</strong></div>
+        <div class="recordDetailRow"><span>Combined (ilk)</span><strong>${escapeHtml(seat.combined || '—')}</strong></div>
+        ${Array.isArray(seat.heldSeats) && seat.heldSeats.length > 1
+    ? seat.heldSeats
+      .map((h, i) => {
+        const line = formatSeatSummary(h) || '—';
+        const sid = h.seatId ? ` <span class="muted">id: ${escapeHtml(h.seatId)}</span>` : '';
+        return `<div class="recordDetailRow"><span>Koltuk #${i + 1}</span><strong>${escapeHtml(line)}</strong>${sid}</div>`;
+      })
+      .join('')
+    : ''}
         <div class="recordDetailRow"><span>Tribun</span><strong>${escapeHtml(seat.tribune || '—')}</strong></div>
         <div class="recordDetailRow"><span>Blok</span><strong>${escapeHtml(seat.block || '—')}</strong></div>
         <div class="recordDetailRow"><span>Sira</span><strong>${escapeHtml(seat.row || '—')}</strong></div>

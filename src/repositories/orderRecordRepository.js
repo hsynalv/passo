@@ -78,10 +78,15 @@ function mapOrderRecord(doc) {
     seat: {
       seatId: safeString(doc.seat?.seatId),
       combined: safeString(doc.seat?.combined),
+      combinedAll: safeString(doc.seat?.combinedAll),
       tribune: safeString(doc.seat?.tribune),
       block: safeString(doc.seat?.block),
       row: safeString(doc.seat?.row),
       seatNumber: safeString(doc.seat?.seatNumber),
+      itemCount: safeNumber(doc.seat?.itemCount, 0),
+      heldSeats: Array.isArray(doc.seat?.heldSeats)
+        ? doc.seat.heldSeats.map((h) => mapHeldSeatRow(h, {}))
+        : [],
     },
     category: {
       categoryText: safeString(doc.category?.categoryText),
@@ -118,15 +123,58 @@ function mapOrderRecord(doc) {
   };
 }
 
-function buildSeatPayload(seat = {}, category = {}) {
+function mapHeldSeatRow(h = {}, category = {}) {
   return {
-    seatId: safeString(seat?.seatId),
-    combined: safeString(seat?.combined),
-    tribune: safeString(seat?.tribune),
-    block: safeString(seat?.block || category?.blockText || category?.blockVal),
-    row: safeString(seat?.row),
-    seatNumber: safeString(seat?.seat),
+    seatId: safeString(h?.seatId),
+    combined: safeString(h?.combined),
+    tribune: safeString(h?.tribune),
+    block: safeString(h?.block || category?.blockText || category?.blockVal),
+    row: safeString(h?.row),
+    seatNumber: safeString(h?.seat),
   };
+}
+
+function buildSeatPayload(seat = {}, category = {}) {
+  const primary = mapHeldSeatRow(seat, category);
+  const rawHeld = Array.isArray(seat?.heldSeats) ? seat.heldSeats : [];
+  const heldSeats = [];
+  const seen = new Set();
+  for (const h of rawHeld) {
+    if (!h || typeof h !== 'object') continue;
+    const one = mapHeldSeatRow(h, category);
+    const key = one.seatId || one.combined || `${one.row}|${one.seatNumber}`;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    heldSeats.push(one);
+  }
+  const ic = Number(seat?.itemCount);
+  const itemCount = Math.max(
+    heldSeats.length,
+    Number.isFinite(ic) && ic > 0 ? Math.floor(ic) : 0,
+    primary.seatId || primary.combined || primary.row || primary.seatNumber ? 1 : 0
+  );
+  const labelSources = heldSeats.length
+    ? heldSeats
+    : primary.combined || primary.row || primary.seatNumber || primary.seatId
+      ? [primary]
+      : [];
+  const combinedAll = labelSources
+    .map((one) => {
+      const line = safeString(one.combined).trim();
+      if (line) return line;
+      const parts = [one.row, one.seatNumber].filter(Boolean).map((x) => safeString(x).trim()).filter(Boolean);
+      if (parts.length) return parts.join(' / ');
+      return safeString(one.seatId).trim();
+    })
+    .filter(Boolean)
+    .join(' · ');
+  const out = {
+    ...primary,
+    itemCount,
+    combinedAll: combinedAll || primary.combined,
+  };
+  if (heldSeats.length) out.heldSeats = heldSeats;
+  return out;
 }
 
 function buildCategoryPayload(category = {}) {

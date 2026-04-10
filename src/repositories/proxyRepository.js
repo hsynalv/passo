@@ -23,6 +23,21 @@ function normalizeProtocol(value) {
   return 'socks5';
 }
 
+/** Havuzdan atanabilir proxy'ler (aktif, blacklist dışı, host+port geçerli) — acquire ile aynı kriter. */
+function assignableProxyFilterAt(nowIso) {
+  return {
+    isActive: { $ne: false },
+    host: { $exists: true, $nin: [null, ''] },
+    port: { $exists: true, $nin: [null, 0] },
+    $or: [
+      { blacklistUntil: null },
+      { blacklistUntil: { $exists: false } },
+      { blacklistUntil: '' },
+      { blacklistUntil: { $lte: nowIso } },
+    ],
+  };
+}
+
 function mapProxy(doc) {
   if (!doc) return null;
   const until = doc.blacklistUntil ? String(doc.blacklistUntil) : null;
@@ -177,39 +192,68 @@ async function restoreProxy(id) {
   return mapProxy({ ...existing, ...next });
 }
 
+async function countAssignableProxies() {
+  const nowIso = new Date().toISOString();
+  try {
+    return await proxies().countDocuments(assignableProxyFilterAt(nowIso));
+  } catch {
+    return 0;
+  }
+}
+
 async function acquireNextActiveProxy() {
   const nowIso = new Date().toISOString();
   const now = Date.now();
 
-  const docs = await proxies().find({ isActive: { $ne: false } }).toArray();
-  const candidates = docs
-    .map(mapProxy)
-    .filter((item) => {
-      if (!item) return false;
-      if (item.isBlacklisted) return false;
-      return item.host && item.port;
-    })
-    .sort((a, b) => {
-      const aT = a.lastUsedAt ? Date.parse(a.lastUsedAt) : 0;
-      const bT = b.lastUsedAt ? Date.parse(b.lastUsedAt) : 0;
-      if (aT !== bT) return aT - bT;
-      return String(a.id).localeCompare(String(b.id));
-    });
+  // Atomik seçim: paralel tarayıcı açılışlarında aynı proxy'nin iki kez verilmesini önler.
+  const filter = assignableProxyFilterAt(nowIso);
 
-  const picked = candidates[0] || null;
-  if (!picked) return null;
+  const update = {
+    $set: {
+      lastUsedAt: nowIso,
+      updatedAt: nowIso,
+    },
+  };
 
-  const oid = toObjectId(picked.id);
-  if (oid) {
-    await proxies().updateOne({ _id: oid }, {
-      $set: {
-        lastUsedAt: nowIso,
-        updatedAt: nowIso,
-      },
+  let doc = null;
+  try {
+    doc = await proxies().findOneAndUpdate(filter, update, {
+      sort: { lastUsedAt: 1, _id: 1 },
+      returnDocument: 'after',
     });
+  } catch (e) {
+    // Eski MongoDB sürümlerinde findOneAndUpdate+sort desteklenmeyebilir; okuma+yazmaya düş.
+    try {
+      const docs = await proxies().find({ isActive: { $ne: false } }).toArray();
+      const candidates = docs
+        .map(mapProxy)
+        .filter((item) => {
+          if (!item) return false;
+          if (item.isBlacklisted) return false;
+          return item.host && item.port;
+        })
+        .sort((a, b) => {
+          const aT = a.lastUsedAt ? Date.parse(a.lastUsedAt) : 0;
+          const bT = b.lastUsedAt ? Date.parse(b.lastUsedAt) : 0;
+          if (aT !== bT) return aT - bT;
+          return String(a.id).localeCompare(String(b.id));
+        });
+      const picked = candidates[0] || null;
+      if (!picked) return null;
+      const oid = toObjectId(picked.id);
+      if (oid) {
+        await proxies().updateOne({ _id: oid }, { $set: { lastUsedAt: nowIso, updatedAt: nowIso } });
+      }
+      return { ...picked, pickedAt: now, lastUsedAt: nowIso };
+    } catch {
+      throw e;
+    }
   }
 
-  return { ...picked, pickedAt: now, lastUsedAt: nowIso };
+  if (!doc) return null;
+  const mapped = mapProxy(doc);
+  if (!mapped || !mapped.host || !mapped.port || mapped.isBlacklisted) return null;
+  return { ...mapped, pickedAt: now, lastUsedAt: nowIso };
 }
 
 async function markLoginSuccess(id) {
@@ -262,6 +306,7 @@ async function markLoginFailure(id, options = {}) {
 
 module.exports = {
   acquireNextActiveProxy,
+  countAssignableProxies,
   createProxy,
   deleteProxy,
   getProxyById,

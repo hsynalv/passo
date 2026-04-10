@@ -1059,6 +1059,32 @@ function statusTextFromAudit(eventKey, meta = {}) {
   if (event === 'basket_presence_restored') return `✅ ${prefix}sepette bilet tekrar göründü`;
   if (event === 'holder_updated') return `↔️ ${prefix}tutucu güncellendi: ${meta?.holder || '—'}`;
 
+  if (event === 'proxy_pool_scan') {
+    const n = Number(meta?.assignableProxyCount);
+    const est = Number(meta?.estimatedBrowserLaunches);
+    const estOk = Number.isFinite(est) && est > 0;
+    const estText = estOk ? est : '?';
+    if (!Number.isFinite(n)) return '🌐 Proxy havuzu: sayım yapılamadı';
+    if (n === 0) return '🌐 Proxy havuzu: atanabilir aktif proxy yok (veya hepsi blacklistte)';
+    if (n === 1 && estOk && est <= 1) {
+      return '🌐 Proxy havuzu: 1 atanabilir proxy — bu koşu tek tarayıcı, paylaşım yok.';
+    }
+    if (meta?.singleProxyAllBrowsersShare) {
+      return `🌐 Proxy havuzu: yalnızca 1 atanabilir proxy — bu koşudaki tüm tarayıcılar (${estText}) mecburen aynı çıkış IP’sini paylaşacak.`;
+    }
+    if (meta?.underprovisioned) {
+      return `🌐 Proxy havuzu: ${n} atanabilir proxy, ~${estText} tarayıcı — bazı çıkışlar tekrar kullanılacak; dağıtım en az kullanılan öncelikli (mümkün olduğunca eşit).`;
+    }
+    return `🌐 Proxy havuzu: ${n} atanabilir proxy — mümkün olduğunca eşit paylaştırma (sıra: en az kullanılan önce).`;
+  }
+  if (event === 'proxy_pool_scan_failed') {
+    const err = String(meta?.error || '').trim();
+    return `⚠️ Proxy havuzu taraması başarısız${err ? `: ${err.length > 120 ? `${err.slice(0, 117)}…` : err}` : ''}`;
+  }
+  if (event === 'proxy_manual_skipped_multi_browser') {
+    return `ℹ️ ${prefix}Çoklu tarayıcı: paneldeki tek proxy atlanıyor; her oturum havuzdan ayrı atanır.`;
+  }
+
   if (event === 'proxy_selected') {
     const stepInfo = {
       raw: '',
@@ -1077,7 +1103,13 @@ function statusTextFromAudit(eventKey, meta = {}) {
       ? ` · ${meta.protocol}`
       : '';
     const pid = meta?.proxyId ? ` · kayıt id: ${meta.proxyId}` : '';
-    return `🌐 ${actorPrefix}Proxy (${src}): ${endpoint}${proto}${pid}`;
+    let tail = '';
+    if (meta?.source === 'pool' && meta?.singleProxyPoolShared) {
+      tail = ' — paylaşımlı tek proxy';
+    } else if (meta?.source === 'pool' && Number(meta?.poolAssignableCount) > 1) {
+      tail = ` — havuz: ${meta.poolAssignableCount} aktif`;
+    }
+    return `🌐 ${actorPrefix}Proxy (${src}): ${endpoint}${proto}${pid}${tail}`;
   }
   if (event === 'proxy_skipped') {
     const stepInfo = {

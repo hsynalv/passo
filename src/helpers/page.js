@@ -671,6 +671,49 @@ async function readBasketData(page) {
     // a basket-like URL or when strong basket DOM is present.
     if (isSeatSelection && !isBasketUrl && !hasStrongBasketDom) return null;
 
+    const getInRoot = (root, label) => {
+      if (!root || !root.querySelectorAll) return '';
+      const el = Array.from(root.querySelectorAll('.basket-list-detail'))
+        .find((e) => norm(e.querySelector('.basket-span')?.textContent) === label);
+      return el ? norm(el.querySelector('span:last-child')?.textContent) : '';
+    };
+
+    const parseMultiBasketRows = () => {
+      const roots = Array.from(document.querySelectorAll('.basket-list > li, .basket-list > div, ul.basket-list > *')).filter(
+        (el) => el && el.querySelector && el.querySelector('.basket-list-detail')
+      );
+      if (roots.length < 2) return null;
+      const heldSeats = [];
+      for (const root of roots) {
+        const tr = getInRoot(root, 'Tribün');
+        const bl = getInRoot(root, 'Blok');
+        const rw = getInRoot(root, 'Sıra');
+        const st = getInRoot(root, 'Koltuk');
+        if (!rw && !st) continue;
+        const combined = `${tr} ${bl} ${rw} ${st}`.trim();
+        heldSeats.push({ tribune: tr, block: bl, row: rw, seat: st, blockId: '', seatId: '', combined });
+      }
+      return heldSeats.length >= 2 ? heldSeats : null;
+    };
+
+    const multi = parseMultiBasketRows();
+    if (multi && multi.length) {
+      const p0 = multi[0];
+      return {
+        tribune: p0.tribune,
+        block: p0.block,
+        row: p0.row,
+        seat: p0.seat,
+        blockId,
+        seatId,
+        combined: p0.combined,
+        inBasket: true,
+        url,
+        itemCount: Math.max(multi.length, itemCount),
+        heldSeats: multi,
+      };
+    }
+
     if (!tribune && !block && !row && !seat) {
       if (!hasStrongBasketDom && !isBasketUrl) return null;
       return { tribune: '', block: '', row: '', seat: '', blockId, seatId, combined: '', inBasket: true, url, itemCount };
