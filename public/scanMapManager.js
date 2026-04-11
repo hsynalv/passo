@@ -345,6 +345,32 @@
     } catch {}
   }
 
+  async function saveScanResultAsBlocks() {
+    const form = getForm();
+    if (!form.teamId) {
+      alert('Takım seç');
+      return;
+    }
+    if (!state.scannedItems.length) {
+      alert('Önce blok taraması yap veya canlı taramayı tamamla');
+      return;
+    }
+    const json = await apiJson('/api/scan-map/save-as-team-blocks', {
+      method: 'POST',
+      body: {
+        teamId: form.teamId,
+        items: state.scannedItems,
+      },
+    });
+    const skipped = Number(json.skippedCount || 0);
+    notify(`Takım blokları kaydedildi (+${json.count || 0}${skipped ? `, ${skipped} blok zaten kayıtlıydı` : ''})`);
+    try {
+      if (window.passobotCatalog && typeof window.passobotCatalog.reloadCategories === 'function') {
+        await window.passobotCatalog.reloadCategories();
+      }
+    } catch {}
+  }
+
   async function setDefault(mappingId, categoryLabel) {
     const form = getForm();
     if (!form.teamId || !mappingId) return;
@@ -422,6 +448,9 @@
     });
     $('btnScanMapSave')?.addEventListener('click', async () => {
       try { await saveScanResult(); } catch (e) { alert(e?.message || String(e)); }
+    });
+    $('btnScanMapSaveAsBlocks')?.addEventListener('click', async () => {
+      try { await saveScanResultAsBlocks(); } catch (e) { alert(e?.message || String(e)); }
     });
     $('btnScanMapRefresh')?.addEventListener('click', async () => {
       try { await loadMappings(); } catch (e) { alert(e?.message || String(e)); }

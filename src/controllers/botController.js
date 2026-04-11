@@ -7,10 +7,11 @@ const util = require('util');
 const treeKill = require('tree-kill');
 const treeKillAsync = util.promisify(treeKill);
 const { PNG } = require('pngjs');
-const { botRequestSchema } = require('../validators/botRequest');
+const { botRequestSchema, snipeRequestSchema } = require('../validators/botRequest');
 
 const configRoot = require('../config');
 const categoryRepo = require('../repositories/categoryRepository');
+const blockRepo = require('../repositories/blockRepository');
 const credentialRepo = require('../repositories/credentialRepository');
 const orderRecordRepo = require('../repositories/orderRecordRepository');
 const proxyRepo = require('../repositories/proxyRepository');
@@ -30,7 +31,7 @@ const { formatError, formatSuccess } = require('../utils/messages');
 const { BasketTimer, checkBasketTimeoutFromPage } = require('../utils/basketTimer');
 const {confirmSwalYes, clickRemoveFromCartAndConfirm} = require('../helpers/swal');
 const { captureSeatIdFromNetwork, readBasketData, readCatBlock, setCatBlockOnB, openSeatMapStrict, clickContinueInsidePage, gotoWithRetry, ensureUrlContains, isHomeUrl, SEAT_NODE_SELECTOR, ensureTcAssignedOnBasket, clickBasketDevamToOdeme, dismissPaymentInfoModalIfPresent, fillInvoiceTcAndContinue, acceptAgreementsAndContinue, fillNkolayPaymentIframe } = require('../helpers/page');
-const { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware, applyTicketQuantityDropdown } = require('../helpers/seat');
+const { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware, applyTicketQuantityDropdown, resolveApiBlockId, startSeatAvailabilityWatcher } = require('../helpers/seat');
 
 function normalizeSelectedCategory(item, fallbackMode = 'scan') {
     if (!item || typeof item !== 'object') return null;
@@ -81,6 +82,44 @@ async function resolveCategoriesForCredential(teamId, selectedCategories, creden
       svgBlockId: item.svgBlockId
     }, categorySelectionMode))
     .filter(Boolean);
+}
+
+/**
+ * Blok hedefini normalleştirir.
+ * @param {object} block - blockRepo.mapBlock çıktısı
+ * @returns {object|null}
+ */
+function normalizeSelectedBlock(block) {
+  if (!block || !block.id) return null;
+  return {
+    id: block.id,
+    label: String(block.label || ''),
+    selectionMode: block.selectionMode === 'legacy' ? 'legacy' : 'svg',
+    svgBlockId: block.svgBlockId || null,
+    apiBlockId: block.apiBlockId || null,
+    categoryType: block.categoryType || null,
+    blockVal: block.blockVal || null,
+    ticketCount: Number.isFinite(block.ticketCount) && block.ticketCount >= 1 ? block.ticketCount : 1,
+    adjacentSeats: block.adjacentSeats === true,
+  };
+}
+
+/**
+ * Üyeliğe blok atanmışsa yalnızca o bloklar kullanılır.
+ * credentialBlockIds yoksa seçili bloklar döner.
+ */
+async function resolveBlocksForCredential(teamId, selectedBlocks, credentialBlockIds) {
+  const ids = Array.isArray(credentialBlockIds)
+    ? credentialBlockIds.map((id) => String(id).trim()).filter(Boolean)
+    : [];
+  if (!ids.length || !teamId) {
+    return selectedBlocks;
+  }
+  const repoBlocks = await blockRepo.getBlocksByIds(teamId, ids);
+  if (!repoBlocks.length) {
+    return selectedBlocks;
+  }
+  return repoBlocks.map(normalizeSelectedBlock).filter(Boolean);
 }
 
 function snapshotLooksLikeCloudflareBlock(snap, httpStatus) {
@@ -616,6 +655,63 @@ async function prepareSeatSelectionControls(page, logContext = 'seatPrep') {
         logger.warn(`${logContext}:membership_type_select_failed`, { error: e?.message || String(e), waitedMs });
         return { ok: false, error: e?.message || String(e), waitedMs };
     }
+}
+
+/**
+ * Blok hedefleri için round-robin seçici.
+ * selectedBlocks boşsa null döner — çağrıcı mevcut kategori seçiciyi kullanır.
+ */
+function createBlockChooser(selectedBlocks) {
+    const list = Array.isArray(selectedBlocks) ? selectedBlocks.filter(Boolean) : [];
+    if (!list.length) return null;
+    let idx = 0;
+    return {
+        list,
+        hasBlocks: true,
+        peekNext() { return list[idx % list.length] || null; },
+        /**
+         * Aktif blok hedefini seçer (koltuk seçim sayfasında).
+         * SVG seçim başarısız olursa legacy fallback'e geçer.
+         */
+        async choose(page, selectionMode) {
+            const block = list[idx % list.length];
+            idx = (idx + 1) % list.length;
+            if (!block) return null;
+            let catBlock;
+            if (block.selectionMode === 'svg') {
+                catBlock = { svgBlockId: block.svgBlockId, categoryText: block.label || '' };
+            } else {
+                catBlock = {
+                    categoryText: block.categoryType || block.label || '',
+                    blockVal: block.blockVal || '',
+                    blockText: block.label || '',
+                };
+            }
+            const seatInfo = block.selectionMode === 'svg'
+                ? { svgBlockId: block.svgBlockId, blockId: String(block.apiBlockId || '') }
+                : {};
+            const ok = await applyCategoryBlockSelection(page, selectionMode, catBlock, seatInfo);
+            // SVG seçim başarısız olduysa ve legacy fallback alanları varsa legacy'ye dön
+            if (!ok && block.selectionMode === 'svg' && block.categoryType && block.blockVal) {
+                const legacyCatBlock = {
+                    categoryText: block.categoryType,
+                    blockVal: block.blockVal,
+                    blockText: block.label || '',
+                };
+                await setCatBlockOnB(page, legacyCatBlock);
+                return {
+                    chosenBlock: block,
+                    svgBlockId: null,
+                    catBlock: legacyCatBlock,
+                };
+            }
+            return {
+                chosenBlock: block,
+                svgBlockId: block.selectionMode === 'svg' ? block.svgBlockId : null,
+                catBlock,
+            };
+        }
+    };
 }
 
 function createCategoryChooser(selectedCategories, fallbackCategoryType, fallbackAlternativeCategory, defaultMode = 'scan', balanceOpts = null) {
@@ -1873,6 +1969,7 @@ async function killSessions(req, res) {
 module.exports = {
     startBot,
     startBotAsync,
+    startSnipe,
     registerCAccount,
     enqueueHotAccountsForRun,
     requestFinalize,
@@ -7148,13 +7245,15 @@ async function startBotAfterValidation(req, res, validatedData) {
         email2, password2,
         aAccounts, bAccounts,
         aCredentialIds, bCredentialIds,
-        selectedCategoryIds, selectedCategories: requestedSelectedCategories
+        selectedCategoryIds, selectedCategories: requestedSelectedCategories,
+        selectedBlockIds
     } = validatedData;
 
     const selectedCategoriesFromBody = Array.isArray(requestedSelectedCategories)
         ? requestedSelectedCategories.map((item) => normalizeSelectedCategory(item, categorySelectionMode)).filter(Boolean)
         : [];
     const selectedCategoryIdsSafe = Array.isArray(selectedCategoryIds) ? selectedCategoryIds.map((id) => String(id).trim()).filter(Boolean) : [];
+    const selectedBlockIdsSafe = Array.isArray(selectedBlockIds) ? selectedBlockIds.map((id) => String(id).trim()).filter(Boolean) : [];
     const aCredentialIdsSafe = Array.isArray(aCredentialIds) ? aCredentialIds.map((id) => String(id).trim()).filter(Boolean) : [];
     const bCredentialIdsSafe = Array.isArray(bCredentialIds) ? bCredentialIds.map((id) => String(id).trim()).filter(Boolean) : [];
 
@@ -7196,6 +7295,13 @@ async function startBotAfterValidation(req, res, validatedData) {
 
     const resolvedCategoryType = selectedCategories[0]?.categoryType || String(categoryType || '').trim();
     const resolvedAlternativeCategory = selectedCategories[0]?.alternativeCategory || String(alternativeCategory || '').trim();
+
+    // ── Blok çözümleme ──────────────────────────────────────────────────────
+    let selectedBlocks = [];
+    if (teamId && selectedBlockIdsSafe.length) {
+        const repoBlocks = await blockRepo.getBlocksByIds(teamId, selectedBlockIdsSafe);
+        selectedBlocks = repoBlocks.map(normalizeSelectedBlock).filter(Boolean);
+    }
 
     let aList;
     let bList;
@@ -9567,44 +9673,15 @@ async function startBotAfterValidation(req, res, validatedData) {
                 await ensureTurnstileTokenOnPage(page, acc.email, `${label}.seatSelection`, { background: true });
                 setStep(`${label}.turnstile.ensure.done`, { snap: await snapshotPage(page, `${label}.afterTurnstileEnsure`) });
 
-                // IMPORTANT: B must be ready with seatmap mounted BEFORE A releases.
-                // Open seatmap now so B can immediately click when A releases.
+                // STRATEJI: B kategori seçim ekranında (seatmap KAPALI) bekler.
+                // A koltuğu seatmap açıkken bırakırsa koltuk "dolu" (gri) görünür ve sayfanın
+                // yenilenmesi gerekir. Bunun yerine: A bırakır → B kategoriyi tıklar →
+                // seatmap SIFIRDAN açılır → koltuk anında serbest görünür → B hemen tıklar.
                 const seatSelectionUrl = (() => { try { return page.url(); } catch { return null; } })();
-                audit('b_prepared', { idx: i, email: acc.email, seatSelectionUrl });
 
-                // Open category/block and seatmap for B before release
-                setStep(`${label}.preRelease.categoryBlock.start`);
-                try {
-                    await applyCategoryBlockSelection(page, categorySelectionMode, null, null);
-                    audit('b_pre_release_cat_block', { idx: i, email: acc.email, categorySelectionMode });
-                } catch (e) {
-                    audit('b_pre_release_cat_block_warn', { idx: i, email: acc.email, error: e?.message }, 'warn');
-                }
-
-                setStep(`${label}.preRelease.seatmap.start`);
-                let seatmapReady = false;
-                for (let attempt = 1; attempt <= 3; attempt++) {
-                    try {
-                        await openSeatMapStrict(page);
-                        await page.waitForFunction((sel) => {
-                            try { return document.querySelectorAll(sel).length > 0; } catch { return false; }
-                        }, { timeout: 15000 }, SEAT_NODE_SELECTOR);
-                        seatmapReady = true;
-                        audit('b_pre_release_seatmap_ready', { idx: i, email: acc.email, attempt });
-                        break;
-                    } catch (e) {
-                        audit('b_pre_release_seatmap_attempt', { idx: i, email: acc.email, attempt, error: e?.message }, 'warn');
-                        if (attempt < 3) await delay(500 + (attempt * 300));
-                    }
-                }
-
-                if (!seatmapReady) {
-                    audit('b_pre_release_seatmap_failed', { idx: i, email: acc.email }, 'warn');
-                }
-
-                // Keep B on seat selection but ready for immediate pick
-                setStep(`${label}.preRelease.ready`, { seatmapReady });
-                audit('b_standby_ready', { idx: i, email: acc.email, seatmapReady, url: (() => { try { return page.url(); } catch { return null; } })() });
+                // Keep B on seat selection category screen; do NOT open seatmap yet.
+                setStep(`${label}.preRelease.ready`);
+                audit('b_standby_ready', { idx: i, email: acc.email, seatmapReady: false, url: seatSelectionUrl });
 
                 return {
                     idx: i,
@@ -9614,7 +9691,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     browser,
                     page,
                     seatSelectionUrl,
-                    seatmapReady
+                    seatmapReady: false
                 };
                 } catch (e) {
                     rethrowAsRunKilledIfNeeded(e, `${label}.prepare`);
@@ -9746,18 +9823,27 @@ async function startBotAfterValidation(req, res, validatedData) {
                         ? { runId, ticketCount, workerIndex: i }
                         : null
                 );
+                const accountAllowedBlocks = await resolveBlocksForCredential(teamId, selectedBlocks, acc.blockIds || []);
+                const accountBlockChooser = createBlockChooser(accountAllowedBlocks);
                 let ticketQuantityPrimed = false;
-                const targetCategory = accountCategoryChooser.peekNext ? accountCategoryChooser.peekNext() : null;
+                const targetBlock = accountBlockChooser ? accountBlockChooser.peekNext() : null;
+                const targetCategory = !targetBlock && accountCategoryChooser.peekNext ? accountCategoryChooser.peekNext() : null;
                 setStep(`${label}.categoryBlock.select.start`, {
                     categorySelectionMode,
                     categoryId: targetCategory?.id || null,
-                    categoryLabel: targetCategory?.label || null,
-                    categoryType: targetCategory?.categoryType || resolvedCategoryType || null,
-                    svgBlockId: targetCategory?.svgBlockId || null,
-                    alternativeCategory: targetCategory?.alternativeCategory || resolvedAlternativeCategory || null
+                    categoryLabel: targetBlock ? targetBlock.label : (targetCategory?.label || null),
+                    categoryType: targetBlock ? null : (targetCategory?.categoryType || resolvedCategoryType || null),
+                    svgBlockId: targetBlock?.svgBlockId || targetCategory?.svgBlockId || null,
+                    alternativeCategory: targetCategory?.alternativeCategory || resolvedAlternativeCategory || null,
+                    blockTarget: targetBlock ? { id: targetBlock.id, selectionMode: targetBlock.selectionMode } : null,
                 });
                 const cbStart = Date.now();
-                const cbRes = await accountCategoryChooser.choose(page, resolvedCategoryType, resolvedAlternativeCategory, categorySelectionMode);
+                let cbRes;
+                if (accountBlockChooser) {
+                    cbRes = await accountBlockChooser.choose(page, categorySelectionMode);
+                } else {
+                    cbRes = await accountCategoryChooser.choose(page, resolvedCategoryType, resolvedAlternativeCategory, categorySelectionMode);
+                }
                 setStep(`${label}.categoryBlock.select.done`, { snap: await snapshotPage(page, `${label}.afterCategoryBlock`) });
                 audit('a_category_block_selected', {
                     idx: i,
@@ -9765,9 +9851,10 @@ async function startBotAfterValidation(req, res, validatedData) {
                     mode: categorySelectionMode,
                     ms: Date.now() - cbStart,
                     categoryId: cbRes?.chosenCategory?.id || null,
-                    categoryLabel: cbRes?.chosenCategory?.label || null,
+                    categoryLabel: cbRes?.chosenCategory?.label || cbRes?.chosenBlock?.label || null,
                     categoryType: cbRes?.chosenCategory?.categoryType || resolvedCategoryType || null,
-                    svgBlockId: cbRes?.svgBlockId || cbRes?.chosenCategory?.svgBlockId || null
+                    svgBlockId: cbRes?.svgBlockId || cbRes?.chosenCategory?.svgBlockId || null,
+                    blockId: cbRes?.chosenBlock?.id || null,
                 });
 
                 let catBlock = { categoryText: '', blockText: '', blockVal: '' };
@@ -10492,6 +10579,33 @@ async function startBotAfterValidation(req, res, validatedData) {
                 } catch {}
                 let removed = false;
                 let removeDiag = null;
+
+                // ── Seat Availability Watcher: A bırakmadan önce B'nin sayfasında watcher başlat ──
+                // Böylece A clearBasket yaptığı anda koltuk müsait görünür görünmez B haberdar olur.
+                const _watcherBlockId = resolveApiBlockId(aCtx.seatInfo);
+                const _watcherAc = new AbortController();
+                let _transferWatcherP = null;
+                if (_watcherBlockId && bCtx?.page) {
+                    const _evId = String(eventAddress || '').split('/').filter(Boolean).pop() || '';
+                    if (_evId && /^\d+$/.test(_evId)) {
+                        _transferWatcherP = startSeatAvailabilityWatcher(bCtx.page, {
+                            eventId: _evId,
+                            serieId: '',
+                            blockIds: [_watcherBlockId],
+                            targetSeatIds: aCtx.seatInfo.seatId ? [Number(aCtx.seatInfo.seatId)] : null,
+                            intervalMs: 600,
+                            timeoutMs: 60_000,
+                            signal: _watcherAc.signal,
+                        }).catch(() => null);
+                        audit('transfer_watcher_started', {
+                            idx: i, bEmail: bCtx.email,
+                            blockId: _watcherBlockId,
+                            seatId: aCtx.seatInfo.seatId,
+                        });
+                    }
+                }
+                // ────────────────────────────────────────────────────────────────────────────────
+
                 await ensureRemoveDelayAfterBasket();
                 for (let attempt = 1; attempt <= 3; attempt++) {
                     if (removed) break;
@@ -10561,29 +10675,17 @@ async function startBotAfterValidation(req, res, validatedData) {
                     removedClicks: removeDiag?.removedClicks ?? null
                 });
 
-                // B is already on seat selection with seatmap ready - just apply correct category/block
-                setStep(`PAIR${i}.b_apply_catblock.start`, { seatmapReady: bCtx.seatmapReady });
-                audit('b_apply_catblock_start', { idx: i, bEmail: bCtx.email, seatId: aCtx.seatInfo.seatId, seatmapReady: bCtx.seatmapReady });
+                // A bıraktı → B kategoriyi şimdi seçiyor → seatmap SIFIRDAN açılıyor.
+                // B daha önce seatmap açmadı (kategori listesinde bekliyordu); böylece
+                // seatmap ilk açıldığında koltuk zaten serbest görünür, yenileme gerekmez.
+                setStep(`PAIR${i}.b_apply_catblock.start`);
+                audit('b_apply_catblock_start', { idx: i, bEmail: bCtx.email, seatId: aCtx.seatInfo.seatId });
 
-                // Apply A's category/block to B for faster exact pick
                 try {
                     await applyCategoryBlockSelection(bCtx.page, categorySelectionMode, aCtx.catBlock, aCtx.seatInfo);
                     audit('b_catblock_applied', { idx: i, bEmail: bCtx.email, seatId: aCtx.seatInfo.seatId });
                 } catch (e) {
                     audit('b_catblock_apply_warn', { idx: i, bEmail: bCtx.email, error: e?.message }, 'warn');
-                }
-
-                // Re-open seatmap to refresh with new block
-                if (!bCtx.seatmapReady) {
-                    try {
-                        await openSeatMapStrict(bCtx.page);
-                        await bCtx.page.waitForFunction((sel) => {
-                            try { return document.querySelectorAll(sel).length > 0; } catch { return false; }
-                        }, { timeout: 10000 }, SEAT_NODE_SELECTOR);
-                        audit('b_seatmap_reopened', { idx: i, bEmail: bCtx.email });
-                    } catch (e) {
-                        audit('b_seatmap_reopen_failed', { idx: i, bEmail: bCtx.email, error: e?.message }, 'warn');
-                    }
                 }
 
                 setStep(`PAIR${i}.b_apply_catblock.done`);
@@ -10608,6 +10710,8 @@ async function startBotAfterValidation(req, res, validatedData) {
                 try {
                     seatBInfo = await exactPromise;
                 } catch (e) {
+                    // Watcher'ı durdur — pick tamamlandı (başarısız)
+                    _watcherAc.abort();
                     results.push({ idx: i, ok: false, error: e?.message || String(e), seatA: aCtx.seatInfo });
                     audit('b_exact_pick_failed', { idx: i, bEmail: bCtx.email, seatId: aCtx.seatInfo.seatId, error: e?.message || String(e) }, 'warn');
                     if (dashboardPairs[i]) {
@@ -10634,6 +10738,9 @@ async function startBotAfterValidation(req, res, validatedData) {
                     });
                     continue;
                 }
+
+                // Watcher'ı durdur — pick başarıyla tamamlandı
+                _watcherAc.abort();
 
                 audit('b_exact_pick_done', {
                     idx: i,
@@ -11140,17 +11247,26 @@ async function startBotAfterValidation(req, res, validatedData) {
             resolvedAlternativeCategory,
             categorySelectionMode
         );
+        const aAllowedBlocks = await resolveBlocksForCredential(teamId, selectedBlocks, aCredential?.blockIds || []);
+        const singleBlockChooserA = createBlockChooser(aAllowedBlocks);
         let ticketQuantityPrimedA = false;
-        const singleTargetCategoryA = singleCategoryChooserA.peekNext ? singleCategoryChooserA.peekNext() : null;
+        const singleTargetBlockA = singleBlockChooserA ? singleBlockChooserA.peekNext() : null;
+        const singleTargetCategoryA = !singleTargetBlockA && singleCategoryChooserA.peekNext ? singleCategoryChooserA.peekNext() : null;
         setStep('A.categoryBlock.select.start', {
             categoryId: singleTargetCategoryA?.id || null,
-            categoryType: singleTargetCategoryA?.categoryType || resolvedCategoryType || null,
+            categoryType: singleTargetBlockA ? null : (singleTargetCategoryA?.categoryType || resolvedCategoryType || null),
             alternativeCategory: singleTargetCategoryA?.alternativeCategory || resolvedAlternativeCategory || null,
-            categoryLabel: singleTargetCategoryA?.label || null,
-            svgBlockId: singleTargetCategoryA?.svgBlockId || null,
-            categorySelectionMode
+            categoryLabel: singleTargetBlockA ? singleTargetBlockA.label : (singleTargetCategoryA?.label || null),
+            svgBlockId: singleTargetBlockA?.svgBlockId || singleTargetCategoryA?.svgBlockId || null,
+            categorySelectionMode,
+            blockTarget: singleTargetBlockA ? { id: singleTargetBlockA.id, selectionMode: singleTargetBlockA.selectionMode } : null,
         });
-        const cbResA = await singleCategoryChooserA.choose(pageA, resolvedCategoryType, resolvedAlternativeCategory, categorySelectionMode);
+        let cbResA;
+        if (singleBlockChooserA) {
+            cbResA = await singleBlockChooserA.choose(pageA, categorySelectionMode);
+        } else {
+            cbResA = await singleCategoryChooserA.choose(pageA, resolvedCategoryType, resolvedAlternativeCategory, categorySelectionMode);
+        }
         if (cbResA && cbResA.svgBlockId) {
             try { catBlockA = { ...catBlockA, svgBlockId: cbResA.svgBlockId }; } catch {}
         }
@@ -12531,4 +12647,367 @@ async function startBotAfterValidation(req, res, validatedData) {
             logger.info('Tarayıcılar açık bırakıldı (KEEP_BROWSERS_OPEN=true)');
         }
     }
+}
+
+// ─── Snipe Mode ───────────────────────────────────────────────────────────────
+
+async function startSnipe(req, res) {
+    const { SeatCoordinator } = require('../helpers/coordinator');
+    const { fetchBlockMap } = require('../helpers/seat');
+
+    let validatedData;
+    try {
+        validatedData = snipeRequestSchema.parse(req.body);
+    } catch (error) {
+        if (error.issues && Array.isArray(error.issues)) {
+            return res.status(400).json({
+                error: 'Doğrulama hatası',
+                details: error.issues.map(e => ({ path: e.path.join('.'), message: e.message }))
+            });
+        }
+        return res.status(400).json({ error: 'Geçersiz istek' });
+    }
+
+    const runCfg = configRoot.createRunConfigFromOverrides(validatedData.panelSettings);
+    return withRunCfg(runCfg, async () => {
+        const {
+            eventAddress,
+            serieId = '',
+            targets,
+            accounts: rawAccounts,
+            aCredentialIds,
+            teamId,
+            intervalMs = 800,
+            timeoutMs = 1_800_000,
+            categorySelectionMode = 'scan',
+            proxyHost, proxyPort, proxyUsername, proxyPassword,
+        } = validatedData;
+
+        const runId = (() => {
+            try {
+                const h = typeof req?.get === 'function' ? req.get('x-run-id') : null;
+                const s = runStore.safeRunId(h);
+                if (s) return s;
+            } catch {}
+            try { return randomUUID(); } catch { return `${Date.now()}_${Math.random().toString(16).slice(2)}`; }
+        })();
+
+        // Extract eventId from URL: .../etkinlik/slug/11352322
+        const eventId = String(eventAddress || '').split('/').filter(Boolean).pop() || '';
+        if (!eventId || !/^\d+$/.test(eventId)) {
+            return res.status(400).json({ error: 'eventAddress\'den geçerli eventId çıkarılamadı' });
+        }
+
+        // Resolve accounts list (credentialIds or inline)
+        let accountList = Array.isArray(rawAccounts) && rawAccounts.length ? rawAccounts : [];
+        if (!accountList.length && Array.isArray(aCredentialIds) && aCredentialIds.length) {
+            try {
+                const creds = await credentialRepo.getManyByIds(aCredentialIds, teamId);
+                accountList = (creds || []).map(c => ({
+                    email: c.email, password: c.password,
+                    identity: c.identity || null, phone: c.phone || null,
+                }));
+            } catch (e) {
+                logger.warn('startSnipe:credential_resolve_failed', { error: e?.message });
+            }
+        }
+        if (!accountList.length) {
+            return res.status(400).json({ error: 'En az 1 hesap zorunludur' });
+        }
+
+        runStore.upsert(runId, {
+            status: 'running',
+            runMode: 'snipe',
+            eventAddress: String(eventAddress || '').slice(0, 800),
+            snipeState: {
+                accountCount: accountList.length,
+                seatsAcquired: 0,
+                activeAccounts: [],
+                coordinatorRunning: false,
+            }
+        });
+
+        res.json({ ok: true, runId, message: `Snipe modu başlatıldı — ${accountList.length} hesap, eventId: ${eventId}` });
+
+        // Async snipe execution
+        (async () => {
+            const browsers = [];
+            const accountCtxList = [];
+            const runProfileStamp = `${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+            const runProfileKey = String(runId || '').replace(/[^a-zA-Z0-9._-]/g, '_');
+
+            try {
+                // Launch & login all accounts in parallel
+                logger.info('startSnipe:launching_accounts', { runId, count: accountList.length });
+
+                const launchResults = await Promise.allSettled(
+                    accountList.map(async (acc, idx) => {
+                        const label = `snipe-${runProfileKey}-${runProfileStamp}-${idx}`;
+                        const userDataDir = getCfg().USER_DATA_DIR_A
+                            ? `${String(getCfg().USER_DATA_DIR_A).replace(/[\\\/]$/, '')}/${label}`
+                            : undefined;
+                        const ctx = await launchAndLogin({
+                            email: acc.email,
+                            password: acc.password,
+                            userDataDir,
+                            proxyHost, proxyPort, proxyUsername, proxyPassword,
+                            runId,
+                        });
+                        ctx.accountProfile = acc;
+                        ctx.email = acc.email;
+                        ctx.password = acc.password;
+                        return ctx;
+                    })
+                );
+
+                for (const result of launchResults) {
+                    if (result.status === 'fulfilled' && result.value?.page) {
+                        browsers.push(result.value.browser);
+                        accountCtxList.push(result.value);
+                    } else {
+                        logger.warn('startSnipe:account_launch_failed', {
+                            error: result.reason?.message || String(result.reason || '')
+                        });
+                    }
+                }
+
+                if (!accountCtxList.length) {
+                    logger.error('startSnipe:no_accounts_launched', { runId });
+                    runStore.upsert(runId, { status: 'error', error: 'Hiçbir hesap giriş yapamadı' });
+                    return;
+                }
+
+                // Navigate all accounts to koltuk-secim
+                const seatSelectionUrl = String(eventAddress).replace(/\/+$/, '') + '/koltuk-secim';
+                await Promise.allSettled(accountCtxList.map(async (ctx) => {
+                    try {
+                        await gotoWithRetry(ctx.page, seatSelectionUrl, {
+                            retries: 2, waitUntil: 'networkidle2',
+                            expectedUrlIncludes: '/koltuk-secim',
+                            rejectIfHome: false, backoffMs: 800,
+                        });
+                        ctx.seatSelectionUrl = seatSelectionUrl;
+                        logger.info('startSnipe:account_at_seat_selection', { email: ctx.email });
+                    } catch (e) {
+                        logger.warn('startSnipe:account_navigate_failed', { email: ctx.email, error: e?.message });
+                    }
+                }));
+
+                // Collect categoryIds from targets
+                const allCategoryIds = targets.flatMap(t => Array.isArray(t.seatCategoryIds) ? t.seatCategoryIds : []);
+
+                // Use the first available page to fetch block map
+                const monitorCtx = accountCtxList[0];
+
+                // Resolve block map: fetch from API or use explicitly provided blockIds
+                let blockMap = new Map();
+                const explicitBlockIds = targets.flatMap(t => Array.isArray(t.blockIds) ? t.blockIds : []);
+                if (explicitBlockIds.length) {
+                    // Caller provided explicit blockIds — create minimal map entries
+                    for (const blkId of explicitBlockIds) {
+                        blockMap.set(Number(blkId), {
+                            categoryId: null,
+                            categoryName: '',
+                            blockName: String(blkId),
+                        });
+                    }
+                    logger.info('startSnipe:using_explicit_blockIds', { count: blockMap.size });
+                } else {
+                    logger.info('startSnipe:fetching_block_map', { eventId, categoryCount: allCategoryIds.length });
+                    try {
+                        blockMap = await fetchBlockMap(monitorCtx.page, {
+                            eventId,
+                            serieId,
+                            categoryIds: allCategoryIds.length ? allCategoryIds : null,
+                        });
+                        logger.info('startSnipe:block_map_fetched', { blockCount: blockMap.size });
+                    } catch (e) {
+                        logger.warn('startSnipe:block_map_fetch_failed', { error: e?.message });
+                    }
+                }
+
+                if (!blockMap.size) {
+                    logger.error('startSnipe:no_blocks_to_watch', { runId });
+                    runStore.upsert(runId, { status: 'error', error: 'İzlenecek blok bulunamadı' });
+                    return;
+                }
+
+                // Merge per-target filters (use first target's filter as default)
+                const mergedFilter = targets[0]?.filter || {};
+
+                const coordinator = new SeatCoordinator({
+                    eventId, serieId, blockMap,
+                    filter: mergedFilter,
+                    intervalMs, timeoutMs,
+                });
+
+                // Register all accounts as idle
+                for (const ctx of accountCtxList) {
+                    coordinator.addAccount(ctx);
+                }
+
+                // Update run store
+                runStore.upsert(runId, {
+                    snipeState: {
+                        accountCount: accountCtxList.length,
+                        seatsAcquired: 0,
+                        activeAccounts: [],
+                        coordinatorRunning: true,
+                        blockCount: blockMap.size,
+                    }
+                });
+
+                let seatsAcquired = 0;
+
+                // Handle seat found → pick seat → return to idle
+                coordinator.on('seat_found', async ({ seatId, blockId, categoryId, categoryName, blockName, assignedCtx, markDone }) => {
+                    logger.info('startSnipe:seat_found', {
+                        runId, seatId, blockId, categoryId,
+                        email: assignedCtx.email,
+                    });
+
+                    // Update run store — mark account active
+                    try {
+                        const prev = runStore.get(runId) || {};
+                        const activeAccounts = [...(prev.snipeState?.activeAccounts || []), assignedCtx.email];
+                        runStore.upsert(runId, {
+                            snipeState: {
+                                ...(prev.snipeState || {}),
+                                activeAccounts,
+                            }
+                        });
+                    } catch {}
+
+                    let pickFailed = false;
+                    try {
+                        // Navigate account to koltuk-secim (may already be there)
+                        try {
+                            await gotoWithRetry(assignedCtx.page, seatSelectionUrl, {
+                                retries: 1, waitUntil: 'networkidle2',
+                                expectedUrlIncludes: '/koltuk-secim',
+                                rejectIfHome: false, backoffMs: 500,
+                            });
+                        } catch {}
+
+                        // Select category/block for this seat
+                        const catBlock = {
+                            categoryText: categoryName || String(categoryId || ''),
+                            blockText: blockName,
+                            blockVal: String(blockId),
+                        };
+                        try {
+                            await applyCategoryBlockSelection(
+                                assignedCtx.page,
+                                categorySelectionMode,
+                                catBlock,
+                                { svgBlockId: `block${blockId}`, blockId: String(blockId), seatId }
+                            );
+                        } catch (e) {
+                            logger.warn('startSnipe:catblock_apply_failed', { email: assignedCtx.email, error: e?.message });
+                        }
+
+                        // Pick the exact seat
+                        const seatInfo = { seatId, blockId: String(blockId), svgBlockId: `block${blockId}` };
+                        const pickedSeat = await pickExactSeatWithVerify_ReleaseAware(
+                            assignedCtx.page, seatInfo, 30_000
+                        );
+
+                        logger.info('startSnipe:seat_picked', {
+                            runId, email: assignedCtx.email,
+                            seatId: pickedSeat?.seatId || seatId, blockId,
+                        });
+
+                        seatsAcquired++;
+                        try {
+                            const prev = runStore.get(runId) || {};
+                            runStore.upsert(runId, {
+                                snipeState: {
+                                    ...(prev.snipeState || {}),
+                                    seatsAcquired,
+                                    activeAccounts: (prev.snipeState?.activeAccounts || []).filter(e => e !== assignedCtx.email),
+                                }
+                            });
+                        } catch {}
+
+                    } catch (e) {
+                        pickFailed = true;
+                        logger.warn('startSnipe:seat_pick_failed', {
+                            runId, seatId, blockId,
+                            email: assignedCtx.email,
+                            error: e?.message,
+                        });
+                        // Update store — remove from active accounts
+                        try {
+                            const prev = runStore.get(runId) || {};
+                            runStore.upsert(runId, {
+                                snipeState: {
+                                    ...(prev.snipeState || {}),
+                                    activeAccounts: (prev.snipeState?.activeAccounts || []).filter(e => e !== assignedCtx.email),
+                                }
+                            });
+                        } catch {}
+                    } finally {
+                        // Return account to idle — navigate back to koltuk-secim first
+                        try {
+                            await gotoWithRetry(assignedCtx.page, seatSelectionUrl, {
+                                retries: 1, waitUntil: 'networkidle2',
+                                expectedUrlIncludes: '/koltuk-secim',
+                                rejectIfHome: false, backoffMs: 500,
+                            });
+                        } catch {}
+                        // failed=true → seatId exclusive kilidini kaldır (başka hesap deneyebilir)
+                        markDone(pickFailed);
+                    }
+                });
+
+                coordinator.on('stopped', () => {
+                    logger.info('startSnipe:coordinator_stopped', { runId, seatsAcquired });
+                    try {
+                        const prev = runStore.get(runId) || {};
+                        runStore.upsert(runId, {
+                            status: seatsAcquired > 0 ? 'completed' : 'error',
+                            snipeState: {
+                                ...(prev.snipeState || {}),
+                                coordinatorRunning: false,
+                                seatsAcquired,
+                            }
+                        });
+                    } catch {}
+                });
+
+                coordinator.on('timeout', () => {
+                    logger.warn('startSnipe:coordinator_timeout', { runId });
+                    try {
+                        const prev = runStore.get(runId) || {};
+                        runStore.upsert(runId, {
+                            status: 'error',
+                            error: 'Snipe modu zaman aşımına uğradı',
+                            snipeState: { ...(prev.snipeState || {}), coordinatorRunning: false, seatsAcquired },
+                        });
+                    } catch {}
+                });
+
+                await coordinator.start();
+
+            } catch (topErr) {
+                logger.errorSafe('startSnipe:top_level_error', topErr, { runId });
+                try { runStore.upsert(runId, { status: 'error', error: topErr?.message || String(topErr) }); } catch {}
+            } finally {
+                // Cleanup browsers if KEEP_BROWSERS_OPEN not set
+                if (!getCfg().KEEP_BROWSERS_OPEN) {
+                    const cleanupDelay = Number(getCfg().CLEANUP_DELAY_MS) || 3000;
+                    setTimeout(async () => {
+                        for (const browser of browsers) {
+                            try {
+                                unregisterPassobotBrowser(browser);
+                                const pages = await browser.pages().catch(() => []);
+                                await Promise.all(pages.map(p => p.close().catch(() => {})));
+                                await browser.close();
+                            } catch {}
+                        }
+                    }, cleanupDelay);
+                }
+            }
+        })();
+    });
 }

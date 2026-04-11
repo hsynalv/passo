@@ -6,8 +6,10 @@
     selectedTeamId: '',
     teamSearch: '',
     categories: [],
+    blocks: [],
     credentials: [],
     selectedCategoryIds: [],
+    selectedBlockIds: [],
     aCredentialIds: [],
     aPayerCredentialIds: [],
     aTransferCredentialIds: [],
@@ -70,6 +72,15 @@
       .map((el) => String(el.value || '').trim())
       .filter(Boolean);
     state.selectedCategoryIds = values;
+  }
+
+  function syncSelectedBlockIdsFromDom() {
+    const root = $('teamBlockList');
+    if (!root) return;
+    const values = Array.from(root.querySelectorAll('input[type="checkbox"][data-block-id]:checked'))
+      .map((el) => String(el.value || '').trim())
+      .filter(Boolean);
+    state.selectedBlockIds = values;
   }
 
   function syncSelectedCredentialIdsFromDom() {
@@ -172,6 +183,79 @@
       wrap.appendChild(input);
       wrap.appendChild(meta);
       root.appendChild(wrap);
+    }
+  }
+
+  function renderBlockChecklist() {
+    const root = $('teamBlockList');
+    if (!root) return;
+    root.textContent = '';
+    if (!state.selectedTeamId) {
+      root.innerHTML = '<div class="checkListEmpty">Önce takım seç.</div>';
+      return;
+    }
+    const activeBlocks = state.blocks.filter((item) => item.isActive !== false);
+    if (!activeBlocks.length) {
+      root.innerHTML = '<div class="checkListEmpty">Bu takım için kayıtlı aktif blok yok.</div>';
+      return;
+    }
+    for (const item of activeBlocks) {
+      const wrap = document.createElement('label');
+      wrap.className = 'checkItem';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.value = item.id;
+      input.dataset.blockId = item.id;
+      input.checked = state.selectedBlockIds.includes(item.id);
+      input.addEventListener('change', () => syncSelectedBlockIdsFromDom());
+      const meta = document.createElement('div');
+      meta.className = 'checkItemMeta';
+      const title = document.createElement('strong');
+      title.textContent = item.label || item.svgBlockId || 'Blok';
+      const sub = document.createElement('span');
+      const badge = item.selectionMode === 'svg' ? '[SVG]' : '[Legacy]';
+      const detail = item.selectionMode === 'svg'
+        ? (item.svgBlockId || '')
+        : (item.categoryType || '');
+      sub.textContent = `${badge} ${detail}`;
+      meta.appendChild(title);
+      meta.appendChild(sub);
+      wrap.appendChild(input);
+      wrap.appendChild(meta);
+      root.appendChild(wrap);
+    }
+  }
+
+  function renderManageBlockList() {
+    const root = $('manageBlockList');
+    if (!root) return;
+    root.textContent = '';
+    if (!state.selectedTeamId) {
+      root.innerHTML = '<div class="itemListEmpty">Önce takım seç.</div>';
+      return;
+    }
+    if (!state.blocks.length) {
+      root.innerHTML = '<div class="itemListEmpty">Kayıtlı blok yok. Aşağıdan ekle.</div>';
+      return;
+    }
+    const escH = escapeHtml;
+    for (const item of state.blocks) {
+      const row = document.createElement('div');
+      row.className = 'categoryItem' + (item.isActive === false ? ' categoryItemInactive' : '');
+      const badge = item.selectionMode === 'svg' ? '<span class="modBadge">SVG</span>' : '<span class="modBadge modBadgeLegacy">Legacy</span>';
+      const detail = item.selectionMode === 'svg'
+        ? escH(item.svgBlockId || '')
+        : `${escH(item.categoryType || '')}${item.blockVal ? ` / ${escH(item.blockVal)}` : ''}`;
+      row.innerHTML = `
+        <div class="categoryItemMeta">
+          <strong>${escH(item.label || item.svgBlockId || 'Blok')} ${badge}</strong>
+          <span>${detail}</span>
+        </div>
+        <div class="categoryItemActions">
+          <button type="button" class="btnSecondarySmall" data-block-id="${escH(item.id)}" data-action="edit">Düzenle</button>
+          <button type="button" class="btnDangerSmall" data-block-id="${escH(item.id)}" data-action="delete">Sil</button>
+        </div>`;
+      root.appendChild(row);
     }
   }
 
@@ -480,8 +564,10 @@
     renderManageTeamList();
     renderManagerSummary();
     renderCategoryChecklist();
+    renderBlockChecklist();
     renderCredentialPickers();
     renderManageCategoryList();
+    renderManageBlockList();
     renderManageCredentialList();
   }
 
@@ -502,8 +588,10 @@
       await loadSelectedTeamData();
     } else {
       state.categories = [];
+      state.blocks = [];
       state.credentials = [];
       state.selectedCategoryIds = [];
+      state.selectedBlockIds = [];
       state.aCredentialIds = [];
       state.aPayerCredentialIds = [];
       state.aTransferCredentialIds = [];
@@ -511,8 +599,10 @@
       renderManageTeamList();
       renderManagerSummary();
       renderCategoryChecklist();
+      renderBlockChecklist();
       renderCredentialPickers();
       renderManageCategoryList();
+      renderManageBlockList();
       renderManageCredentialList();
     }
   }
@@ -526,19 +616,23 @@
   async function loadSelectedTeamData() {
     if (!state.selectedTeamId) {
       state.categories = [];
+      state.blocks = [];
       state.credentials = [];
       resetCategoryForm();
       resetCredentialForm();
       renderAll();
       return;
     }
-    const [catJson, credJson] = await Promise.all([
+    const [catJson, blockJson, credJson] = await Promise.all([
       apiJson(`/api/teams/${encodeURIComponent(state.selectedTeamId)}/categories?includeInactive=1`),
+      apiJson(`/api/teams/${encodeURIComponent(state.selectedTeamId)}/blocks?includeInactive=1`),
       apiJson(`/api/teams/${encodeURIComponent(state.selectedTeamId)}/credentials?includeInactive=1`),
     ]);
     state.categories = Array.isArray(catJson.categories) ? catJson.categories : [];
+    state.blocks = Array.isArray(blockJson.blocks) ? blockJson.blocks : [];
     state.credentials = Array.isArray(credJson.credentials) ? credJson.credentials : [];
     state.selectedCategoryIds = state.selectedCategoryIds.filter((id) => state.categories.some((item) => item.id === id && item.isActive !== false));
+    state.selectedBlockIds = state.selectedBlockIds.filter((id) => state.blocks.some((item) => item.id === id && item.isActive !== false));
     state.aCredentialIds = state.aCredentialIds.filter((id) => state.credentials.some((item) => item.id === id && item.isActive !== false));
     state.aPayerCredentialIds = state.aPayerCredentialIds.filter((id) => state.credentials.some((item) => item.id === id && item.isActive !== false) && state.aCredentialIds.includes(id));
     state.aTransferCredentialIds = state.aTransferCredentialIds.filter((id) => state.credentials.some((item) => item.id === id && item.isActive !== false) && state.aCredentialIds.includes(id) && !state.aPayerCredentialIds.includes(id));
@@ -547,8 +641,10 @@
     renderManageTeamList();
     renderManagerSummary();
     renderCategoryChecklist();
+    renderBlockChecklist();
     renderCredentialPickers();
     renderManageCategoryList();
+    renderManageBlockList();
     renderManageCredentialList();
     // Credential düzenleniyorsa picker'ı koru, değilse temizle
     const editingCredId = String($('credentialEditId').value || '').trim();
@@ -563,6 +659,11 @@
   function selectedCategoryIds() {
     syncSelectedCategoriesFromDom();
     return state.selectedCategoryIds.slice();
+  }
+
+  function getSelectedBlockIds() {
+    syncSelectedBlockIdsFromDom();
+    return state.selectedBlockIds.slice();
   }
 
   function selectedCredentialIds(role) {
@@ -708,6 +809,101 @@
     await loadSelectedTeamData();
   }
 
+  function resetBlockForm() {
+    if ($('blockEditId')) $('blockEditId').value = '';
+    if ($('blockLabelInput')) $('blockLabelInput').value = '';
+    if ($('blockSelectionMode')) $('blockSelectionMode').value = 'svg';
+    if ($('blockSvgBlockIdInput')) $('blockSvgBlockIdInput').value = '';
+    if ($('blockCategoryTypeInput')) $('blockCategoryTypeInput').value = '';
+    if ($('blockBlockValInput')) $('blockBlockValInput').value = '';
+    if ($('blockLegacyOnlyCategoryTypeInput')) $('blockLegacyOnlyCategoryTypeInput').value = '';
+    if ($('blockLegacyOnlyBlockValInput')) $('blockLegacyOnlyBlockValInput').value = '';
+    if ($('blockTicketCount')) $('blockTicketCount').value = '1';
+    if ($('blockAdjacentSeats')) $('blockAdjacentSeats').value = 'false';
+    updateBlockModeFields();
+  }
+
+  function updateBlockModeFields() {
+    const mode = $('blockSelectionMode') ? $('blockSelectionMode').value : 'svg';
+    const svgFields = $('blockSvgFields');
+    const legacyFields = $('blockLegacyFields');
+    if (svgFields) svgFields.hidden = (mode !== 'svg');
+    if (legacyFields) legacyFields.hidden = (mode !== 'legacy');
+  }
+
+  async function handleSaveBlock() {
+    if (!state.selectedTeamId) {
+      notify('Blok için önce takım seç');
+      return;
+    }
+    const mode = $('blockSelectionMode') ? $('blockSelectionMode').value : 'svg';
+    const tcRaw = $('blockTicketCount') ? parseInt($('blockTicketCount').value, 10) : 1;
+    const ticketCount = Number.isFinite(tcRaw) && tcRaw >= 1 ? Math.min(tcRaw, 10) : 1;
+    const adjacentSeats = $('blockAdjacentSeats') ? $('blockAdjacentSeats').value === 'true' : false;
+    const payload = {
+      label: String($('blockLabelInput')?.value || '').trim(),
+      selectionMode: mode,
+      isActive: true,
+      ticketCount,
+      adjacentSeats,
+    };
+    if (mode === 'svg') {
+      payload.svgBlockId = String($('blockSvgBlockIdInput')?.value || '').trim();
+      // opsiyonel legacy fallback alanları (SVG bulunamazsa kullanılır)
+      payload.categoryType = String($('blockCategoryTypeInput')?.value || '').trim();
+      payload.blockVal = String($('blockBlockValInput')?.value || '').trim();
+    } else {
+      payload.categoryType = String($('blockLegacyOnlyCategoryTypeInput')?.value || '').trim();
+      payload.blockVal = String($('blockLegacyOnlyBlockValInput')?.value || '').trim();
+    }
+    const editId = String($('blockEditId')?.value || '').trim();
+    if (editId) {
+      await apiJson(`/api/teams/${encodeURIComponent(state.selectedTeamId)}/blocks/${encodeURIComponent(editId)}`, {
+        method: 'PUT',
+        body: payload,
+      });
+      notify('Blok güncellendi', { label: payload.label });
+    } else {
+      await apiJson(`/api/teams/${encodeURIComponent(state.selectedTeamId)}/blocks`, {
+        method: 'POST',
+        body: payload,
+      });
+      notify('Blok eklendi', { label: payload.label });
+    }
+    resetBlockForm();
+    await loadSelectedTeamData();
+  }
+
+  async function handleDeleteBlock(blockId) {
+    if (!state.selectedTeamId || !blockId) return;
+    await apiJson(`/api/teams/${encodeURIComponent(state.selectedTeamId)}/blocks/${encodeURIComponent(blockId)}`, {
+      method: 'DELETE',
+    });
+    if (String($('blockEditId')?.value || '') === String(blockId)) resetBlockForm();
+    notify('Blok silindi');
+    await loadSelectedTeamData();
+  }
+
+  function fillBlockForm(blockId) {
+    const item = state.blocks.find((row) => row.id === blockId);
+    if (!item) return;
+    if ($('blockEditId')) $('blockEditId').value = item.id;
+    if ($('blockLabelInput')) $('blockLabelInput').value = item.label || '';
+    if ($('blockSelectionMode')) $('blockSelectionMode').value = item.selectionMode || 'svg';
+    if (item.selectionMode === 'svg') {
+      if ($('blockSvgBlockIdInput')) $('blockSvgBlockIdInput').value = item.svgBlockId || '';
+      if ($('blockCategoryTypeInput')) $('blockCategoryTypeInput').value = item.categoryType || '';
+      if ($('blockBlockValInput')) $('blockBlockValInput').value = item.blockVal || '';
+    } else {
+      if ($('blockLegacyOnlyCategoryTypeInput')) $('blockLegacyOnlyCategoryTypeInput').value = item.categoryType || '';
+      if ($('blockLegacyOnlyBlockValInput')) $('blockLegacyOnlyBlockValInput').value = item.blockVal || '';
+    }
+    if ($('blockTicketCount')) $('blockTicketCount').value = String(item.ticketCount || 1);
+    if ($('blockAdjacentSeats')) $('blockAdjacentSeats').value = item.adjacentSeats ? 'true' : 'false';
+    updateBlockModeFields();
+    renderManageBlockList();
+  }
+
   async function handleSaveCredential() {
     if (!state.selectedTeamId) {
       notify('Üyelik için önce takım seç');
@@ -815,6 +1011,14 @@
       state.selectedCategoryIds = [];
       renderCategoryChecklist();
     });
+    $('btnSelectAllBlocks')?.addEventListener('click', () => {
+      state.selectedBlockIds = state.blocks.filter((item) => item.isActive !== false).map((item) => item.id);
+      renderBlockChecklist();
+    });
+    $('btnClearBlocks')?.addEventListener('click', () => {
+      state.selectedBlockIds = [];
+      renderBlockChecklist();
+    });
     $('btnCreateTeam')?.addEventListener('click', async () => {
       try { await handleCreateTeam(); } catch (error) { notify('Takım kaydedilemedi', { error: error?.message || String(error) }); }
     });
@@ -859,6 +1063,35 @@
         try { await handleDeleteCategory(categoryId); } catch (error) { notify('Kategori silinemedi', { error: error?.message || String(error) }); }
       }
     });
+    $('blockSelectionMode')?.addEventListener('change', updateBlockModeFields);
+    $('btnSaveBlock')?.addEventListener('click', async () => {
+      try { await handleSaveBlock(); } catch (error) { notify('Blok kaydedilemedi', { error: error?.message || String(error) }); }
+    });
+    $('btnDeleteBlock')?.addEventListener('click', async () => {
+      const blockId = String($('blockEditId')?.value || '').trim();
+      if (!blockId) {
+        notify('Silmek için önce bir blok seç');
+        return;
+      }
+      try { await handleDeleteBlock(blockId); } catch (error) { notify('Blok silinemedi', { error: error?.message || String(error) }); }
+    });
+    $('btnResetBlock')?.addEventListener('click', () => {
+      resetBlockForm();
+      renderManageBlockList();
+    });
+    $('manageBlockList')?.addEventListener('click', async (event) => {
+      const button = event.target.closest('button[data-block-id]');
+      if (!button) return;
+      const blockId = String(button.dataset.blockId || '').trim();
+      if (!blockId) return;
+      if (button.dataset.action === 'edit') {
+        fillBlockForm(blockId);
+        return;
+      }
+      if (button.dataset.action === 'delete') {
+        try { await handleDeleteBlock(blockId); } catch (error) { notify('Blok silinemedi', { error: error?.message || String(error) }); }
+      }
+    });
     $('btnSaveCredential')?.addEventListener('click', async () => {
       try { await handleSaveCredential(); } catch (error) { notify('Üyelik kaydedilemedi', { error: error?.message || String(error) }); }
     });
@@ -892,6 +1125,7 @@
   async function init() {
     bindEvents();
     resetCategoryForm();
+    resetBlockForm();
     resetCredentialForm();
     try {
       await loadTeams({ keepSelection: false });
@@ -902,6 +1136,7 @@
 
   window.passobotCatalog = {
     getSelectedCategoryIds: selectedCategoryIds,
+    getSelectedBlockIds,
     getSelectedCredentialIds: selectedCredentialIds,
     getSelectedPayerCredentialIds: selectedPayerCredentialIds,
     getSelectedTransferCredentialIds: selectedTransferCredentialIds,

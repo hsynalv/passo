@@ -3146,4 +3146,180 @@ async function pickExactSeatWithVerify_ReleaseAware(page, target, maxMs = null) 
   }
 }
 
-module.exports = { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware, applyTicketQuantityDropdown };
+// ─── Seat Availability Watcher ───────────────────────────────────────────────
+
+/**
+ * seatInfo objesinden API integer blockId'sini çözer.
+ * SVG: svgBlockId = "block17363" → 17363
+ * Legacy: seatInfo.blockId = "14859" → 14859
+ */
+function resolveApiBlockId(seatInfo) {
+  if (!seatInfo) return null;
+  if (seatInfo.svgBlockId) {
+    const n = parseInt(String(seatInfo.svgBlockId).replace(/^block/i, ''), 10);
+    if (!isNaN(n) && n > 0) return n;
+  }
+  if (seatInfo.blockId) {
+    const n = parseInt(String(seatInfo.blockId), 10);
+    if (!isNaN(n) && n > 0) return n;
+  }
+  return null;
+}
+
+/**
+ * Belirtilen blok(lar)daki hedef koltuğun müsait olmasını bekler.
+ * page.evaluate üzerinden fetch yaparak login session'ını kullanır.
+ *
+ * @param {import('puppeteer').Page} page  - Login olmuş Puppeteer page
+ * @param {object} opts
+ * @param {string}          opts.eventId
+ * @param {string}          [opts.serieId='']
+ * @param {number[]}        opts.blockIds        - izlenecek blok ID'leri
+ * @param {number[]|null}   [opts.targetSeatIds] - null = bloktaki herhangi biri
+ * @param {number}          [opts.intervalMs=800]
+ * @param {number}          [opts.timeoutMs=300000]
+ * @param {AbortSignal}     [opts.signal]
+ * @returns {Promise<{seatId:number, blockId:number}>}
+ */
+async function startSeatAvailabilityWatcher(page, opts) {
+  const {
+    eventId,
+    serieId = '',
+    blockIds,
+    targetSeatIds = null,
+    intervalMs = 800,
+    timeoutMs = 300_000,
+    signal,
+  } = opts || {};
+
+  if (!blockIds || !blockIds.length) throw new Error('startSeatAvailabilityWatcher: blockIds gerekli');
+
+  const targetSet = targetSeatIds && targetSeatIds.length
+    ? new Set(targetSeatIds.map(Number))
+    : null;
+
+  const BASE = 'https://ticketingweb.passo.com.tr/api/passoweb';
+
+  return new Promise((resolve, reject) => {
+    let done = false;
+    let timer = null;
+    let elapsed = 0;
+
+    const finish = (result, err) => {
+      if (done) return;
+      done = true;
+      if (timer) clearInterval(timer);
+      if (err) reject(err);
+      else resolve(result);
+    };
+
+    if (signal) {
+      if (signal.aborted) { finish(null, new Error('aborted')); return; }
+      signal.addEventListener('abort', () => finish(null, new Error('aborted')));
+    }
+
+    const poll = async () => {
+      if (done) return;
+      elapsed += intervalMs;
+      if (elapsed > timeoutMs) {
+        finish(null, new Error('startSeatAvailabilityWatcher: timeout'));
+        return;
+      }
+
+      try {
+        const results = await page.evaluate(async (blocks, evId, seId, base) => {
+          return Promise.all(blocks.map(async (blockId) => {
+            try {
+              const url = `${base}/getseatstatus?eventId=${evId}&serieId=${seId}&blockId=${blockId}`;
+              const r = await fetch(url, { credentials: 'include' });
+              if (!r.ok) return { blockId, seats: null };
+              const j = await r.json();
+              return { blockId, seats: j.valueList || j.value || null };
+            } catch {
+              return { blockId, seats: null };
+            }
+          }));
+        }, blockIds, eventId, serieId, BASE);
+
+        for (const { blockId, seats } of results) {
+          if (!Array.isArray(seats)) continue;
+          for (const seat of seats) {
+            if (seat.isSold || seat.isReserved) continue;
+            const seatId = Number(seat.id);
+            if (targetSet && !targetSet.has(seatId)) continue;
+            finish({ seatId, blockId });
+            return;
+          }
+        }
+      } catch (e) {
+        // Page navigate vs. context destroy — sessizce devam et
+        logger.warn('seatAvailabilityWatcher:poll_error', { error: e?.message });
+      }
+    };
+
+    timer = setInterval(poll, intervalMs);
+    // İlk poll'u hemen çalıştır (0 bekleme)
+    poll();
+  });
+}
+
+/**
+ * Etkinliğin tüm kategorilerini ve her kategorinin blok listesini API'dan çeker.
+ * Snipe modu setup'ında bir kez çalıştırılır.
+ *
+ * @param {import('puppeteer').Page} page
+ * @param {object} opts
+ * @param {string}        opts.eventId
+ * @param {string}        [opts.serieId='']
+ * @param {number[]|null} [opts.categoryIds] - null = tüm kategoriler
+ * @returns {Promise<Map<number, {categoryId:number, categoryName:string, blockName:string}>>}
+ *          key = API blockId
+ */
+async function fetchBlockMap(page, { eventId, serieId = '', categoryIds = null }) {
+  const BASE = 'https://ticketingweb.passo.com.tr/api/passoweb';
+
+  const catRes = await page.evaluate(async (base, evId, seId) => {
+    try {
+      const url = `${base}/getcategories?eventId=${evId}&serieId=${seId}&tickettype=100&campaignId=null&validationintegrationid=null`;
+      const r = await fetch(url, { credentials: 'include' });
+      if (!r.ok) return null;
+      return r.json();
+    } catch { return null; }
+  }, BASE, eventId, serieId);
+
+  if (!catRes || !Array.isArray(catRes.valueList)) return new Map();
+
+  const categories = catRes.valueList.filter(c =>
+    !categoryIds || categoryIds.includes(Number(c.id))
+  );
+
+  const blockMap = new Map();
+
+  for (const cat of categories) {
+    const blkRes = await page.evaluate(async (base, evId, seId, catId) => {
+      try {
+        const url = `${base}/getavailableblocklist?eventId=${evId}&serieId=${seId}&seatCategoryId=${catId}`;
+        const r = await fetch(url, { credentials: 'include' });
+        if (!r.ok) return null;
+        return r.json();
+      } catch { return null; }
+    }, BASE, eventId, serieId, cat.id);
+
+    if (!blkRes || !Array.isArray(blkRes.valueList)) continue;
+
+    for (const blk of blkRes.valueList) {
+      blockMap.set(Number(blk.id), {
+        categoryId: Number(cat.id),
+        categoryName: String(cat.name || ''),
+        blockName: String(blk.name || ''),
+        totalCount: blk.totalCount || 0,
+      });
+    }
+
+    await delay(200);
+  }
+
+  return blockMap;
+}
+
+module.exports = { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware, applyTicketQuantityDropdown, resolveApiBlockId, startSeatAvailabilityWatcher, fetchBlockMap };

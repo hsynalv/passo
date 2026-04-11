@@ -6,6 +6,7 @@ const { ZodError } = require('zod');
 const rebrowserPuppeteer = require('rebrowser-puppeteer-core');
 const cfg = require('../config');
 const categoryRepo = require('../repositories/categoryRepository');
+const blockRepo = require('../repositories/blockRepository');
 const credentialRepo = require('../repositories/credentialRepository');
 const proxyRepo = require('../repositories/proxyRepository');
 const scanMapRepo = require('../repositories/scanMapRepository');
@@ -22,6 +23,7 @@ const {
   scanMapClearSchema,
   scanMapQuerySchema,
   scanMapSaveAsCategoriesSchema,
+  scanMapSaveAsBlocksSchema,
   scanMapScanRequestSchema,
   scanMapSetDefaultSchema,
 } = require('../validators/management');
@@ -764,6 +766,24 @@ async function saveScanItemsAsTeamCategories(req, res) {
   }
 }
 
+async function saveScanItemsAsTeamBlocks(req, res) {
+  try {
+    const payload = scanMapSaveAsBlocksSchema.parse(req.body || {});
+    const team = await ensureTeam(req, res, payload.teamId);
+    if (!team) return null;
+    const { created, skipped } = await blockRepo.createBlocksFromScanItems(payload.teamId, payload.items);
+    return res.status(201).json({
+      success: true,
+      count: created.length,
+      skippedCount: skipped.length,
+      skippedBlockIds: skipped,
+      blocks: created,
+    });
+  } catch (error) {
+    return handleError(res, error);
+  }
+}
+
 async function scanBlocks(req, res) {
   try {
     const payload = scanMapScanRequestSchema.parse(req.body || {});
@@ -827,6 +847,7 @@ module.exports = {
   getScanRun,
   listMappings,
   saveScanItemsAsTeamCategories,
+  saveScanItemsAsTeamBlocks,
   scanBlocks,
   scanBlocksLive,
   setDefaultMapping,

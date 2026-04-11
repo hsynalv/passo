@@ -95,6 +95,7 @@ const botRequestSchema = z.object({
   transferACredentialIds: z.array(z.string().min(1)).optional(),
   selectedCategoryIds: z.array(z.string().min(1)).optional(),
   selectedCategories: z.array(selectedCategorySchema).optional(),
+  selectedBlockIds: z.array(z.string().min(1)).optional(),
 
   cardHolder: z.string().min(1, 'Kart sahibi adı zorunludur').optional(),
   cardNumber: z.string().regex(/^[\d\s]{13,19}$/, 'Geçerli bir kart numarası giriniz (13-19 haneli)').optional(),
@@ -225,3 +226,59 @@ const botRequestSchema = z.object({
 });
 
 module.exports = { botRequestSchema };
+
+// ─── Snipe Mode Schema ────────────────────────────────────────────────────────
+
+const snipeTargetFilterSchema = z.object({
+  adjacentCount: z.number().int().min(1).optional().default(1),
+  maxPrice: z.number().nullable().optional().default(null),
+  rows: z.array(z.string()).nullable().optional().default(null),
+});
+
+const snipeTargetSchema = z.object({
+  seatCategoryIds: z.array(z.union([z.number(), z.string()]))
+    .nullable().optional()
+    .transform(v => (Array.isArray(v) ? v.map(Number) : null)),
+  blockIds: z.array(z.union([z.number(), z.string()]))
+    .nullable().optional()
+    .transform(v => (Array.isArray(v) ? v.map(Number) : null)),
+  filter: snipeTargetFilterSchema.optional().default({}),
+});
+
+const snipeRequestSchema = z.object({
+  eventAddress: z.string().url('Geçerli bir URL giriniz'),
+  serieId: z.string().optional().default(''),
+  targets: z.array(snipeTargetSchema).min(1, 'En az 1 hedef belirtilmelidir'),
+  accounts: z.array(accountSchema).min(1, 'En az 1 hesap zorunludur'),
+  aCredentialIds: z.array(z.string().min(1)).optional(),
+  teamId: z.string().optional(),
+  intervalMs: z.number().int().min(200).max(5000).optional().default(800),
+  timeoutMs: z.number().int().min(10000).optional().default(1_800_000),
+  categorySelectionMode: z.enum(['legacy', 'scan', 'svg', 'scan_map']).optional().default('scan'),
+  useProxyPool: z.union([z.boolean(), z.string()]).optional().transform(val => {
+    if (val === undefined || val === null) return true;
+    if (val === true || val === 'true') return true;
+    if (val === false || val === 'false') return false;
+    return true;
+  }),
+  proxyHost: z.string().nullable().optional(),
+  proxyPort: z.string().nullable().optional(),
+  proxyUsername: z.string().nullable().optional(),
+  proxyPassword: z.string().nullable().optional(),
+  panelSettings: z
+    .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+    .optional()
+    .transform((obj) => {
+      if (!obj || typeof obj !== 'object') return undefined;
+      const allowed = new Set(PANEL_ENV_KEYS);
+      const out = {};
+      for (const [k, v] of Object.entries(obj)) {
+        if (!allowed.has(k)) continue;
+        if (v === undefined || v === null) continue;
+        out[k] = String(v).trim();
+      }
+      return Object.keys(out).length ? out : undefined;
+    }),
+});
+
+module.exports = { botRequestSchema, snipeRequestSchema };

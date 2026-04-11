@@ -1517,6 +1517,9 @@ $('botForm').addEventListener('submit', async (e) => {
     : [];
   const selectedCategoryIdsFromDom = getCheckedCategoryIdsFromDom();
   const mergedCategoryIds = Array.from(new Set([...(selectedCategoryIds || []), ...selectedCategoryIdsFromDom]));
+  const selectedBlockIds = catalogApi && typeof catalogApi.getSelectedBlockIds === 'function'
+    ? catalogApi.getSelectedBlockIds()
+    : [];
   const aCredentialIds = catalogApi && typeof catalogApi.getSelectedCredentialIds === 'function'
     ? catalogApi.getSelectedCredentialIds('A')
     : [];
@@ -1541,6 +1544,7 @@ $('botForm').addEventListener('submit', async (e) => {
   body.teamId = selectedTeam.id;
   body.team = selectedTeam.name;
   if (mergedCategoryIds.length) body.selectedCategoryIds = mergedCategoryIds;
+  if (selectedBlockIds.length) body.selectedBlockIds = selectedBlockIds;
 
   // Öncelikli satış: kapalı → false; açık → seçilen kategori metni (Passo modal eşlemesi)
   const psRaw = String(body.prioritySale || '').trim().toLowerCase();

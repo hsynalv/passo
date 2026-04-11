@@ -200,6 +200,17 @@
                 </div>
               </div>
 
+              <div class="row">
+                <label>Seçili Bloklar</label>
+                <div class="inlineActions" style="margin-bottom:4px">
+                  <button type="button" id="btnSelectAllBlocks" class="btnMuted">Tümünü Seç</button>
+                  <button type="button" id="btnClearBlocks" class="btnMuted">Temizle</button>
+                </div>
+                <div id="teamBlockList" class="checkList">
+                  <div class="checkListEmpty">Önce takım seç.</div>
+                </div>
+              </div>
+
               <div class="details detailsOpen" style="margin-top:10px">
                 <div class="detailsTitle">Takım Üyelik Havuzu</div>
                 <div class="row2" style="margin-top:10px">
@@ -434,7 +445,8 @@
               <div class="actions">
                 <button type="button" id="btnScanMapStart">Başlat (Canlı Tarayıcı)</button>
                 <button type="button" id="btnScanMapRun">Yeniden Tara</button>
-                <button type="button" id="btnScanMapSave" class="btnMuted">Kaydet</button>
+                <button type="button" id="btnScanMapSave" class="btnMuted">Kategori Olarak Kaydet</button>
+                <button type="button" id="btnScanMapSaveAsBlocks" class="btnMuted">Blok Olarak Kaydet</button>
                 <button type="button" id="btnScanMapRefresh" class="btnMuted">Listeyi Yenile</button>
               </div>
             </section>
@@ -572,7 +584,72 @@
               </section>
 
               <section class="managerSection">
-                <h3>Üyelik Yönetimi</h3>
+                <h3>Blok Yönetimi</h3>
+                <div class="hint" style="margin-top:0">SVG haritadan veya manuel olarak blok hedefleri ekle. SVG modunda blok DOM kimliği (block17363), Legacy modda kategori metin + blok değeri kullanılır.</div>
+                <div id="manageBlockList" class="itemList">
+                  <div class="itemListEmpty">Takım seçildiğinde bloklar burada görünür.</div>
+                </div>
+                <input id="blockEditId" type="hidden" />
+                <div class="managerFormStack">
+                  <div class="row">
+                    <label>Blok Etiketi</label>
+                    <input id="blockLabelInput" type="text" placeholder="Maraton Kuzey Block 17363" />
+                  </div>
+                  <div class="row">
+                    <label>Seçim Modu</label>
+                    <select id="blockSelectionMode">
+                      <option value="svg">Normal — SVG haritadan seç (bulamazsa legacy dropdown'a geç)</option>
+                      <option value="legacy">Yalnızca Legacy — kategori + blok dropdown</option>
+                    </select>
+                  </div>
+                  <div id="blockSvgFields">
+                    <div class="row">
+                      <label>SVG Blok ID</label>
+                      <input id="blockSvgBlockIdInput" type="text" placeholder="block17363" />
+                      <div class="hint">Scan Map sonucundan veya koltuk seçim sayfası DOM'undan alınır.</div>
+                    </div>
+                    <div class="row">
+                      <label>Legacy Fallback — Kategori Metni <small>(opsiyonel)</small></label>
+                      <input id="blockCategoryTypeInput" type="text" placeholder="Maraton Alt" />
+                      <div class="hint">SVG seçim başarısız olursa bu kategori + blok değerinden legacy dropdown yoluyla seçilir.</div>
+                    </div>
+                    <div class="row">
+                      <label>Legacy Fallback — Blok Değeri <small>(opsiyonel)</small></label>
+                      <input id="blockBlockValInput" type="text" placeholder="17363" />
+                    </div>
+                  </div>
+                  <div id="blockLegacyFields" hidden>
+                    <div class="row">
+                      <label>Kategori Metni</label>
+                      <input id="blockLegacyOnlyCategoryTypeInput" type="text" placeholder="Maraton Alt" />
+                    </div>
+                    <div class="row">
+                      <label>Blok Değeri (select#blocks option value)</label>
+                      <input id="blockLegacyOnlyBlockValInput" type="text" placeholder="17363" />
+                    </div>
+                  </div>
+                  <div class="row2">
+                    <div class="row">
+                      <label>Bilet Adedi</label>
+                      <input id="blockTicketCount" type="number" min="1" max="10" value="1" />
+                    </div>
+                    <div class="row">
+                      <label>Koltuk Kuralı</label>
+                      <select id="blockAdjacentSeats">
+                        <option value="false">Yanyana olmak zorunda değil</option>
+                        <option value="true">Yanyana koltuk seç</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+                <div class="actions">
+                  <button type="button" id="btnSaveBlock">Blok Kaydet</button>
+                  <button type="button" id="btnDeleteBlock" class="btnDanger">Sil</button>
+                  <button type="button" id="btnResetBlock" class="btnMuted">Temizle</button>
+                </div>
+              </section>
+
+              <section class="managerSection">
                 <div class="hint" style="margin-top:0">Buraya eklenen üyelikler bot başlatma ekranında ana ve tutucu havuzları için seçilebilir.</div>
                 <div id="manageCredentialList" class="itemList">
                   <div class="itemListEmpty">Takım seçildiğinde üyelikler burada görünür.</div>

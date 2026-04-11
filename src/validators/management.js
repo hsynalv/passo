@@ -255,6 +255,110 @@ const scanMapSaveAsCategoriesSchema = z.object({
   items: z.array(scanMapItemSchema).min(1, 'En az bir blok gerekli'),
 });
 
+// ─── Block Schemas ────────────────────────────────────────────────────────────
+
+const blockCommonFields = {
+  label: z.string().min(1, 'Blok etiketi zorunludur'),
+  selectionMode: z.enum(['svg', 'legacy'], {
+    errorMap: () => ({ message: 'selectionMode "svg" veya "legacy" olmalıdır' }),
+  }),
+  isActive: z.boolean().optional().default(true),
+  ticketCount: z.union([z.number(), z.string()])
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val === null || val === '') return 1;
+      const n = typeof val === 'number' ? val : parseInt(String(val).trim(), 10);
+      if (!Number.isFinite(n) || n < 1) return 1;
+      return Math.min(Math.floor(n), 10);
+    }),
+  adjacentSeats: z.union([z.boolean(), z.string()])
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val === null || val === '') return false;
+      if (val === true || val === 'true' || val === '1') return true;
+      return false;
+    }),
+  sortOrder: z.union([z.number(), z.string()])
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val === null || val === '') return 0;
+      const n = typeof val === 'number' ? val : parseInt(String(val).trim(), 10);
+      return Number.isFinite(n) ? Math.floor(n) : 0;
+    }),
+};
+
+const blockPayloadSchema = z.object({
+  ...blockCommonFields,
+  // SVG fields
+  svgBlockId: z.string().optional().nullable().transform((v) => (v == null ? '' : String(v).trim())),
+  apiBlockId: z.union([z.number(), z.string()])
+    .optional()
+    .nullable()
+    .transform((val) => {
+      if (val === undefined || val === null || val === '') return undefined;
+      const n = typeof val === 'number' ? val : parseInt(String(val).trim(), 10);
+      return Number.isFinite(n) && n > 0 ? n : undefined;
+    }),
+  // Legacy fields
+  categoryType: z.string().optional().nullable().transform((v) => (v == null ? '' : String(v).trim())),
+  blockVal: z.string().optional().nullable().transform((v) => (v == null ? '' : String(v).trim())),
+}).superRefine((data, ctx) => {
+  if (data.selectionMode === 'svg') {
+    if (!String(data.svgBlockId || '').trim()) {
+      ctx.addIssue({ code: 'custom', path: ['svgBlockId'], message: 'SVG modunda svgBlockId zorunludur (ör. block17363)' });
+    }
+    // categoryType ve blockVal SVG modunda opsiyonel fallback alanları — hata oluşturmaz
+  } else {
+    if (!String(data.categoryType || '').trim()) {
+      ctx.addIssue({ code: 'custom', path: ['categoryType'], message: 'Legacy modunda categoryType zorunludur' });
+    }
+  }
+});
+
+const blockUpdatePayloadSchema = z.object({
+  label: z.string().min(1).optional(),
+  selectionMode: z.enum(['svg', 'legacy']).optional(),
+  svgBlockId: z.string().optional().nullable().transform((v) => (v == null ? undefined : String(v).trim() || undefined)),
+  apiBlockId: z.union([z.number(), z.string()])
+    .optional()
+    .nullable()
+    .transform((val) => {
+      if (val === undefined || val === null || val === '') return undefined;
+      const n = typeof val === 'number' ? val : parseInt(String(val).trim(), 10);
+      return Number.isFinite(n) && n > 0 ? n : undefined;
+    }),
+  categoryType: z.string().optional().nullable().transform((v) => (v == null ? undefined : String(v).trim() || undefined)),
+  blockVal: z.string().optional().nullable().transform((v) => (v == null ? undefined : String(v).trim() || undefined)),
+  isActive: z.boolean().optional(),
+  ticketCount: z.union([z.number(), z.string()])
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val === null || val === '') return undefined;
+      const n = typeof val === 'number' ? val : parseInt(String(val).trim(), 10);
+      if (!Number.isFinite(n) || n < 1) return 1;
+      return Math.min(Math.floor(n), 10);
+    }),
+  adjacentSeats: z.union([z.boolean(), z.string()])
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val === null || val === '') return undefined;
+      if (val === true || val === 'true' || val === '1') return true;
+      return false;
+    }),
+  sortOrder: z.union([z.number(), z.string()])
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val === null || val === '') return undefined;
+      const n = typeof val === 'number' ? val : parseInt(String(val).trim(), 10);
+      return Number.isFinite(n) ? Math.floor(n) : undefined;
+    }),
+});
+
+const scanMapSaveAsBlocksSchema = z.object({
+  teamId: objectIdLike,
+  items: z.array(scanMapItemSchema).min(1, 'En az bir blok gerekli'),
+});
+
 const scanMapSetDefaultSchema = z.object({
   teamId: objectIdLike,
   eventAddress: z.string().optional().default(''),
@@ -285,4 +389,7 @@ module.exports = {
   scanMapSaveAsCategoriesSchema,
   scanMapSetDefaultSchema,
   teamPayloadSchema,
+  blockPayloadSchema,
+  blockUpdatePayloadSchema,
+  scanMapSaveAsBlocksSchema,
 };
