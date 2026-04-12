@@ -1389,6 +1389,22 @@ const runStore = (() => {
     return { get, upsert, remove, safeRunId, list, listRunning, killAllRunning };
 })();
 
+/** /kill-sessions sonrası runStore.status === 'killed' ise launch/login beklemelerini keser. */
+function assertLaunchRunNotKilled(runId, label = '') {
+    const rid = runStore.safeRunId(runId);
+    if (!rid) return;
+    try {
+        const st = runStore.get(rid);
+        if (st && st.status === 'killed') {
+            const e = new Error(`RUN_KILLED${label ? `:${label}` : ''}`);
+            e.code = 'RUN_KILLED';
+            throw e;
+        }
+    } catch (e) {
+        if (e && e.code === 'RUN_KILLED') throw e;
+    }
+}
+
 const runLogBufferStore = (() => {
     const buffers = new Map();
     const MAX_LOGS = 2000;
@@ -3550,6 +3566,9 @@ async function launchAndLogin(options) {
     const proxyPort = opts.proxyPort;
     const proxyUsername = opts.proxyUsername;
     const proxyPassword = opts.proxyPassword;
+    const loginRunId = opts.runId;
+
+    assertLaunchRunNotKilled(loginRunId, 'enter');
 
     const {args, proxyApplied, useMinimalArgs} = buildProxyArgs(proxyHost, proxyPort);
     const chromePath = resolveBrowserExecutablePath(getCfg().CHROME_PATH);
@@ -3568,6 +3587,7 @@ async function launchAndLogin(options) {
         proxyApplied,
         chromePath: chromePath || 'not-found'
     });
+    assertLaunchRunNotKilled(loginRunId, 'before_connect');
     const ret = await connectStableBrowser({ chromePath, userDataDir, args, ignoreAllFlags: useMinimalArgs });
     const browser = ret.browser;
     let page;
@@ -3577,6 +3597,7 @@ async function launchAndLogin(options) {
         await disposeBrowserAfterFailedLogin(browser, email, ensureErr);
         throw ensureErr;
     }
+    assertLaunchRunNotKilled(loginRunId, 'after_ensure_page');
 
     try {
         try {
@@ -3599,6 +3620,7 @@ async function launchAndLogin(options) {
     }
 
     logger.debug('launchAndLogin: login sayfasına gidiliyor', { email, url: getCfg().PASSO_LOGIN });
+    assertLaunchRunNotKilled(loginRunId, 'before_login_goto');
 
     await installTurnstileSiteKeyNetworkWatcher(page);
     await installTurnstileCallbackInterceptor(page);
@@ -3710,6 +3732,7 @@ async function launchAndLogin(options) {
                 docStatus: lastLoginDoc?.status
             });
             for (let cfRound = 1; cfRound <= 3; cfRound++) {
+                assertLaunchRunNotKilled(loginRunId, `cf_recover_${cfRound}`);
                 try {
                     await delay(1600 + cfRound * 400);
                     await gotoWithRetry(page, passoHomeTrLogin, {
@@ -3750,6 +3773,7 @@ async function launchAndLogin(options) {
             lastSnap = await evalOnPage(page, snapScript);
             logger.info('launchAndLogin: çerez sonrası snapshot', { email, snap: lastSnap });
             for (let attempt = 1; attempt <= 15 && noLoginFieldsYet(lastSnap); attempt++) {
+                assertLaunchRunNotKilled(loginRunId, `shell_${attempt}`);
                 logger.warn('launchAndLogin: giriş formu henüz yok (SPA/shell), zorla yenileme', {
                     email,
                     attempt,
@@ -3865,6 +3889,7 @@ async function launchAndLogin(options) {
         const start = Date.now();
         let lastDismiss = 0;
         while (Date.now() - start < timeoutMs) {
+            assertLaunchRunNotKilled(loginRunId, 'login_form_poll');
             let ctx = await findLoginContext();
             if (ctx) return ctx;
             const now = Date.now();
@@ -3880,6 +3905,7 @@ async function launchAndLogin(options) {
 
     const ensureLoginFormWithReload = async () => {
         for (let attempt = 1; attempt <= 12; attempt++) {
+            assertLaunchRunNotKilled(loginRunId, `ensure_reload_${attempt}`);
             const ctx = await tryEnsureLoginForm(24000);
             if (ctx) return ctx;
             logger.warn('launchAndLogin: form hâlâ yok, tekrar giriş URL + yenileme', { email, attempt });
@@ -4160,6 +4186,7 @@ async function launchAndLogin(options) {
     const waitForGirisBtn = async (maxMs = 12000) => {
         const start = Date.now();
         while (Date.now() - start < maxMs) {
+            assertLaunchRunNotKilled(loginRunId, 'wait_giris_btn');
             await dismissObstructions('wait_login_btn_loop');
             const found = await evaluateSafe(evalTarget, () => {
                 var qf = document.querySelector('quick-form');
@@ -4283,6 +4310,7 @@ async function launchAndLogin(options) {
     const pollMaxMs = submitResult ? 0 : 5000;
     const pollIntervalMs = 320;
     while (Date.now() - pollStart < pollMaxMs) {
+        assertLaunchRunNotKilled(loginRunId, 'submit_poll');
         try {
             await dismissObstructions('before_click_giris');
             submitResult = await tryClickGirisBtn();
@@ -4384,6 +4412,7 @@ async function launchAndLogin(options) {
     const dismissLoginErrorModal = async () => {
         const evalTarget = loginCtx?.frame || page;
         for (let i = 0; i < 5; i++) {
+            assertLaunchRunNotKilled(loginRunId, 'dismiss_login_err');
             await delay(350);
             const dismissed = await evaluateSafe(evalTarget, () => {
                 var root = document.querySelector('.swal2-container.swal2-shown, .modal.show, [role="dialog"][aria-modal="true"]');
@@ -4532,6 +4561,17 @@ async function launchAndLogin(options) {
 
     return {browser, page};
     } catch (loginFlowErr) {
+        const rid = runStore.safeRunId(loginRunId);
+        if (rid) {
+            const st = runStore.get(rid);
+            if (st && st.status === 'killed') {
+                const k = new Error('RUN_KILLED:post_kill_abort');
+                k.code = 'RUN_KILLED';
+                k.cause = loginFlowErr;
+                await disposeBrowserAfterFailedLogin(browser, email, k);
+                throw k;
+            }
+        }
         await disposeBrowserAfterFailedLogin(browser, email, loginFlowErr);
         throw loginFlowErr;
     }
@@ -7678,6 +7718,7 @@ async function startBotAfterValidation(req, res, validatedData) {
             );
             let lastErr = null;
             for (let poolAttempt = 1; poolAttempt <= maxPoolAttempts; poolAttempt++) {
+                assertLaunchRunNotKilled(runId, `proxy_pool_${poolAttempt}`);
                 activeProxy = null;
                 fromPool = false;
                 try {
@@ -7720,6 +7761,7 @@ async function startBotAfterValidation(req, res, validatedData) {
                     }
                     return result;
                 } catch (error) {
+                    if (error && error.code === 'RUN_KILLED') throw error;
                     lastErr = error;
                     const soft = isSoftProxyLoginFailure(error?.message);
                     const retryAnotherProxy =
