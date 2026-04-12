@@ -13322,3 +13322,5 @@ async function startSnipe(req, res) {
         })();
     });
 }
+
+module.exports.handlePrioritySaleModal = handlePrioritySaleModal;

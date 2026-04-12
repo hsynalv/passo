@@ -13,7 +13,7 @@ const scanMapRepo = require('../repositories/scanMapRepository');
 const teamRepo = require('../repositories/teamRepository');
 const { gotoWithRetry, openSeatMapStrict } = require('../helpers/page');
 const { decryptSecret } = require('../utils/credentialCrypto');
-const { launchAndLogin, unregisterPassobotBrowser } = require('./botController');
+const { launchAndLogin, unregisterPassobotBrowser, handlePrioritySaleModal } = require('./botController');
 const logger = require('../utils/logger');
 const {
   isSoftProxyLoginFailure,
@@ -189,6 +189,47 @@ function deriveCategoryLabel(tooltipText = '', fallback = '') {
   return t.split(' ').slice(0, 2).join(' ').trim();
 }
 
+function firstNonEmpty(...vals) {
+  for (const v of vals) {
+    const s = String(v ?? '').trim();
+    if (s) return s;
+  }
+  return '';
+}
+
+/** Canlı / headless tarama: ana bot ile aynı handlePrioritySaleModal opts. */
+function buildScanPriorityModalOpts(payload = {}, cred = null) {
+  const ps = payload.prioritySale;
+  if (ps === false || ps === null || ps === undefined || ps === '') return null;
+  if (ps === true) return null;
+  const prioritySale = String(ps).trim();
+  if (!prioritySale) return null;
+  return {
+    prioritySale,
+    fanCardCode: firstNonEmpty(payload.fanCardCode, cred?.fanCardCode),
+    identity: firstNonEmpty(payload.identity, cred?.identity),
+    sicilNo: firstNonEmpty(payload.sicilNo, cred?.sicilNo),
+    priorityTicketCode: firstNonEmpty(payload.priorityTicketCode, cred?.priorityTicketCode),
+    priorityPhone: firstNonEmpty(payload.priorityPhone, cred?.phone),
+    priorityTckn: firstNonEmpty(payload.priorityTckn, cred?.identity),
+  };
+}
+
+function mergeScanCategoryHints(payload = {}) {
+  const base = Array.isArray(payload.categoryHints) ? payload.categoryHints : [];
+  const ps = payload.prioritySale;
+  const head = typeof ps === 'string' && ps.trim() ? [ps.trim()] : [];
+  const seen = new Set();
+  const out = [];
+  for (const h of [...head, ...base]) {
+    const s = String(h || '').trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
 async function collectBlocksFromPage(page, { maxProbe = 30, categoryHints = [] } = {}) {
   const traceLog = (typeof categoryHints?.__traceLog === 'function') ? categoryHints.__traceLog : null;
   if (traceLog) traceLog('SVG layout bekleniyor...', { maxProbe });
@@ -276,12 +317,24 @@ async function collectBlocksFromPage(page, { maxProbe = 30, categoryHints = [] }
   return out;
 }
 
-async function ensureSeatMapReadyForScan(page, eventAddress) {
-  const traceLog = arguments[2] && typeof arguments[2] === 'function' ? arguments[2] : null;
+async function ensureSeatMapReadyForScan(page, eventAddress, traceLog = null, priorityModalOpts = null) {
   const eventUrl = String(eventAddress || '').trim();
   const seatUrl = normalizeSeatUrl(eventAddress);
   if (!seatUrl) throw new Error('SCAN_EVENT_URL_REQUIRED');
   if (traceLog) traceLog('Seat map hazırlığı başladı', { eventUrl, seatUrl });
+
+  const tryPriorityModal = async (stepLabel) => {
+    if (!priorityModalOpts) return;
+    const ps = priorityModalOpts.prioritySale;
+    const shouldTry = ps === true || (typeof ps === 'string' && String(ps).trim().length > 0);
+    if (!shouldTry) return;
+    if (traceLog) traceLog(`Öncelikli satış modalı (${stepLabel})`, { prioritySale: ps });
+    try {
+      await handlePrioritySaleModal(page, priorityModalOpts);
+    } catch (e) {
+      if (traceLog) traceLog('Öncelik modalı hata', { step: stepLabel, error: e?.message || String(e) }, 'warn');
+    }
+  };
 
   const tryClickBuyOnEventPage = async () => {
     const clicked = await page.evaluate(() => {
@@ -340,6 +393,8 @@ async function ensureSeatMapReadyForScan(page, eventAddress) {
     });
   }
 
+  await tryPriorityModal('koltuk-secim');
+
   if (traceLog) traceLog('openSeatMapStrict çağrılıyor...');
   const seatMapOpened = await openSeatMapStrict(page).catch(() => false);
   if (!seatMapOpened) {
@@ -364,6 +419,7 @@ async function ensureSeatMapReadyForScan(page, eventAddress) {
       throw new Error('SCAN_SEATMAP_NOT_READY');
     }
   }
+  await tryPriorityModal('harita sonrası');
   if (traceLog) traceLog('Seat map açıldı, SVG bekleniyor...');
   await page.waitForSelector('svg.svgLayout, .svgLayout', { timeout: 30000 });
   if (traceLog) traceLog('Seat map SVG hazır');
@@ -506,10 +562,21 @@ async function pickRandomTeamCredential(teamId) {
     id: selected.id,
     email: selected.email,
     password,
+    identity: selected.identity || '',
+    phone: selected.phone || '',
+    fanCardCode: selected.fanCardCode || '',
+    sicilNo: selected.sicilNo || '',
+    priorityTicketCode: selected.priorityTicketCode || '',
   };
 }
 
-async function scanBlocksViaTooltip({ eventAddress, maxProbe = 30, categoryHints = [] }) {
+async function scanBlocksViaTooltip({
+  eventAddress,
+  maxProbe = 30,
+  categoryHints = [],
+  priorityModalOpts = null,
+  scanPayload = null,
+} = {}) {
   const executablePath = resolveBrowserExecutablePath();
   if (!executablePath) {
     throw new Error('SCAN_BROWSER_NOT_FOUND: CHROME_PATH veya tarayıcı kurulumu bulunamadı');
@@ -517,6 +584,8 @@ async function scanBlocksViaTooltip({ eventAddress, maxProbe = 30, categoryHints
 
   const seatUrl = normalizeSeatUrl(eventAddress);
   if (!seatUrl) throw new Error('SCAN_EVENT_URL_REQUIRED');
+
+  const mergedHints = scanPayload ? mergeScanCategoryHints(scanPayload) : categoryHints;
 
   const browser = await rebrowserPuppeteer.launch({
     headless: true,
@@ -527,8 +596,8 @@ async function scanBlocksViaTooltip({ eventAddress, maxProbe = 30, categoryHints
 
   try {
     const page = await browser.newPage();
-    await ensureSeatMapReadyForScan(page, eventAddress);
-    return collectBlocksFromPage(page, { maxProbe, categoryHints });
+    await ensureSeatMapReadyForScan(page, eventAddress, null, priorityModalOpts);
+    return collectBlocksFromPage(page, { maxProbe, categoryHints: mergedHints });
   } finally {
     try { await browser.close(); } catch {}
   }
@@ -545,6 +614,13 @@ async function scanBlocksLive(req, res) {
       scopeType: payload.scopeType,
       maxProbe: payload.maxProbe,
       useProxy: payload.useProxy !== false,
+      prioritySale: payload.prioritySale,
+      priorityPhone: payload.priorityPhone,
+      priorityTckn: payload.priorityTckn,
+      sicilNo: payload.sicilNo,
+      priorityTicketCode: payload.priorityTicketCode,
+      fanCardCode: payload.fanCardCode,
+      identity: payload.identity,
     });
     await scanMapRepo.upsertLiveScanRun(run).catch(() => null);
     appendLiveScanLog(run, 'Canlı scan run başlatıldı', {
@@ -648,12 +724,19 @@ async function scanBlocksLive(req, res) {
         const page = loginRet?.page || (browser ? await browser.newPage() : null);
         if (!browser || !page) throw new Error('SCAN_LOGIN_BROWSER_PAGE_NOT_READY');
         appendLiveScanLog(run, 'Login adımı tamamlandı, evente gidiliyor ve koltuk haritası açılıyor...');
-        await ensureSeatMapReadyForScan(page, payload.eventAddress, (m, meta, level) => appendLiveScanLog(run, m, meta, level));
+        const priorityModalOpts = buildScanPriorityModalOpts(payload, credential);
+        await ensureSeatMapReadyForScan(
+          page,
+          payload.eventAddress,
+          (m, meta, level) => appendLiveScanLog(run, m, meta, level),
+          priorityModalOpts
+        );
 
         appendLiveScanLog(run, 'Koltuk seçim/SVG harita hazır, block taraması başladı...');
+        const mergedHints = mergeScanCategoryHints(payload);
         const items = await collectBlocksFromPage(page, {
           maxProbe: payload.maxProbe,
-          categoryHints: Object.assign([], payload.categoryHints || [], { __traceLog: (m, mm, lv) => appendLiveScanLog(run, m, mm, lv) }),
+          categoryHints: Object.assign([], mergedHints, { __traceLog: (m, mm, lv) => appendLiveScanLog(run, m, mm, lv) }),
         });
 
         run.status = 'completed';
@@ -793,6 +876,8 @@ async function scanBlocks(req, res) {
       eventAddress: payload.eventAddress,
       maxProbe: payload.maxProbe,
       categoryHints: payload.categoryHints,
+      priorityModalOpts: buildScanPriorityModalOpts(payload, null),
+      scanPayload: payload,
     });
     return res.json({ success: true, count: items.length, items });
   } catch (error) {

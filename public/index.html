@@ -464,56 +464,110 @@
 
   <div id="scanMapModal" class="modalRoot" hidden>
     <div class="modalBackdrop" id="scanMapModalBackdrop"></div>
-    <div class="modalDialog modalDialogWide" role="dialog" aria-modal="true" aria-labelledby="scanMapModalTitle">
+    <div class="modalDialog modalDialogWide scanMapModalDialog" role="dialog" aria-modal="true" aria-labelledby="scanMapModalTitle">
       <div class="modalHead">
         <h2 id="scanMapModalTitle">Blok Haritası (Scan Map)</h2>
         <button type="button" class="modalClose" id="btnCloseScanMapModal" aria-label="Kapat">×</button>
       </div>
       <p class="modalIntro">Tooltip tabanlı blok tarama sonuçlarını takım+event bazında saklar. İleride sadece takım scope'una genişletilebilir.</p>
       <div class="modalBody">
-        <div class="managerWorkspace">
-          <aside class="managerSidebar">
-            <section class="managerSection">
+        <div class="managerWorkspace scanMapManagerWorkspace">
+          <aside class="managerSidebar scanMapSidebar">
+            <section class="managerSection scanMapSidebarSection">
               <h3>Taramayı Başlat</h3>
-              <div class="row">
-                <label>Takım</label>
-                <select id="scanMapTeamSelect">
-                  <option value="">Takım seç</option>
-                </select>
+              <div class="scanMapSidebarActions">
+                <div class="actions scanMapActionsPrimary">
+                  <button type="button" id="btnScanMapStart">Başlat (Canlı Tarayıcı)</button>
+                  <button type="button" id="btnScanMapRun">Yeniden Tara</button>
+                </div>
+                <div class="actions scanMapActionsSecondary">
+                  <button type="button" id="btnScanMapSave" class="btnMuted">Kategori Olarak Kaydet</button>
+                  <button type="button" id="btnScanMapSaveAsBlocks" class="btnMuted">Blok Olarak Kaydet</button>
+                  <button type="button" id="btnScanMapRefresh" class="btnMuted">Listeyi Yenile</button>
+                </div>
               </div>
-              <div class="row">
-                <label>Event URL</label>
-                <input id="scanMapEventAddressInput" type="url" placeholder="https://www.passo.com.tr/..." />
-              </div>
-              <div class="row2">
+              <div class="scanMapFormScroll">
                 <div class="row">
-                  <label>Scope</label>
-                  <select id="scanMapScopeSelect">
-                    <option value="team_event" selected>team_event</option>
-                    <option value="team">team</option>
+                  <label>Takım</label>
+                  <select id="scanMapTeamSelect">
+                    <option value="">Takım seç</option>
                   </select>
                 </div>
                 <div class="row">
-                  <label>Max Probe</label>
-                  <input id="scanMapMaxProbeInput" type="number" min="1" max="200" value="30" />
+                  <label>Event URL</label>
+                  <input id="scanMapEventAddressInput" type="url" placeholder="https://www.passo.com.tr/..." />
                 </div>
-              </div>
-              <div class="row">
-                <label>Kategori İpucu (ops.)</label>
-                <input id="scanMapCategoryHintInput" type="text" placeholder="100, 125, Classic" />
-              </div>
-              <div class="row">
-                <label style="display:flex;align-items:center;gap:8px;margin:0;cursor:pointer">
-                  <input id="scanMapUseProxyInput" type="checkbox" checked />
-                  <span>Canlı taramada proxy kullan</span>
-                </label>
-              </div>
-              <div class="actions">
-                <button type="button" id="btnScanMapStart">Başlat (Canlı Tarayıcı)</button>
-                <button type="button" id="btnScanMapRun">Yeniden Tara</button>
-                <button type="button" id="btnScanMapSave" class="btnMuted">Kategori Olarak Kaydet</button>
-                <button type="button" id="btnScanMapSaveAsBlocks" class="btnMuted">Blok Olarak Kaydet</button>
-                <button type="button" id="btnScanMapRefresh" class="btnMuted">Listeyi Yenile</button>
+                <div class="row2 scanMapScopeRow">
+                  <div class="row">
+                    <label>Scope</label>
+                    <select id="scanMapScopeSelect">
+                      <option value="team_event" selected>team_event</option>
+                      <option value="team">team</option>
+                    </select>
+                  </div>
+                  <div class="row">
+                    <label>Max Probe</label>
+                    <input id="scanMapMaxProbeInput" type="number" min="1" max="200" value="30" />
+                  </div>
+                </div>
+                <div class="row">
+                  <label>Kategori İpucu (ops.)</label>
+                  <input id="scanMapCategoryHintInput" type="text" placeholder="100, 125, Classic" />
+                </div>
+                <details class="details scanMapPriorityDetails">
+                  <summary class="detailsTitle scanMapDetailsSummary">Öncelikli satış (ana bot ile aynı)</summary>
+                  <div class="hint scanMapPriorityHint">Açıkken Passo öncelik modalı işlenir; alanlar boşsa seçilen üyelikteki değerler kullanılır.</div>
+                  <div class="row scanMapPriorityFirstRow">
+                    <label>Öncelik durumu</label>
+                    <select id="scanMapPrioritySaleSelect">
+                      <option value="off" selected>Kapalı</option>
+                      <option value="on">Açık</option>
+                    </select>
+                  </div>
+                  <div class="row" id="scanMapPriorityCategoryRow" hidden>
+                    <label>Öncelik kategorisi</label>
+                    <select id="scanMapPriorityCategorySelect" class="scanMapPriorityCategorySelect">
+                      <option value="">Seçin…</option>
+                      <option value="Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler">Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler</option>
+                      <option value="Kara Kartal+ Öncelikli Bilet Alım">Kara Kartal+ Öncelikli Bilet Alım</option>
+                      <option value="GS PLUS Premium">GS PLUS Premium</option>
+                      <option value="GSPara Öncelik">GSPara Öncelik</option>
+                    </select>
+                  </div>
+                  <details class="details divanPriorityFields scanMapNestedDetails" id="scanMapGsPlusPriorityFieldsDetails" hidden>
+                    <summary class="detailsTitle scanMapDetailsSummary">GS PLUS Premium — cep (ops.)</summary>
+                    <div class="row scanMapNestedFirstRow">
+                      <label>Cep telefonu</label>
+                      <input id="scanMapPriorityPhoneInput" type="tel" inputmode="tel" autocomplete="off" placeholder="Üyelikteki veya buraya" />
+                    </div>
+                  </details>
+                  <details class="details divanPriorityFields scanMapNestedDetails" id="scanMapGsParaPriorityFieldsDetails" hidden>
+                    <summary class="detailsTitle scanMapDetailsSummary">GSPara Öncelik — TCKN (ops.)</summary>
+                    <div class="row scanMapNestedFirstRow">
+                      <label>T.C. kimlik no</label>
+                      <input id="scanMapPriorityTcknInput" type="text" inputmode="numeric" autocomplete="off" placeholder="11 hane" maxlength="11" />
+                    </div>
+                  </details>
+                  <details class="details divanPriorityFields scanMapNestedDetails" id="scanMapDivanPriorityFieldsDetails" hidden>
+                    <summary class="detailsTitle scanMapDetailsSummary">Divan — sicil / kod (ops.)</summary>
+                    <div class="scanMapDivanGrid">
+                      <div class="row">
+                        <label>Sicil No</label>
+                        <input id="scanMapPrioritySicilNoInput" type="text" autocomplete="off" placeholder="TXXXX" />
+                      </div>
+                      <div class="row">
+                        <label>Öncelikli bilet kodu</label>
+                        <input id="scanMapPriorityTicketCodeInput" type="text" autocomplete="off" />
+                      </div>
+                    </div>
+                  </details>
+                </details>
+                <div class="row scanMapProxyRow">
+                  <label class="scanMapProxyChkLabel">
+                    <input id="scanMapUseProxyInput" type="checkbox" checked />
+                    <span>Canlı taramada proxy kullan</span>
+                  </label>
+                </div>
               </div>
             </section>
           </aside>

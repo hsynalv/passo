@@ -41,6 +41,62 @@
       .replace(/"/g, '&quot;');
   }
 
+  const SCAN_MAP_DIVAN = 'Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler';
+  const SCAN_MAP_GS_PLUS = 'GS PLUS Premium';
+  const SCAN_MAP_GSPARA = 'GSPara Öncelik';
+
+  function syncScanMapPriorityUi() {
+    const main = $('scanMapPrioritySaleSelect');
+    const row = $('scanMapPriorityCategoryRow');
+    const divanDetails = $('scanMapDivanPriorityFieldsDetails');
+    const gsPlusDetails = $('scanMapGsPlusPriorityFieldsDetails');
+    const gsParaDetails = $('scanMapGsParaPriorityFieldsDetails');
+    const cat = $('scanMapPriorityCategorySelect');
+    if (!main || !row || !cat || !divanDetails || !gsPlusDetails || !gsParaDetails) return;
+    const on = String(main.value || '').trim().toLowerCase() === 'on';
+    row.hidden = !on;
+    if (!on) {
+      gsPlusDetails.hidden = true;
+      gsParaDetails.hidden = true;
+      divanDetails.hidden = true;
+      return;
+    }
+    const catVal = String(cat.value || '').trim();
+    gsPlusDetails.hidden = catVal !== SCAN_MAP_GS_PLUS;
+    gsParaDetails.hidden = catVal !== SCAN_MAP_GSPARA;
+    divanDetails.hidden = catVal !== SCAN_MAP_DIVAN;
+  }
+
+  function mirrorMainPriorityIntoScanMap() {
+    try {
+      const mSale = document.getElementById('prioritySaleSelect');
+      const sSale = $('scanMapPrioritySaleSelect');
+      if (mSale && sSale) sSale.value = mSale.value === 'on' ? 'on' : 'off';
+      const mCat = document.getElementById('prioritySaleCategorySelect');
+      const sCat = $('scanMapPriorityCategorySelect');
+      if (mCat && sCat) sCat.value = String(mCat.value || '');
+      const mPh = document.getElementById('priorityPhoneInput');
+      if (mPh && $('scanMapPriorityPhoneInput')) $('scanMapPriorityPhoneInput').value = mPh.value || '';
+      const mTck = document.getElementById('priorityTcknInput');
+      if (mTck && $('scanMapPriorityTcknInput')) $('scanMapPriorityTcknInput').value = mTck.value || '';
+      const divanRoot = document.getElementById('divanPriorityFieldsDetails');
+      if (divanRoot) {
+        const sicIn = divanRoot.querySelector('input[name="sicilNo"]');
+        const tIn = divanRoot.querySelector('input[name="priorityTicketCode"]');
+        if (sicIn && $('scanMapPrioritySicilNoInput')) $('scanMapPrioritySicilNoInput').value = sicIn.value || '';
+        if (tIn && $('scanMapPriorityTicketCodeInput')) $('scanMapPriorityTicketCodeInput').value = tIn.value || '';
+      }
+    } catch {}
+    syncScanMapPriorityUi();
+  }
+
+  function ensurePriorityCategoryIfOn() {
+    const main = $('scanMapPrioritySaleSelect');
+    const cat = $('scanMapPriorityCategorySelect');
+    if (!main || String(main.value || '').trim().toLowerCase() !== 'on') return true;
+    return !!String(cat?.value || '').trim();
+  }
+
   function openModal() {
     const root = $('scanMapModal');
     if (root) root.hidden = false;
@@ -149,7 +205,28 @@
       .map((s) => String(s || '').trim())
       .filter(Boolean);
     const useProxy = !!$('scanMapUseProxyInput')?.checked;
-    return { teamId, eventAddress, scopeType, maxProbe, categoryHints, useProxy };
+    let prioritySale = false;
+    const priSel = $('scanMapPrioritySaleSelect');
+    const priCat = $('scanMapPriorityCategorySelect');
+    if (priSel && String(priSel.value || '').trim().toLowerCase() === 'on') {
+      const c = String(priCat?.value || '').trim();
+      if (c) prioritySale = c;
+    }
+    return {
+      teamId,
+      eventAddress,
+      scopeType,
+      maxProbe,
+      categoryHints,
+      useProxy,
+      prioritySale,
+      priorityPhone: String($('scanMapPriorityPhoneInput')?.value || '').trim(),
+      priorityTckn: String($('scanMapPriorityTcknInput')?.value || '').trim(),
+      sicilNo: String($('scanMapPrioritySicilNoInput')?.value || '').trim(),
+      priorityTicketCode: String($('scanMapPriorityTicketCodeInput')?.value || '').trim(),
+      fanCardCode: '',
+      identity: '',
+    };
   }
 
   function syncTeamAndEventDefaults() {
@@ -276,6 +353,10 @@
       alert('Takım seç');
       return;
     }
+    if (!ensurePriorityCategoryIfOn()) {
+      alert('Öncelik açıkken öncelik kategorisi seç');
+      return;
+    }
     if (!form.eventAddress) {
       alert('Etkinlik URL gir (tarama için zorunlu)');
       return;
@@ -293,6 +374,10 @@
     const form = getForm();
     if (!form.teamId) {
       alert('Takım seç');
+      return;
+    }
+    if (!ensurePriorityCategoryIfOn()) {
+      alert('Öncelik açıkken öncelik kategorisi seç');
       return;
     }
     if (!form.eventAddress) {
@@ -419,6 +504,7 @@
     $('btnOpenScanMapManager')?.addEventListener('click', async () => {
       openModal();
       clearLiveRunUi();
+      mirrorMainPriorityIntoScanMap();
       try {
         await loadTeams();
         await loadMappings();
@@ -439,6 +525,9 @@
     $('scanMapEventAddressInput')?.addEventListener('change', () => {
       loadMappings().catch((e) => notify('Kayıtlar yüklenemedi', { error: e?.message || String(e) }));
     });
+
+    $('scanMapPrioritySaleSelect')?.addEventListener('change', syncScanMapPriorityUi);
+    $('scanMapPriorityCategorySelect')?.addEventListener('change', syncScanMapPriorityUi);
 
     $('btnScanMapRun')?.addEventListener('click', async () => {
       try { await runScan(); } catch (e) { alert(e?.message || String(e)); }
@@ -478,6 +567,7 @@
   function init() {
     bindEvents();
     clearLiveRunUi();
+    syncScanMapPriorityUi();
   }
 
   window.passobotScanMap = {

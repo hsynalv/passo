@@ -219,6 +219,20 @@ const scanMapScanRequestSchema = z.object({
     if (!Number.isFinite(n) || n < 1) return 30;
     return Math.min(200, Math.floor(n));
   }),
+  /** Ana bot ile aynı: false/kapalı veya Passo öncelik kategori metni. */
+  prioritySale: z.union([z.boolean(), z.string()]).optional().transform((val) => {
+    if (val === undefined || val === null || val === '') return false;
+    if (val === 'off' || val === false || val === 'false') return false;
+    if (val === 'on' || val === true || val === 'true') return true;
+    const s = String(val).trim();
+    return s.length ? s : false;
+  }),
+  priorityPhone: z.string().optional().default(''),
+  priorityTckn: z.string().optional().default(''),
+  sicilNo: z.string().optional().default(''),
+  priorityTicketCode: z.string().optional().default(''),
+  fanCardCode: z.string().optional().default(''),
+  identity: z.string().optional().default(''),
 }).superRefine((data, ctx) => {
   const raw = String(data.eventAddress || '').trim();
   if (!raw) {
@@ -229,6 +243,9 @@ const scanMapScanRequestSchema = z.object({
     void new URL(raw);
   } catch {
     ctx.addIssue({ code: 'custom', path: ['eventAddress'], message: 'Etkinlik URL gecersiz' });
+  }
+  if (data.prioritySale === true) {
+    ctx.addIssue({ code: 'custom', path: ['prioritySale'], message: 'Oncelik acikken kategori metni gonder (ana bottaki liste ile ayni deger).' });
   }
 });
 
