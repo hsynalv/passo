@@ -1427,7 +1427,12 @@ const runLogBufferStore = (() => {
         if (!key) return false;
         return buffers.delete(key);
     };
-    return { get, append, remove };
+    const clearAll = () => {
+        try {
+            buffers.clear();
+        } catch {}
+    };
+    return { get, append, remove, clearAll };
 })();
 
 /** Panel "aktif oturumları kapat" — tüm Puppeteer oturumlarını buradan kapatır */
@@ -2063,6 +2068,27 @@ async function killSessions(req, res) {
         try { logger.warnSafe('KILL_SESSIONS: tarayıcı kapatma hatası', e); } catch {}
     }
 
+    // Bellekteki oturum önbellekleri (log kuyruğu, Turnstile semaphore havuzu) — yalnızca Node süreci kalsın istenen durum.
+    try {
+        runLogBufferStore.clearAll();
+    } catch (e) {
+        try { logger.warnSafe('KILL_SESSIONS: runLogBufferStore.clearAll', e); } catch {}
+    }
+    try {
+        for (const r of runStore.list()) {
+            if (r && r.runId) {
+                runStore.upsert(r.runId, { logCount: 0, logTail: [] });
+            }
+        }
+    } catch (e) {
+        try { logger.warnSafe('KILL_SESSIONS: runStore logTail sıfırlama', e); } catch {}
+    }
+    try {
+        turnstileSemCache.clear();
+    } catch (e) {
+        try { logger.warnSafe('KILL_SESSIONS: turnstileSemCache.clear', e); } catch {}
+    }
+
     // Log separator for visual distinction in logs
     logger.info('==================================================');
     logger.info('KILL_SESSIONS: Aktif oturumlar kapatılıyor', {
@@ -2081,7 +2107,8 @@ async function killSessions(req, res) {
         killedCount: killedRunIds.length,
         killedRunIds,
         runningCount: running.length,
-        browsersClosed: browserCloseCount
+        browsersClosed: browserCloseCount,
+        cachesCleared: true
     });
 }
 

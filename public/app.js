@@ -848,11 +848,26 @@ async function killSessions() {
     const resp = await fetch('/kill-sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      cache: 'no-store',
     });
     const json = await resp.json();
     if (resp.ok) {
       clearLogs();
+      try {
+        if (runStatusRefreshTimer) clearTimeout(runStatusRefreshTimer);
+      } catch {}
+      runStatusRefreshTimer = null;
+      currentRunId = null;
+      if (runIdEl) runIdEl.textContent = '-';
+      if (runStatusEl) runStatusEl.textContent = '-';
+      try {
+        renderPairDashboard(null);
+      } catch {}
+      setActiveStep('setup');
       infoLine(`Aktif oturumlar kapatıldı: ${json.killedCount} oturum`);
+      try {
+        document.dispatchEvent(new CustomEvent('passobot:sessions-killed', { detail: json }));
+      } catch {}
     } else {
       infoLine('Oturum kapatma hatası', { error: json.error || 'unknown' });
     }
@@ -1862,6 +1877,18 @@ try {
     logEl.scrollTop = logEl.scrollHeight;
   }
 
+  document.addEventListener('passobot:sessions-killed', () => {
+    stopTimer();
+    setRunning(false);
+    snipeRunId = null;
+    lastLoggedTick = 0;
+    if (logEl) logEl.textContent = '';
+    if (pollRow) pollRow.hidden = true;
+    if (pollSummary) pollSummary.textContent = '—';
+    if (statElapsed) statElapsed.textContent = '0:00';
+    if (statSeats) statSeats.textContent = '0';
+  });
+
   function renderBlocks() {
     if (!blocksList) return;
     if (!_blocks.length) {
@@ -2103,11 +2130,9 @@ try {
   }
 
   async function stopSnipe() {
-    if (!snipeRunId) { setRunning(false); stopTimer(); return; }
     try {
-      // Tüm aktif oturumları sonlandır (tek bir snipe run çalışıyorsa etkili)
-      await fetch('/kill-sessions', { method: 'POST' });
-      log('Tarama durduruldu (oturumlar kapatıldı).', 'warn');
+      await killSessions();
+      log('Tüm aktif oturumlar kapatıldı (ana bot + tarama).', 'warn');
     } catch (e) {
       log('Durdurma hatası: ' + e?.message, 'err');
     }

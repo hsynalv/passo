@@ -5,24 +5,45 @@ const { openSeatMapStrict, readBasketData, clickContinueInsidePage, ensureUrlCon
 const logger = require('../utils/logger');
 const { confirmSwalYes } = require('./swal');
 
-/** Koltuk haritasında ardışık tıklamalar arasında Turnstile token’ı için kısa bekle (çift sepet / çift seçim riski). */
+/** Koltuk haritasında Turnstile hazır olana kadar bekle; ensure’i seyrekleştir (ardışık çağrı çoklu widget üretir). */
 async function awaitTurnstileGapForSeatMap(page, context, email, ensureTurnstileFn, tag) {
   if (!page) return;
-  const maxMs = 6500;
-  const poll = 300;
+  const maxMs = 9000;
+  const poll = 420;
   const t0 = Date.now();
+  let lastEnsureAt = 0;
+  const minEnsureGapMs = 3400;
   while (Date.now() - t0 < maxMs) {
     const st = await page.evaluate(() => {
-      const w = !!document.querySelector('.cf-turnstile');
+      const widgets = document.querySelectorAll('.cf-turnstile');
       const f = document.querySelector('input[name="cf-turnstile-response"]');
       const tok = f && f.value && String(f.value).length >= 80;
-      return { hasWidget: w, hasToken: tok };
-    }).catch(() => ({ hasWidget: false, hasToken: true }));
+      return { widgetCount: widgets.length, hasWidget: widgets.length > 0, hasToken: tok };
+    }).catch(() => ({ widgetCount: 0, hasWidget: false, hasToken: true }));
+    if (st.hasToken) {
+      await delay(320);
+      return;
+    }
+    if (st.widgetCount > 1 && typeof ensureTurnstileFn === 'function' && email) {
+      try {
+        logger.warn(`seatPick:${context}:turnstile_multiple_widgets`, { count: st.widgetCount, tag });
+      } catch {}
+      try {
+        await ensureTurnstileFn(page, email, `seatPick:${context}:mapGapDedupe:${tag}`, { background: false, recaptchaFallback: false });
+      } catch {}
+      lastEnsureAt = Date.now();
+      await delay(1100);
+      continue;
+    }
     if (st.hasWidget && !st.hasToken) {
       if (typeof ensureTurnstileFn === 'function' && email) {
-        try {
-          await ensureTurnstileFn(page, email, `seatPick:${context}:mapGap:${tag}`, { background: true, recaptchaFallback: false });
-        } catch {}
+        const now = Date.now();
+        if (!lastEnsureAt || (now - lastEnsureAt) >= minEnsureGapMs) {
+          lastEnsureAt = now;
+          try {
+            await ensureTurnstileFn(page, email, `seatPick:${context}:mapGap:${tag}`, { background: true, recaptchaFallback: false });
+          } catch {}
+        }
       }
       await delay(poll);
       continue;
@@ -30,6 +51,11 @@ async function awaitTurnstileGapForSeatMap(page, context, email, ensureTurnstile
     await delay(380);
     return;
   }
+}
+
+/** Koltuk tıklamadan önce: token yoksa bir kez toparla (döngü içi spam’i önler). */
+async function awaitTurnstileBeforeSeatClick(page, context, email, ensureTurnstileFn) {
+  await awaitTurnstileGapForSeatMap(page, context, email, ensureTurnstileFn, 'beforeSeatClick');
 }
 
 const SELECTED_SEAT_SELECTOR = (
@@ -273,11 +299,6 @@ async function clickSeatById(page, seatId) {
         fireOn(g || r, t);
         if (r !== g) fireOn(r, t);
       }
-      // Then mirror to top element (if different) so page-level listeners still trigger.
-      if (topEl && topEl !== r && topEl !== g) {
-        for (const t of seq) fireOn(topEl, t);
-      }
-      try { if (typeof (g || r).click === 'function') (g || r).click(); } catch {}
       const topTxt = (() => {
         try {
           const t = (topEl?.innerText || topEl?.textContent || '').toString().trim().slice(0, 80);
@@ -297,7 +318,15 @@ async function clickSeatById(page, seatId) {
             at: Date.now()
           };
         } catch {}
+        // Turnstile / captcha üzerine synthetic event gönderme — Passo ek doğrulama widget'ı açabiliyor.
+        try { if (typeof (g || r).click === 'function') (g || r).click(); } catch {}
+        return true;
       }
+      // Normal overlay: üst elemana da yansıt (dinleyiciler için).
+      if (topEl && topEl !== r && topEl !== g) {
+        for (const t of seq) fireOn(topEl, t);
+      }
+      try { if (typeof (g || r).click === 'function') (g || r).click(); } catch {}
       return true;
     }, String(seatId));
     return !!ok;
@@ -2251,6 +2280,10 @@ async function pickRandomSeatWithVerify(page, maxMs = null, options = null){
             lockedSeat = clickInfo;
             logger.info(`seatPick:${context}:locked`, { seatId: clickInfo.seatId, row: clickInfo.row || null, seat: clickInfo.seat || null, mode: seatSelectionMode, x: clickInfo.x, y: clickInfo.y });
           }
+
+          try {
+            await awaitTurnstileBeforeSeatClick(page, context, email, ensureTurnstileFn);
+          } catch {}
 
           // Prefer deterministic click by seatId when available.
           let clicked = false;

@@ -1,0 +1,6 @@
+{"at":"2026-04-12T14:39:24.829Z","level":"info","message":"Canlı scan run başlatıldı","meta":{"teamId":"69c4fa867ee985a07152cc56","eventAddress":"https://www.passo.com.tr/tr/etkinlik/fenerbahce-rizespor-super-lig-mac-bileti/11396319","maxProbe":100}}
+{"at":"2026-04-12T14:39:24.832Z","level":"info","message":"Rastgele takım hesabı seçiliyor...","meta":{}}
+{"at":"2026-04-12T14:39:24.841Z","level":"info","message":"Hesap seçildi","meta":{"email":"eikowinkler@aj.com.tr","credentialId":"69c4fad57ee985a07152cc5e"}}
+{"at":"2026-04-12T14:39:24.845Z","level":"info","message":"Passo login + turnstile/captcha çözüm adımları başlatıldı...","meta":{}}
+{"at":"2026-04-12T14:39:24.844Z","level":"info","message":"Tarayıcı açılıyor (ana bot akışı)...","meta":{"profileDir":"C:\\Users\\alavh\\AppData\\Local\\Temp\\passo-scan-live-QmE25P"}}
+{"at":"2026-04-12T14:39:24.863Z","level":"info","message":"Proxy seçildi","meta":{"proxyId":"69d4eb86a1e40b627283fc5f","proxy":"142.111.67.146:5611","protocol":"http","proxyAttempt":1,"maxProxyAttempts":4}}
