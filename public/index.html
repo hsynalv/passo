@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="tr">
 <head>
   <meta charset="utf-8" />
@@ -796,6 +796,11 @@
           <aside class="credentialFormAside">
             <h3 id="credentialFormTitle">Üyelik Ekle</h3>
             <input id="credentialEditId" type="hidden" />
+            <div class="catalogFormActions">
+              <button type="button" id="btnSaveCredential" class="btnPrimary">Kaydet</button>
+              <button type="button" id="btnDeleteCredential" class="btnDanger">Sil</button>
+              <button type="button" id="btnResetCredential" class="btnMuted">Temizle</button>
+            </div>
             <div class="credentialFormFields">
               <div class="row">
                 <label>Email</label>
@@ -837,11 +842,6 @@
                 <label>Atanmış Kategoriler <small>(boşsa tümünden alır)</small></label>
                 <div id="credentialCategoryPicker" class="checkList checkListCatalogCredentialCats"></div>
               </div>
-            </div>
-            <div class="catalogFormActions">
-              <button type="button" id="btnSaveCredential" class="btnPrimary">Kaydet</button>
-              <button type="button" id="btnDeleteCredential" class="btnDanger">Sil</button>
-              <button type="button" id="btnResetCredential" class="btnMuted">Temizle</button>
             </div>
           </aside>
 

@@ -32,6 +32,7 @@ const { BasketTimer, checkBasketTimeoutFromPage } = require('../utils/basketTime
 const {confirmSwalYes, clickRemoveFromCartAndConfirm} = require('../helpers/swal');
 const { captureSeatIdFromNetwork, readBasketData, readCatBlock, setCatBlockOnB, openSeatMapStrict, clickContinueInsidePage, gotoWithRetry, ensureUrlContains, isHomeUrl, SEAT_NODE_SELECTOR, ensureTcAssignedOnBasket, clickBasketDevamToOdeme, dismissPaymentInfoModalIfPresent, fillInvoiceTcAndContinue, acceptAgreementsAndContinue, fillNkolayPaymentIframe } = require('../helpers/page');
 const { pickRandomSeatWithVerify, pickExactSeatWithVerify_Locked, waitForTargetSeatReady, pickExactSeatWithVerify_ReleaseAware, applyTicketQuantityDropdown, resolveApiBlockId, startSeatAvailabilityWatcher } = require('../helpers/seat');
+const { buildPassoApiCookieHeader } = require('../helpers/passoSessionCookies');
 
 function normalizeSelectedCategory(item, fallbackMode = 'scan') {
     if (!item || typeof item !== 'object') return null;
@@ -3157,6 +3158,26 @@ async function getcaptchaGuid() {
         logger.warn('getcaptchaGuid: hata', { error: e?.message });
         return null;
     }
+}
+
+/**
+ * Snipe sırasında sayfa içi fetch('/api/passoweb/...') same-origin olmalı.
+ * www etkinlik URL'sini ticketingweb host'una taşır (path/query korunur).
+ */
+function seedTicketingWebUrlForSnipePoll(eventAddress) {
+    const tw = (getCfg().TICKETING_API_BASE || 'https://ticketingweb.passo.com.tr').replace(/\/$/, '');
+    const s = String(eventAddress || '').trim();
+    if (!s) return `${tw}/`;
+    try {
+        const u = new URL(s);
+        const h = u.hostname.toLowerCase();
+        if (h === 'www.passo.com.tr' || h === 'passo.com.tr') {
+            u.hostname = 'ticketingweb.passo.com.tr';
+            return u.toString();
+        }
+        if (h === 'ticketingweb.passo.com.tr') return s;
+    } catch {}
+    return `${tw}/`;
 }
 
 /**
@@ -12810,8 +12831,9 @@ async function startSnipe(req, res) {
             accounts: rawAccounts,
             aCredentialIds,
             teamId,
-            intervalMs = 800,
+            intervalMs = 1400,
             timeoutMs = 1_800_000,
+            pollConcurrency = 4,
             categorySelectionMode = 'scan',
             proxyHost, proxyPort, proxyUsername, proxyPassword,
         } = validatedData;
@@ -12927,9 +12949,9 @@ async function startSnipe(req, res) {
                 }
 
                 // Poll için koltuk-secim'e GİTME — Passo SPA orada frame detach yapar.
-                // Polling tamamen Node.js axios ile yapılır; browser frame'e dokunulmaz.
-                // Hesapları login sonrası nerede olursa olsun bırak, cookie'leri extract et.
+                // Polling: sayfa içi fetch same-origin olmalı → önce ticketingweb seed URL.
                 const seatSelectionUrl = String(eventAddress).replace(/\/+$/, '') + '/koltuk-secim';
+                const ticketingSeedUrl = seedTicketingWebUrlForSnipePoll(eventAddress);
                 await Promise.allSettled(accountCtxList.map(async (ctx) => {
                     try {
                         // Şu anki URL etkinlik sayfasıysa yeniden navigate etmeye gerek yok
@@ -12943,20 +12965,41 @@ async function startSnipe(req, res) {
                         }
                         ctx.seatSelectionUrl = seatSelectionUrl;
                         logger.info('startSnipe:account_at_event_page', { email: ctx.email, url: eventAddress });
+                        try {
+                            await gotoWithRetry(ctx.page, ticketingSeedUrl, {
+                                retries: 2,
+                                waitUntil: 'domcontentloaded',
+                                rejectIfHome: false,
+                                backoffMs: 500,
+                            });
+                            logger.info('startSnipe:account_at_ticketingweb_for_poll', {
+                                email: ctx.email,
+                                url: ticketingSeedUrl,
+                            });
+                        } catch (e) {
+                            logger.warn('startSnipe:ticketingweb_seed_nav_failed', {
+                                email: ctx.email,
+                                error: e?.message,
+                            });
+                        }
                     } catch (e) {
                         logger.warn('startSnipe:account_navigate_failed', { email: ctx.email, error: e?.message });
                     }
 
-                    // Cookie'leri şimdi extract et — coordinator poll'larında frame'e dokunmak yerine kullanılacak.
+                    // Cookie'leri www + ticketingweb için topla (yalnızca aktif sayfa domain'i yetmez).
                     try {
-                        const cookieArr  = await ctx.page.cookies();
-                        ctx.cookieString = cookieArr.map(c => `${c.name}=${c.value}`).join('; ');
-                        logger.info('startSnipe:cookies_extracted', { email: ctx.email, count: cookieArr.length });
+                        ctx.cookieString = await buildPassoApiCookieHeader(ctx.page);
+                        const pairs = (ctx.cookieString || '').split(';').filter(Boolean).length;
+                        logger.info('startSnipe:cookies_extracted', { email: ctx.email, cookiePairs: pairs });
                     } catch (e) {
                         ctx.cookieString = '';
                         logger.warn('startSnipe:cookie_extract_failed', { email: ctx.email, error: e?.message });
                     }
                 }));
+
+                // ticketingweb SPA token/localStorage dolsun — getseatstatus 401 InComingToken azaltır
+                await delay(1000);
+                logger.info('startSnipe:ticketingweb_bootstrap_wait', { ms: 1000 });
 
                 // Collect categoryIds from targets
                 const allCategoryIds = targets.flatMap(t => Array.isArray(t.seatCategoryIds) ? t.seatCategoryIds : []);
@@ -13037,7 +13080,7 @@ async function startSnipe(req, res) {
                 const coordinator = new SeatCoordinator({
                     eventId, serieId, blockMap,
                     filter: mergedFilter,
-                    intervalMs, timeoutMs,
+                    intervalMs, timeoutMs, pollConcurrency,
                 });
 
                 // Register all accounts as idle

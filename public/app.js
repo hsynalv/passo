@@ -1932,7 +1932,17 @@ try {
     if (t.httpNot200) parts.push(`HTTP≠200: ${t.httpNot200}`);
     if (t.networkErrors) parts.push(`ağ hatası: ${t.networkErrors}`);
     if (t.incompletePoll) parts.push('eksik istek turu');
-    return parts.filter(Boolean).join(' · ');
+    if (t.pollHint) parts.push(String(t.pollHint).slice(0, 220) + (String(t.pollHint).length > 220 ? '…' : ''));
+    const line = parts.filter(Boolean).join(' · ');
+    if (Array.isArray(t.responseSamples) && t.responseSamples.length) {
+      const s0 = t.responseSamples[0];
+      const pv = String(s0.bodyPreview || '').replace(/\s+/g, ' ').trim();
+      if (pv) {
+        const clip = pv.length > 200 ? `${pv.slice(0, 200)}…` : pv;
+        return `${line} · örnek [blok ${s0.blockId} HTTP ${s0.httpStatus ?? '—'}]: ${clip}`;
+      }
+    }
+    return line;
   }
 
   function tickLogClass(t) {

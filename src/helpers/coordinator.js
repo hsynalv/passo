@@ -1,12 +1,78 @@
 'use strict';
 
 const EventEmitter = require('events');
-const axios        = require('axios');
 const logger       = require('../utils/logger');
+const delay        = require('../utils/delay');
+const { evaluateSafe } = require('../utils/browserEval');
 
-// HTTPS keep-alive ile bağlantı havuzu — her poll için yeni bağlantı açılmaz.
-const { Agent: HttpsAgent } = require('https');
-const _httpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 64 });
+/** Ham gövdeyi log / runStore için kısalt. */
+function previewHttpBody(data, maxLen = 900) {
+  try {
+    const s = typeof data === 'string' ? data : JSON.stringify(data);
+    if (s.length <= maxLen) return s;
+    return `${s.slice(0, maxLen)}…(+${s.length - maxLen} karakter)`;
+  } catch {
+    try { return String(data).slice(0, maxLen); } catch { return '(önizleme yok)'; }
+  }
+}
+
+/** HTML / Cloudflare gövdelerini log ve runStore için kısalt. */
+function previewNetworkErrorBody(data, maxLen = 400) {
+  try {
+    if (data == null) return '(empty)';
+    const str = typeof data === 'string' ? data : JSON.stringify(data);
+    if (/Attention Required!\s*\|\s*Cloudflare/i.test(str) || /cf-error-details/i.test(str)) {
+      return '(Cloudflare HTML — oturum veya bölge kısıtı; ticketingweb alanında geçerli oturum gerekir)';
+    }
+    if (typeof data === 'string' && str.trimStart().startsWith('<!')) {
+      const m = str.match(/<title>([^<]+)<\/title>/i);
+      const t = m ? m[1].replace(/\s+/g, ' ').trim().slice(0, 100) : '';
+      const clip = str.replace(/\s+/g, ' ').trim().slice(0, Math.min(180, maxLen));
+      return t ? `(HTML: ${t}) ${clip}…` : `(HTML, JSON değil) ${clip}…`;
+    }
+    return previewHttpBody(data, maxLen);
+  } catch {
+    return '(önizleme yok)';
+  }
+}
+
+/**
+ * getseatstatus JSON: valueList çok büyük olabilir — uzunluk + ilk koltuk + diğer alanlar.
+ */
+function previewSeatStatusPayload(data, maxLen = 900) {
+  try {
+    if (data == null) return '(empty)';
+    if (typeof data !== 'object') return previewHttpBody(data, maxLen);
+    const vl = data.valueList ?? data.value;
+    const slim = { ...data };
+    delete slim.valueList;
+    delete slim.value;
+    if (Array.isArray(vl)) {
+      slim.valueListLength = vl.length;
+      slim.valueListFirst  = vl.length ? vl[0] : null;
+    } else {
+      slim.valueListLength = null;
+    }
+    return previewHttpBody(slim, maxLen);
+  } catch {
+    return '(önizleme hatası)';
+  }
+}
+
+/**
+ * Snipe tick aralığı için alt sınır (ms): blok ve hesap sayısına göre dinamik.
+ * Hesap başına düşen blok (B/A) arttıkça veya hesap sayısı arttıkça süre uzar (429 / Cloudflare).
+ */
+function computeSnipeMinIntervalMs(blockCount, accountCount) {
+  const B = Math.max(0, Math.floor(Number(blockCount)) || 0);
+  const A = Math.max(1, Math.floor(Number(accountCount)) || 1);
+  if (B === 0) return 650;
+  const perAccount = Math.ceil(B / A);
+  const accountFactor = 1 + (A - 1) * 0.38;
+  const load = perAccount * 38 + Math.sqrt(B + 1) * 18;
+  const v = 480 + load * accountFactor;
+  return Math.min(7800, Math.max(650, Math.round(v)));
+}
 
 /**
  * SeatCoordinator
@@ -14,9 +80,10 @@ const _httpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 64 });
  * Proaktif koltuk tarama motoru.
  *
  * Tasarım ilkeleri:
- *  1. Multi-page polling   — Tüm idle hesapların sayfaları blokları paylaşır.
- *     83 blok / 5 idle hesap → her hesap ~17 bloğu poll eder, hepsi paralel.
- *     Bir hesap busy olduğunda kalan idle hesaplar onun bloklarını da kapsar.
+ *  1. Multi-page polling   — Her idle hesabın Puppeteer sayfasında `fetch(..., credentials:include)`
+ *     ile getseatstatus çağrılır (Cloudflare / tarayıcı oturumu ile uyumlu).
+ *     Bloklar hesaplar arasında bölünür; her sekmede pollConcurrency kadar paralel,
+ *     kalanı sırayla (429 / Cloudflare rate limit azaltma).
  *  2. Seat TTL tracking    — Boşa düşen koltukların "ilk görülme" zamanı tutulur.
  *     Koltuk kaybolursa TTL tablosundan silinir; exclusive kilit serbest bırakılır.
  *  3. Exclusive assignment — seatId exclusive kilitle; aynı koltuk 2 hesaba atanmaz.
@@ -43,17 +110,23 @@ class SeatCoordinator extends EventEmitter {
    * @param {number}   [opts.filter.adjacentCount=1]
    * @param {number|null} [opts.filter.maxPrice]
    * @param {string[]|null} [opts.filter.rows]
-   * @param {number}   [opts.intervalMs=800]
+   * @param {number}   [opts.intervalMs=1400]
    * @param {number}   [opts.timeoutMs=1800000]  30 dakika default
+   * @param {number}   [opts.pollConcurrency=4]  Tek tick’te sekme başına eşzamanlı getseatstatus üst sınırı
    */
-  constructor({ eventId, serieId = '', blockMap, filter = {}, intervalMs = 800, timeoutMs = 1_800_000 }) {
+  constructor({ eventId, serieId = '', blockMap, filter = {}, intervalMs = 1400, timeoutMs = 1_800_000, pollConcurrency = 4 }) {
     super();
     this.eventId    = eventId;
     this.serieId    = serieId;
     this.blockMap   = blockMap || new Map();
     this.filter     = { adjacentCount: 1, maxPrice: null, rows: null, ...filter };
-    this.intervalMs = intervalMs;
+    let im = Number(intervalMs);
+    if (!Number.isFinite(im) || im < 400) im = 1400;
+    this.intervalMs = Math.min(8000, Math.max(400, im));
     this.timeoutMs  = timeoutMs;
+    this.pollConcurrency = Math.max(1, Math.min(12, Number(pollConcurrency) || 4));
+    /** start() içinde hesap sayısına göre güncellenir */
+    this._effectivePollConcurrency = this.pollConcurrency;
 
     this._idlePool      = [];          // accountCtx[]
     this._busyPool      = new Set();
@@ -84,11 +157,41 @@ class SeatCoordinator extends EventEmitter {
     this._elapsed = 0;
     this._abortCtrl = new AbortController();
     const blockIds = Array.from(this.blockMap.keys());
+    const ac0 = this._idlePool.length;
+    const acForFloor = Math.max(1, ac0);
+    const intervalUserRequested = this.intervalMs;
+    const minByLoad = computeSnipeMinIntervalMs(blockIds.length, acForFloor);
+    if (minByLoad > this.intervalMs) {
+      logger.warn('SeatCoordinator:intervalMs_dynamic_floor', {
+        blockCount: blockIds.length,
+        accountCount: acForFloor,
+        userRequested: intervalUserRequested,
+        effective: minByLoad,
+      });
+      this.intervalMs = minByLoad;
+    }
+    let pc = this.pollConcurrency;
+    if (blockIds.length >= 70 && ac0 >= 2) pc = Math.min(pc, 2);
+    else if (blockIds.length >= 45 && ac0 >= 2) pc = Math.min(pc, 3);
+    this._effectivePollConcurrency = Math.max(1, pc);
+    if (this._effectivePollConcurrency !== this.pollConcurrency) {
+      logger.warn('SeatCoordinator:pollConcurrency_clamped', {
+        blockCount: blockIds.length,
+        accountCount: ac0,
+        requested: this.pollConcurrency,
+        effective: this._effectivePollConcurrency,
+      });
+    }
     logger.info('SeatCoordinator:started', {
       eventId: this.eventId,
       blockCount: blockIds.length,
-      accountCount: this._idlePool.length,
+      accountCount: ac0,
+      intervalMsUser: intervalUserRequested,
+      intervalMsMinByLoad: minByLoad,
       intervalMs: this.intervalMs,
+      pollConcurrency: this.pollConcurrency,
+      pollConcurrencyEffective: this._effectivePollConcurrency,
+      sequentialAccountPoll: blockIds.length >= 55 && ac0 >= 2,
       timeoutMs: this.timeoutMs,
     });
     this._timer = setInterval(() => this._tick(blockIds), this.intervalMs);
@@ -121,7 +224,7 @@ class SeatCoordinator extends EventEmitter {
   /**
    * Her tick'te:
    *  1. Idle hesapları blok gruplarına böl, her grup bir hesabın page'inde paralel poll eder.
-   *  2. Tüm gruplar eşzamanlı olarak çalışır (Promise.allSettled).
+   *  2. Çok blok + birden fazla hesap: hesaplar sırayla poll edilir (429 azaltma). Aksi halde Promise.allSettled.
    *  3. Sonuçları birleştir, TTL takibi yap, dispatch et.
    */
   async _tick(blockIds) {
@@ -172,71 +275,192 @@ class SeatCoordinator extends EventEmitter {
         blockIds.slice(i * chunkSize, (i + 1) * chunkSize)
       );
 
-      const BASE  = 'https://ticketingweb.passo.com.tr/api/passoweb';
+      // Same-origin: sekme ticketingweb.passo.com.tr üzerinde olmalı (startSnipe seed URL).
       const evId  = this.eventId;
       const seId  = this.serieId;
 
-      // ── Cookie yenileme (her 60 tick'te bir veya henüz yoksa) ────────────────
-      const shouldRefreshCookies = tick % 60 === 1; // ilk tick + her ~36 saniye
+      const pc = this._effectivePollConcurrency != null ? this._effectivePollConcurrency : this.pollConcurrency;
 
-      const chunkResults = await Promise.allSettled(
-        idleAccounts.map(async (ctx, i) => {
-          const chunk = chunks[i] || [];
-          if (!chunk.length) return [];
+      const useSequentialAccounts = blockIds.length >= 55 && idleAccounts.length >= 2;
 
-          // Cookie extract: yoksa veya periyodik yenileme zamanıysa page'den al.
-          // page.evaluate yerine cookies() kullanıyoruz — frame detach sorunu yok.
-          if ((!ctx.cookieString || shouldRefreshCookies) && ctx.page) {
-            try {
-              const cookieArr  = await ctx.page.cookies();
-              ctx.cookieString = cookieArr.map(c => `${c.name}=${c.value}`).join('; ');
-            } catch (e) {
-              logger.warn('SeatCoordinator:cookie_refresh_failed', { email: ctx.email, error: e?.message });
-            }
-          }
+      const runChunk = async (ctx, i) => {
+        const chunk = chunks[i] || [];
+        if (!chunk.length) return [];
 
-          if (!ctx.cookieString) return [];
+        const page = ctx.page;
+        if (!page || (typeof page.isClosed === 'function' && page.isClosed())) return [];
 
-          try {
-            // Node.js axios ile doğrudan HTTP — browser frame'e hiç dokunmaz.
-            return await Promise.all(chunk.map(async (blockId) => {
-              try {
-                const url = `${BASE}/getseatstatus?eventId=${evId}&serieId=${seId}&blockId=${blockId}`;
-                const res = await axios.get(url, {
-                  httpsAgent:    _httpsAgent,
-                  timeout:       8000,
-                  validateStatus: () => true,
-                  headers: {
-                    'Cookie':          ctx.cookieString,
-                    'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                    'Accept':          'application/json, text/plain, */*',
-                    'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8',
-                    'Referer':         'https://www.passo.com.tr/',
-                    'Origin':          'https://www.passo.com.tr',
-                  },
-                });
-                const httpStatus = res.status;
-                if (httpStatus !== 200) {
-                  return { blockId, seats: null, httpStatus, axiosError: null };
+        try {
+          if (!useSequentialAccounts && i > 0) await delay(60 * i);
+
+          const rows = await evaluateSafe(
+              page,
+              function browserPollGetSeatStatus(blocks, eId, sId, maxParallel) {
+                function enc(v) {
+                  return encodeURIComponent(String(v == null ? '' : v));
                 }
-                const data  = res.data;
-                const seats = data?.valueList || data?.value || null;
-                return { blockId, seats, httpStatus };
-              } catch (e) {
-                return {
-                  blockId,
-                  seats:      null,
-                  httpStatus: null,
-                  axiosError: e?.code || e?.message || 'request_failed',
-                };
+                function extractTokenString(v) {
+                  if (!v || typeof v !== 'string') return '';
+                  var s = v.trim();
+                  if (!s) return '';
+                  if (s.charAt(0) === '{') {
+                    try {
+                      var o = JSON.parse(s);
+                      var t = o.access_token || o.token || o.accessToken || o.jwt || o.inComingToken || o.InComingToken;
+                      return t ? String(t) : '';
+                    } catch (e) { return ''; }
+                  }
+                  if (s.length > 40 && s.indexOf('.') > 0 && s.split('.').length >= 3) return s;
+                  return '';
+                }
+                function buildPassoFetchHeaders() {
+                  var h = {};
+                  var token = '';
+                  var fixed = ['access_token', 'token', 'jwt', 'id_token', 'accessToken', 'authToken', 'passo_token', 'passoToken', 'pb_token', 'pb-token'];
+                  try {
+                    for (var fi = 0; fi < fixed.length; fi++) {
+                      var fk = fixed[fi];
+                      token = extractTokenString(localStorage.getItem(fk) || sessionStorage.getItem(fk) || '');
+                      if (token) break;
+                    }
+                    if (!token) {
+                      function scan(store) {
+                        for (var i = 0; i < store.length; i++) {
+                          var k = store.key(i);
+                          if (!k) continue;
+                          var lk = String(k).toLowerCase();
+                          if (lk.indexOf('token') < 0 && lk.indexOf('auth') < 0 && lk.indexOf('jwt') < 0) continue;
+                          token = extractTokenString(store.getItem(k));
+                          if (token) return token;
+                        }
+                        return '';
+                      }
+                      token = scan(localStorage) || scan(sessionStorage);
+                    }
+                    if (!token) {
+                      for (var j = 0; j < localStorage.length; j++) {
+                        var k2 = localStorage.key(j);
+                        if (!k2) continue;
+                        token = extractTokenString(localStorage.getItem(k2));
+                        if (token && token.length > 50) break;
+                      }
+                    }
+                  } catch (e) {}
+                  if (token) {
+                    h.Authorization = 'Bearer ' + token;
+                    h.IncomingToken = token;
+                    h.InComingToken = token;
+                  }
+                  return h;
+                }
+                var lim = Math.max(1, Math.min(12, parseInt(maxParallel, 10) || 4));
+                return (async function () {
+                  var acc = [];
+                  for (var o = 0; o < blocks.length; o += lim) {
+                    if (o > 0) await new Promise(function (r) { setTimeout(r, 55); });
+                    var slice = blocks.slice(o, o + lim);
+                    var batch = await Promise.all(slice.map(function (blockId) {
+                      return (async function () {
+                        try {
+                          const url = '/api/passoweb/getseatstatus?eventId=' + enc(eId) + '&serieId=' + enc(sId) + '&blockId=' + Number(blockId);
+                          var r;
+                          var httpStatus;
+                          var ct;
+                          var lastErrText = '';
+                          for (var attempt = 0; attempt < 2; attempt++) {
+                            var hdrs = buildPassoFetchHeaders();
+                            var init = { credentials: 'include', cache: 'no-store' };
+                            if (hdrs && Object.keys(hdrs).length) init.headers = hdrs;
+                            r = await fetch(url, init);
+                            httpStatus = r.status;
+                            ct = (r.headers.get('content-type') || '').toLowerCase();
+                            if (httpStatus !== 401) break;
+                            lastErrText = await r.text();
+                            if (attempt === 0 && lastErrText.indexOf('InComingToken') >= 0) {
+                              await new Promise(function (rr) { setTimeout(rr, 450); });
+                              continue;
+                            }
+                            break;
+                          }
+                          if (httpStatus !== 200) {
+                            let bodyPreview = null;
+                            try {
+                              var t = lastErrText;
+                              if (!t) { try { t = await r.text(); } catch (e2) { t = ''; } }
+                              if (/Attention Required!\s*\|\s*Cloudflare/i.test(t) || /cf-error-details/i.test(t)) {
+                                bodyPreview = '(Cloudflare HTML)';
+                              } else {
+                                bodyPreview = t.replace(/\s+/g, ' ').trim().slice(0, 400);
+                              }
+                            } catch (_) {}
+                            return { blockId, seats: null, httpStatus, axiosError: null, bodyPreview };
+                          }
+                          if (!ct.includes('json')) {
+                            let bodyPreview = null;
+                            try {
+                              bodyPreview = (await r.text()).replace(/\s+/g, ' ').trim().slice(0, 400);
+                            } catch (_) {}
+                            return {
+                              blockId,
+                              seats: null,
+                              httpStatus,
+                              axiosError: null,
+                              bodyPreview: bodyPreview || '(yanıt JSON değil)',
+                            };
+                          }
+                          const data = await r.json();
+                          const seats = data.valueList || data.value || null;
+                          return { blockId, seats, httpStatus: 200, axiosError: null, bodyPreview: null };
+                        } catch (e) {
+                          return {
+                            blockId,
+                            seats: null,
+                            httpStatus: null,
+                            axiosError: e && e.message ? String(e.message) : 'fetch_failed',
+                            bodyPreview: null,
+                          };
+                        }
+                      })();
+                    }));
+                    for (var j = 0; j < batch.length; j++) acc.push(batch[j]);
+                  }
+                  return acc;
+                })();
+              },
+              chunk,
+              evId,
+              seId,
+              pc
+            );
+            const list = Array.isArray(rows) ? rows : [];
+            for (const row of list) {
+              if (row.httpStatus === 200 && Array.isArray(row.seats)) {
+                row.bodyPreview = previewSeatStatusPayload({ valueList: row.seats }, 900);
               }
-            }));
-          } catch (e) {
-            logger.warn('SeatCoordinator:chunk_poll_failed', { email: ctx.email, error: e?.message });
-            return [];
+            }
+            return list;
+        } catch (e) {
+          logger.warn('SeatCoordinator:chunk_poll_failed', { email: ctx.email, error: e?.message });
+          return [];
+        }
+      };
+
+      let chunkResults;
+      if (useSequentialAccounts) {
+        chunkResults = [];
+        for (let i = 0; i < idleAccounts.length; i++) {
+          if (i > 0) await delay(420);
+          try {
+            chunkResults.push({ status: 'fulfilled', value: await runChunk(idleAccounts[i], i) });
+          } catch (reason) {
+            chunkResults.push({ status: 'rejected', reason });
           }
-        })
-      );
+        }
+      } else {
+        chunkResults = await Promise.allSettled(
+          idleAccounts.map((ctx, i) => runChunk(ctx, i))
+        );
+      }
 
       // ── Sonuçları birleştir ───────────────────────────────────────────────
       const allResults = [];
@@ -280,6 +504,24 @@ class SeatCoordinator extends EventEmitter {
       this._lastSeenSeats = currentSeats;
 
       const httpSum = this._buildTickHttpSummary(allResults);
+      const minIntervalByLoad = computeSnipeMinIntervalMs(
+        blockIds.length,
+        Math.max(1, idleAccounts.length)
+      );
+      const responseSamples = this._pickResponseSamples(allResults, 6);
+      const allBlocksCf403 = allResults.length > 0
+        && httpSum.http200 === 0
+        && httpSum.httpNot200 === allResults.length
+        && Number((httpSum.statusBreakdown || {})['403'] || 0) === allResults.length;
+      const allBlocks429 = allResults.length > 0
+        && httpSum.http200 === 0
+        && httpSum.httpNot200 === allResults.length
+        && Number((httpSum.statusBreakdown || {})['429'] || 0) === allResults.length;
+      const pollHint = allBlocks429
+        ? 'Tüm yanıtlar 429 (hız limiti / Cloudflare). Aralık blok ve hesap sayısına göre dinamik tabana çekilir; tick_stats.intervalMs ve minIntervalByLoad alanlarına bak. Gerekirse pollConcurrency veya hesap sayısını azalt.'
+        : allBlocksCf403
+          ? 'ticketingweb: tüm yanıtlar 403 (Cloudflare HTML). Sayfayı ticketing alanında yenile veya oturumu doğrula; hâlâ olmazsa IP/bölge kısıtı olabilir.'
+          : null;
       this.emit('tick_stats', {
         tick,
         tickMs: Date.now() - tickT0,
@@ -289,7 +531,13 @@ class SeatCoordinator extends EventEmitter {
         idleAccounts:     this._idlePool.length,
         busyAccounts:     this._busyPool.size,
         availableAfterFilter: available.length,
+        intervalMs: this.intervalMs,
+        minIntervalByLoad,
+        pollConcurrencyEffective: this._effectivePollConcurrency ?? this.pollConcurrency,
+        sequentialAccountPoll: useSequentialAccounts,
         ...httpSum,
+        ...(pollHint ? { pollHint } : {}),
+        ...(responseSamples?.length ? { responseSamples } : {}),
       });
 
       if (!available.length) return;
@@ -352,7 +600,7 @@ class SeatCoordinator extends EventEmitter {
     return true;
   }
 
-  /** HTTP özetini tek tur için üret (axios satırlarından). */
+  /** HTTP özetini tek tur için üret (tarayıcı içi fetch satırlarından). */
   _buildTickHttpSummary(allResults) {
     let http200 = 0;
     let httpNot200 = 0;
@@ -390,6 +638,32 @@ class SeatCoordinator extends EventEmitter {
       blocksWithSeatList,
       totalSeatRows,
     };
+  }
+
+  /**
+   * Tur başına sınırlı yanıt özeti: önce hatalar, sonra en fazla birkaç başarılı örnek.
+   */
+  _pickResponseSamples(allResults, max = 5) {
+    if (!Array.isArray(allResults) || !allResults.length) return [];
+    const out   = [];
+    const push  = (r) => {
+      if (out.length >= max) return;
+      out.push({
+        blockId:     r.blockId,
+        httpStatus:  r.httpStatus,
+        axiosError:  r.axiosError || undefined,
+        bodyPreview: r.bodyPreview || null,
+      });
+    };
+    for (const r of allResults) {
+      if (out.length >= max) break;
+      if (r.axiosError || (r.httpStatus != null && r.httpStatus !== 200)) push(r);
+    }
+    for (const r of allResults) {
+      if (out.length >= max) break;
+      if (r.httpStatus === 200 && r.bodyPreview) push(r);
+    }
+    return out;
   }
 }
 
