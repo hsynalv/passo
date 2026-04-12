@@ -49,6 +49,31 @@
     if (root) root.hidden = true;
   }
 
+  function openCredentialModal() {
+    const team = currentTeam();
+    if (!team) return;
+    const modal = $('credentialModal');
+    if (modal) modal.hidden = false;
+    const nameEl = $('credentialModalTeamName');
+    if (nameEl) nameEl.textContent = `Takım: ${team.name}`;
+    renderManageCredentialList();
+    const editingCredId = String($('credentialEditId')?.value || '').trim();
+    const editingCred = editingCredId ? state.credentials.find((c) => c.id === editingCredId) : null;
+    renderCredentialCategoryPicker(editingCred?.categoryIds || []);
+  }
+
+  function closeCredentialModal() {
+    const modal = $('credentialModal');
+    if (modal) modal.hidden = true;
+  }
+
+  function updateTabCounts() {
+    const catCount = $('tabCountCategories');
+    const blkCount = $('tabCountBlocks');
+    if (catCount) catCount.textContent = String(state.categories.length);
+    if (blkCount) blkCount.textContent = String(state.blocks.length);
+  }
+
   async function apiJson(path, options = {}) {
     const resp = await fetch(path, {
       method: options.method || 'GET',
@@ -72,6 +97,8 @@
       .map((el) => String(el.value || '').trim())
       .filter(Boolean);
     state.selectedCategoryIds = values;
+    // Kategori değişince blok checklist'ini yeniden filtrele
+    renderBlockChecklist();
   }
 
   function syncSelectedBlockIdsFromDom() {
@@ -194,9 +221,18 @@
       root.innerHTML = '<div class="checkListEmpty">Önce takım seç.</div>';
       return;
     }
-    const activeBlocks = state.blocks.filter((item) => item.isActive !== false);
+    // Seçili kategorilere bağlı blokları göster; kategori seçilmemişse tüm bloklar
+    const selectedCatIds = state.selectedCategoryIds;
+    const activeBlocks = state.blocks.filter((item) => {
+      if (item.isActive === false) return false;
+      if (!selectedCatIds.length) return true;
+      return item.categoryId && selectedCatIds.includes(item.categoryId);
+    });
     if (!activeBlocks.length) {
-      root.innerHTML = '<div class="checkListEmpty">Bu takım için kayıtlı aktif blok yok.</div>';
+      const msg = selectedCatIds.length
+        ? 'Seçili kategorilere bağlı aktif blok yok.'
+        : 'Bu takım için kayıtlı aktif blok yok.';
+      root.innerHTML = `<div class="checkListEmpty">${msg}</div>`;
       return;
     }
     for (const item of activeBlocks) {
@@ -214,10 +250,13 @@
       title.textContent = item.label || item.svgBlockId || 'Blok';
       const sub = document.createElement('span');
       const badge = item.selectionMode === 'svg' ? '[SVG]' : '[Legacy]';
+      const linkedCat = item.categoryId
+        ? state.categories.find((c) => c.id === item.categoryId)
+        : null;
       const detail = item.selectionMode === 'svg'
-        ? (item.svgBlockId || '')
-        : (item.categoryType || '');
-      sub.textContent = `${badge} ${detail}`;
+        ? `${badge} ${item.svgBlockId || ''}${linkedCat ? ` · ${linkedCat.label || linkedCat.categoryTypeValue}` : ''}`
+        : `${badge} ${item.categoryType || ''}`;
+      sub.textContent = detail;
       meta.appendChild(title);
       meta.appendChild(sub);
       wrap.appendChild(input);
@@ -235,27 +274,45 @@
       return;
     }
     if (!state.blocks.length) {
-      root.innerHTML = '<div class="itemListEmpty">Kayıtlı blok yok. Aşağıdan ekle.</div>';
+      root.innerHTML = '<div class="itemListEmpty">Blok yok. Sağ formdan ekle.</div>';
       return;
     }
     const escH = escapeHtml;
+    const editingId = String($('blockEditId')?.value || '');
     for (const item of state.blocks) {
       const row = document.createElement('div');
-      row.className = 'categoryItem' + (item.isActive === false ? ' categoryItemInactive' : '');
-      const badge = item.selectionMode === 'svg' ? '<span class="modBadge">SVG</span>' : '<span class="modBadge modBadgeLegacy">Legacy</span>';
+      row.className = 'itemCard' + (editingId === item.id ? ' active' : '');
+      const modeTag = item.selectionMode === 'svg' ? 'SVG' : 'Legacy';
       const detail = item.selectionMode === 'svg'
         ? escH(item.svgBlockId || '')
         : `${escH(item.categoryType || '')}${item.blockVal ? ` / ${escH(item.blockVal)}` : ''}`;
-      row.innerHTML = `
-        <div class="categoryItemMeta">
-          <strong>${escH(item.label || item.svgBlockId || 'Blok')} ${badge}</strong>
-          <span>${detail}</span>
-        </div>
-        <div class="categoryItemActions">
-          <button type="button" class="btnSecondarySmall" data-block-id="${escH(item.id)}" data-action="edit">Düzenle</button>
-          <button type="button" class="btnDangerSmall" data-block-id="${escH(item.id)}" data-action="delete">Sil</button>
-        </div>`;
+      const linkedCat = item.categoryId
+        ? state.categories.find((c) => c.id === item.categoryId)
+        : null;
+      const catLabel = linkedCat ? ` · ↗ ${escH(linkedCat.label || linkedCat.categoryTypeValue || '')}` : '';
+      const meta = document.createElement('div');
+      meta.innerHTML = `<strong>${escH(item.label || item.svgBlockId || 'Blok')}</strong>
+        <div class="itemCardMeta">[${modeTag}] ${detail}${catLabel}</div>`;
+      const actions = document.createElement('div');
+      actions.className = 'itemCardActions';
+      actions.innerHTML = `<button type="button" data-action="edit" data-block-id="${escH(item.id)}" class="btnMuted">Düzenle</button>
+        <button type="button" data-action="delete" data-block-id="${escH(item.id)}" class="btnDanger">Sil</button>`;
+      row.appendChild(meta);
+      row.appendChild(actions);
       root.appendChild(row);
+    }
+  }
+
+  function renderBlockCategoryPicker(selectedCategoryId) {
+    const root = $('blockCategoryPicker');
+    if (!root) return;
+    root.innerHTML = '<option value="">— Bağlama —</option>';
+    for (const cat of state.categories.filter((c) => c.isActive !== false)) {
+      const opt = document.createElement('option');
+      opt.value = cat.id;
+      opt.textContent = cat.label || cat.categoryTypeValue || cat.id;
+      if (String(cat.id) === String(selectedCategoryId || '')) opt.selected = true;
+      root.appendChild(opt);
     }
   }
 
@@ -417,39 +474,47 @@
 
   function renderManagerSummary() {
     const root = $('managerTeamSummary');
-    const content = $('managerContent');
+    const catalogMain = $('catalogMain');
+    const credBtn = $('btnOpenCredentialManager');
     if (!root) return;
     const team = currentTeam();
     if (!team) {
-      if (content) content.classList.add('disabled');
-      root.innerHTML = '<strong>Takım seçilmedi</strong><span>Soldan bir takım seçmeden kategori ve üyelik yönetimi yapılamaz.</span>';
+      if (catalogMain) catalogMain.classList.add('disabled');
+      if (credBtn) credBtn.disabled = true;
+      root.innerHTML = '<strong>Takım seçilmedi</strong><span>Soldan bir takım seç.</span>';
       return;
     }
-    if (content) content.classList.remove('disabled');
+    if (catalogMain) catalogMain.classList.remove('disabled');
+    if (credBtn) credBtn.disabled = false;
     const categoryCount = state.categories.length;
+    const blockCount = state.blocks.length;
     const credentialCount = state.credentials.length;
-    root.innerHTML = `<strong>Seçili takım: ${escapeHtml(team.name || '')}</strong>
-      <span>${escapeHtml(team.slug || '')} • ${categoryCount} kategori • ${credentialCount} üyelik</span>`;
+    root.innerHTML = `<strong>${escapeHtml(team.name || '')}</strong>
+      <span>${categoryCount} kategori · ${blockCount} blok · ${credentialCount} üyelik</span>`;
   }
 
   function resetCategoryForm() {
-    $('categoryEditId').value = '';
-    $('categoryValueInput').value = '';
+    if ($('categoryEditId')) $('categoryEditId').value = '';
+    if ($('categoryValueInput')) $('categoryValueInput').value = '';
     if ($('categoryTicketCount')) $('categoryTicketCount').value = '1';
     if ($('categoryAdjacentSeats')) $('categoryAdjacentSeats').value = 'false';
+    const titleEl = $('categoryFormTitle');
+    if (titleEl) titleEl.textContent = 'Kategori Ekle';
   }
 
   function resetCredentialForm() {
-    $('credentialEditId').value = '';
-    $('credentialEmailInput').value = '';
-    $('credentialPasswordInput').value = '';
-    $('credentialIdentityInput').value = '';
-    $('credentialFanCardInput').value = '';
+    if ($('credentialEditId')) $('credentialEditId').value = '';
+    if ($('credentialEmailInput')) $('credentialEmailInput').value = '';
+    if ($('credentialPasswordInput')) $('credentialPasswordInput').value = '';
+    if ($('credentialIdentityInput')) $('credentialIdentityInput').value = '';
+    if ($('credentialFanCardInput')) $('credentialFanCardInput').value = '';
     if ($('credentialPhoneInput')) $('credentialPhoneInput').value = '';
     if ($('credentialSicilNoInput')) $('credentialSicilNoInput').value = '';
     if ($('credentialPriorityTicketCodeInput')) $('credentialPriorityTicketCodeInput').value = '';
     if ($('credentialNotesInput')) $('credentialNotesInput').value = '';
     renderCredentialCategoryPicker([]);
+    const titleEl = $('credentialFormTitle');
+    if (titleEl) titleEl.textContent = 'Üyelik Ekle';
   }
 
   function renderCredentialCategoryPicker(selectedCatIds) {
@@ -524,15 +589,18 @@
     const root = $('manageCredentialList');
     if (!root) return;
     root.textContent = '';
+    const countEl = $('credentialListCount');
     if (!state.selectedTeamId) {
       root.innerHTML = '<div class="itemListEmpty">Önce takım seç.</div>';
+      if (countEl) countEl.textContent = '0 üyelik';
       return;
     }
+    if (countEl) countEl.textContent = `${state.credentials.length} üyelik`;
     if (!state.credentials.length) {
-      root.innerHTML = '<div class="itemListEmpty">Üyelik yok.</div>';
+      root.innerHTML = '<div class="itemListEmpty">Üyelik yok. Soldan ekle.</div>';
       return;
     }
-    const editingId = String($('credentialEditId').value || '');
+    const editingId = String($('credentialEditId')?.value || '');
     for (const item of state.credentials) {
       const row = document.createElement('div');
       row.className = 'itemCard' + (editingId === item.id ? ' active' : '');
@@ -563,11 +631,13 @@
     renderTeamOptions();
     renderManageTeamList();
     renderManagerSummary();
+    updateTabCounts();
     renderCategoryChecklist();
     renderBlockChecklist();
     renderCredentialPickers();
     renderManageCategoryList();
     renderManageBlockList();
+    renderBlockCategoryPicker($('blockEditId')?.value ? (state.blocks.find((b) => b.id === $('blockEditId').value)?.categoryId || '') : '');
     renderManageCredentialList();
   }
 
@@ -598,6 +668,7 @@
       state.bCredentialIds = [];
       renderManageTeamList();
       renderManagerSummary();
+      updateTabCounts();
       renderCategoryChecklist();
       renderBlockChecklist();
       renderCredentialPickers();
@@ -640,11 +711,13 @@
     state.bCredentialIds = state.bCredentialIds.filter((id) => !state.aCredentialIds.includes(id));
     renderManageTeamList();
     renderManagerSummary();
+    updateTabCounts();
     renderCategoryChecklist();
     renderBlockChecklist();
     renderCredentialPickers();
     renderManageCategoryList();
     renderManageBlockList();
+    renderBlockCategoryPicker($('blockEditId')?.value ? (state.blocks.find((b) => b.id === $('blockEditId').value)?.categoryId || '') : '');
     renderManageCredentialList();
     // Credential düzenleniyorsa picker'ı koru, değilse temizle
     const editingCredId = String($('credentialEditId').value || '').trim();
@@ -813,6 +886,7 @@
     if ($('blockEditId')) $('blockEditId').value = '';
     if ($('blockLabelInput')) $('blockLabelInput').value = '';
     if ($('blockSelectionMode')) $('blockSelectionMode').value = 'svg';
+    renderBlockCategoryPicker('');
     if ($('blockSvgBlockIdInput')) $('blockSvgBlockIdInput').value = '';
     if ($('blockCategoryTypeInput')) $('blockCategoryTypeInput').value = '';
     if ($('blockBlockValInput')) $('blockBlockValInput').value = '';
@@ -821,6 +895,8 @@
     if ($('blockTicketCount')) $('blockTicketCount').value = '1';
     if ($('blockAdjacentSeats')) $('blockAdjacentSeats').value = 'false';
     updateBlockModeFields();
+    const titleEl = $('blockFormTitle');
+    if (titleEl) titleEl.textContent = 'Blok Ekle';
   }
 
   function updateBlockModeFields() {
@@ -843,6 +919,7 @@
     const payload = {
       label: String($('blockLabelInput')?.value || '').trim(),
       selectionMode: mode,
+      categoryId: String($('blockCategoryPicker')?.value || '').trim() || null,
       isActive: true,
       ticketCount,
       adjacentSeats,
@@ -890,6 +967,7 @@
     if ($('blockEditId')) $('blockEditId').value = item.id;
     if ($('blockLabelInput')) $('blockLabelInput').value = item.label || '';
     if ($('blockSelectionMode')) $('blockSelectionMode').value = item.selectionMode || 'svg';
+    renderBlockCategoryPicker(item.categoryId || '');
     if (item.selectionMode === 'svg') {
       if ($('blockSvgBlockIdInput')) $('blockSvgBlockIdInput').value = item.svgBlockId || '';
       if ($('blockCategoryTypeInput')) $('blockCategoryTypeInput').value = item.categoryType || '';
@@ -901,6 +979,8 @@
     if ($('blockTicketCount')) $('blockTicketCount').value = String(item.ticketCount || 1);
     if ($('blockAdjacentSeats')) $('blockAdjacentSeats').value = item.adjacentSeats ? 'true' : 'false';
     updateBlockModeFields();
+    const titleEl = $('blockFormTitle');
+    if (titleEl) titleEl.textContent = 'Blok Düzenle';
     renderManageBlockList();
   }
 
@@ -953,26 +1033,30 @@
   function fillCategoryForm(categoryId) {
     const item = state.categories.find((row) => row.id === categoryId);
     if (!item) return;
-    $('categoryEditId').value = item.id;
-    $('categoryValueInput').value = item.categoryTypeValue || '';
+    if ($('categoryEditId')) $('categoryEditId').value = item.id;
+    if ($('categoryValueInput')) $('categoryValueInput').value = item.categoryTypeValue || '';
     if ($('categoryTicketCount')) $('categoryTicketCount').value = String(item.ticketCount || 1);
     if ($('categoryAdjacentSeats')) $('categoryAdjacentSeats').value = item.adjacentSeats ? 'true' : 'false';
+    const titleEl = $('categoryFormTitle');
+    if (titleEl) titleEl.textContent = 'Kategori Düzenle';
     renderManageCategoryList();
   }
 
   function fillCredentialForm(credentialId) {
     const item = state.credentials.find((row) => row.id === credentialId);
     if (!item) return;
-    $('credentialEditId').value = item.id;
-    $('credentialEmailInput').value = item.email || '';
-    $('credentialPasswordInput').value = '';
-    $('credentialIdentityInput').value = item.identity || '';
-    $('credentialFanCardInput').value = item.fanCardCode || '';
+    if ($('credentialEditId')) $('credentialEditId').value = item.id;
+    if ($('credentialEmailInput')) $('credentialEmailInput').value = item.email || '';
+    if ($('credentialPasswordInput')) $('credentialPasswordInput').value = '';
+    if ($('credentialIdentityInput')) $('credentialIdentityInput').value = item.identity || '';
+    if ($('credentialFanCardInput')) $('credentialFanCardInput').value = item.fanCardCode || '';
     if ($('credentialPhoneInput')) $('credentialPhoneInput').value = item.phone || '';
     if ($('credentialSicilNoInput')) $('credentialSicilNoInput').value = item.sicilNo || '';
     if ($('credentialPriorityTicketCodeInput')) $('credentialPriorityTicketCodeInput').value = item.priorityTicketCode || '';
     if ($('credentialNotesInput')) $('credentialNotesInput').value = item.notes || '';
     renderCredentialCategoryPicker(item.categoryIds || []);
+    const titleEl = $('credentialFormTitle');
+    if (titleEl) titleEl.textContent = 'Üyelik Düzenle';
     renderManageCredentialList();
   }
 
@@ -988,6 +1072,30 @@
     $('btnCloseCatalogModal')?.addEventListener('click', () => closeModal());
     $('catalogModalBackdrop')?.addEventListener('click', () => closeModal());
     $('btnCatalogModalDone')?.addEventListener('click', () => closeModal());
+
+    // ── Catalog tab bar ───────────────────────────────────────
+    $('catalogTabBar')?.addEventListener('click', (event) => {
+      const tab = event.target.closest('[data-catalog-tab]');
+      if (!tab) return;
+      const tabKey = tab.dataset.catalogTab;
+      document.querySelectorAll('.catalogTab').forEach((t) => {
+        const active = t.dataset.catalogTab === tabKey;
+        t.classList.toggle('active', active);
+        t.setAttribute('aria-selected', String(active));
+      });
+      document.querySelectorAll('.catalogTabPanel').forEach((panel) => {
+        const active = panel.dataset.catalogPanel === tabKey;
+        panel.classList.toggle('active', active);
+        panel.hidden = !active;
+      });
+    });
+
+    // ── Credential modal ──────────────────────────────────────
+    $('btnOpenCredentialManager')?.addEventListener('click', () => openCredentialModal());
+    $('btnCloseCredentialModal')?.addEventListener('click', () => closeCredentialModal());
+    $('credentialModalBackdrop')?.addEventListener('click', () => closeCredentialModal());
+    $('btnCloseCredentialModalDone')?.addEventListener('click', () => closeCredentialModal());
+
     $('teamSearchInput')?.addEventListener('input', (event) => {
       state.teamSearch = String(event.target.value || '');
       renderManageTeamList();

@@ -24,6 +24,7 @@ router.get('/api/panel-settings', (req, res) => {
 router.post('/start-bot', botRateLimiter, startBot);
 router.post('/start-bot-async', botRateLimiter, startBotAsync);
 router.post('/start-snipe', botRateLimiter, startSnipe);
+router.post('/api/start-snipe', botRateLimiter, startSnipe);
 
 router.get('/api/teams', listTeams);
 router.post('/api/teams', createTeam);

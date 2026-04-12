@@ -1428,6 +1428,12 @@ function startSse() {
       if (shouldRefreshRunStatusNow(e, currentRunId)) {
         scheduleRunStatusRefresh(currentRunId, 0);
       }
+      // Snipe modu açıkken SSE loglarını snipe paneline de yönlendir
+      try {
+        if (window._snipeLogForward && typeof window._snipeLogForward === 'function') {
+          window._snipeLogForward(e);
+        }
+      } catch {}
     } catch {}
   });
 
@@ -1804,6 +1810,371 @@ try {
     window.passobotScanMap.init();
   }
 } catch {}
+
+// ─── Snipe Modu (Piyasa Dinle) ────────────────────────────────────────────────
+;(function initSnipeModal() {
+  let snipeRunId  = null;
+  let snipeTimer  = null;
+  let snipeElapsedSec = 0;
+
+  const modal          = $('snipeModal');
+  const teamSel        = $('snipeTeamSelect');
+  const blocksList     = $('snipeBlocksList');
+  const accountsList   = $('snipeAccountsList');
+  const btnStart       = $('btnSnipeStart');
+  const btnStop        = $('btnSnipeStop');
+  const statBlocks     = $('snipeStatBlocks')?.querySelector('.snipeStatVal');
+  const statAccounts   = $('snipeStatAccounts')?.querySelector('.snipeStatVal');
+  const statSeats      = $('snipeStatSeats')?.querySelector('.snipeStatVal');
+  const statElapsed    = $('snipeStatElapsed')?.querySelector('.snipeStatVal');
+  const logEl          = $('snipeStatusLog');
+  const pollRow        = $('snipePollRow');
+  const pollSummary    = $('snipePollSummary');
+  let lastLoggedTick   = 0;
+
+  let _teams    = [];
+  let _blocks   = [];
+  let _accounts = [];
+  let _selBlocks   = new Set();
+  let _selAccounts = new Set();
+
+  // SSE olaylarını snipe log paneline yönlendir (sadece snipe run varken)
+  const SSE_SNIPE_PREFIXES = ['SeatCoordinator', 'startSnipe'];
+  window._snipeLogForward = function(e) {
+    if (!snipeRunId) return;
+    const msg = String(e?.message || '');
+    const prefix = msg.split(':')[0];
+    if (!SSE_SNIPE_PREFIXES.includes(prefix)) return;
+    const meta = e?.meta ? JSON.stringify(e.meta) : '';
+    const display = meta ? `${msg} ${meta}` : msg;
+    const lvl = String(e?.level || 'info');
+    const cls = lvl === 'warn' ? 'warn' : (lvl === 'error' ? 'err' : 'ok');
+    log(display, cls);
+  };
+
+  function log(msg, cls = '') {
+    if (!logEl) return;
+    const line = document.createElement('div');
+    line.className = 'snipeLogEntry' + (cls ? ' ' + cls : '');
+    const ts = new Date().toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    line.textContent = `[${ts}] ${msg}`;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function renderBlocks() {
+    if (!blocksList) return;
+    if (!_blocks.length) {
+      blocksList.innerHTML = '<p class="snipeEmpty">Bu takımda blok yok. Önce Blok Haritası\'ndan import et.</p>';
+      return;
+    }
+    blocksList.innerHTML = '';
+    for (const b of _blocks) {
+      const item = document.createElement('label');
+      item.className = 'snipeCheckItem' + (_selBlocks.has(b.id) ? ' selected' : '');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = _selBlocks.has(b.id);
+      cb.addEventListener('change', () => {
+        if (cb.checked) _selBlocks.add(b.id); else _selBlocks.delete(b.id);
+        item.classList.toggle('selected', cb.checked);
+        updateStats();
+      });
+      item.appendChild(cb);
+      item.appendChild(document.createTextNode(b.label || b.svgBlockId || b.id));
+      blocksList.appendChild(item);
+    }
+    updateStats();
+  }
+
+  function renderAccounts() {
+    if (!accountsList) return;
+    if (!_accounts.length) {
+      accountsList.innerHTML = '<p class="snipeEmpty">Bu takımda üye yok</p>';
+      return;
+    }
+    accountsList.innerHTML = '';
+    for (const a of _accounts) {
+      const item = document.createElement('label');
+      item.className = 'snipeCheckItem' + (_selAccounts.has(a.id) ? ' selected' : '');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = _selAccounts.has(a.id);
+      cb.addEventListener('change', () => {
+        if (cb.checked) _selAccounts.add(a.id); else _selAccounts.delete(a.id);
+        item.classList.toggle('selected', cb.checked);
+        updateStats();
+      });
+      item.appendChild(cb);
+      item.appendChild(document.createTextNode(a.email || a.id));
+      accountsList.appendChild(item);
+    }
+    updateStats();
+  }
+
+  function updateStats() {
+    if (statBlocks)   statBlocks.textContent  = _selBlocks.size   || '—';
+    if (statAccounts) statAccounts.textContent = _selAccounts.size || '—';
+  }
+
+  function formatSnipeLastTick(t) {
+    if (!t || typeof t !== 'object') return '—';
+    if (t.note === 'no_idle_accounts') {
+      return `#${t.tick} · boşta hesap yok (${t.busyAccounts || 0} meşgul)`;
+    }
+    const parts = [
+      `#${t.tick}`,
+      `${t.http200 ?? 0}/${t.blocksPolled ?? 0} HTTP 200`,
+      t.tickMs != null ? `${t.tickMs} ms` : null,
+      t.totalSeatRows != null ? `${t.totalSeatRows} koltuk satırı` : null,
+      `filtre sonrası müsait: ${t.availableAfterFilter ?? 0}`,
+    ];
+    if (t.httpNot200) parts.push(`HTTP≠200: ${t.httpNot200}`);
+    if (t.networkErrors) parts.push(`ağ hatası: ${t.networkErrors}`);
+    if (t.incompletePoll) parts.push('eksik istek turu');
+    return parts.filter(Boolean).join(' · ');
+  }
+
+  function tickLogClass(t) {
+    if (!t || typeof t !== 'object') return '';
+    if (t.note === 'no_idle_accounts') return 'warn';
+    if (t.networkErrors > 0 || t.httpNot200 > 0 || t.incompletePoll) return 'warn';
+    return 'ok';
+  }
+
+  async function loadTeamData(teamId) {
+    _blocks   = [];
+    _accounts = [];
+    _selBlocks.clear();
+    _selAccounts.clear();
+    if (!teamId) { renderBlocks(); renderAccounts(); return; }
+
+    try {
+      const [bRes, aRes] = await Promise.allSettled([
+        fetch(`/api/teams/${teamId}/blocks`).then(r => r.json()),
+        fetch(`/api/teams/${teamId}/credentials`).then(r => r.json()),
+      ]);
+      if (bRes.status === 'fulfilled') {
+        _blocks = Array.isArray(bRes.value?.blocks) ? bRes.value.blocks : [];
+        // hepsini seç varsayılan olarak
+        _blocks.forEach(b => _selBlocks.add(b.id));
+      }
+      if (aRes.status === 'fulfilled') {
+        _accounts = Array.isArray(aRes.value?.credentials) ? aRes.value.credentials : [];
+        _accounts.forEach(a => _selAccounts.add(a.id));
+      }
+    } catch {}
+    renderBlocks();
+    renderAccounts();
+  }
+
+  async function loadTeams() {
+    try {
+      const data = await fetch('/api/teams').then(r => r.json());
+      _teams = Array.isArray(data.teams) ? data.teams : [];
+      if (!teamSel) return;
+      teamSel.innerHTML = '<option value="">— Takım Seçiniz —</option>';
+      for (const t of _teams) {
+        const opt = document.createElement('option');
+        opt.value = t.id;
+        opt.textContent = t.name;
+        teamSel.appendChild(opt);
+      }
+      // Ana formda seçili takım varsa onu seç
+      const mainTeamSel = $('teamSelect');
+      if (mainTeamSel && mainTeamSel.value) {
+        teamSel.value = mainTeamSel.value;
+        await loadTeamData(mainTeamSel.value);
+      }
+    } catch (e) {
+      log('Takımlar yüklenemedi: ' + e?.message, 'err');
+    }
+  }
+
+  function openModal() {
+    if (!modal) return;
+    modal.hidden = false;
+    loadTeams();
+  }
+
+  function closeModal() {
+    if (!modal) return;
+    modal.hidden = true;
+  }
+
+  function startTimer() {
+    snipeElapsedSec = 0;
+    if (snipeTimer) clearInterval(snipeTimer);
+    snipeTimer = setInterval(() => {
+      snipeElapsedSec++;
+      const m = Math.floor(snipeElapsedSec / 60);
+      const s = String(snipeElapsedSec % 60).padStart(2, '0');
+      if (statElapsed) statElapsed.textContent = `${m}:${s}`;
+    }, 1000);
+  }
+
+  function stopTimer() {
+    if (snipeTimer) { clearInterval(snipeTimer); snipeTimer = null; }
+  }
+
+  function setRunning(yes) {
+    if (btnStart) btnStart.disabled = yes;
+    if (btnStop)  btnStop.disabled  = !yes;
+  }
+
+  async function startSnipe() {
+    const teamId = teamSel?.value;
+    if (!teamId) { log('Lütfen bir takım seç.', 'err'); return; }
+
+    const eventUrl = $('snipeEventUrl')?.value?.trim();
+    if (!eventUrl || !eventUrl.startsWith('http')) { log('Geçerli bir etkinlik URL\'si gir.', 'err'); return; }
+
+    const selBlockIds = [..._selBlocks];
+    if (!selBlockIds.length) { log('En az 1 blok seçmelisin.', 'err'); return; }
+
+    const selAccountIds = [..._selAccounts];
+    if (!selAccountIds.length) { log('En az 1 hesap seçmelisin.', 'err'); return; }
+
+    const intervalMs   = parseInt($('snipeIntervalMs')?.value || '600', 10);
+    const timeoutMin   = parseInt($('snipeTimeoutMin')?.value || '60', 10);
+    const timeoutMs    = timeoutMin * 60 * 1000;
+    const catMode      = $('snipeCategoryMode')?.value || 'scan';
+    const maxPriceRaw  = parseFloat($('snipeMaxPrice')?.value || '');
+    const adjacentCount= parseInt($('snipeAdjacentCount')?.value || '1', 10);
+
+    const body = {
+      eventAddress: eventUrl,
+      teamId,
+      selectedBlockIds: selBlockIds,
+      aCredentialIds: selAccountIds,
+      accounts: [],
+      categorySelectionMode: catMode,
+      intervalMs: Math.max(200, Math.min(5000, intervalMs)),
+      timeoutMs,
+      targets: [{
+        filter: {
+          adjacentCount: adjacentCount >= 1 ? adjacentCount : 1,
+          maxPrice: Number.isFinite(maxPriceRaw) && maxPriceRaw > 0 ? maxPriceRaw : null,
+          rows: null,
+        },
+      }],
+    };
+
+    log(`Tarama başlatılıyor… ${selBlockIds.length} blok, ${selAccountIds.length} hesap`, 'ok');
+    setRunning(true);
+    startTimer();
+    if (statSeats) statSeats.textContent = '0';
+
+    try {
+      const res = await fetch('/start-snipe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        log('Başlatma hatası: ' + (data.error || res.statusText), 'err');
+        setRunning(false);
+        stopTimer();
+        return;
+      }
+      snipeRunId = data.runId || null;
+      lastLoggedTick = 0;
+      if (pollRow) pollRow.hidden = false;
+      if (pollSummary) pollSummary.textContent = 'İlk tur bekleniyor…';
+      log(`Başlatıldı. Run ID: ${snipeRunId}`, 'ok');
+      log(`${selBlockIds.length} blok ${Math.ceil(selBlockIds.length / selAccountIds.length)} hesap/grup dağılımıyla taranıyor`, 'ok');
+      pollSnipeStatus();
+    } catch (e) {
+      log('Bağlantı hatası: ' + e?.message, 'err');
+      setRunning(false);
+      stopTimer();
+    }
+  }
+
+  async function stopSnipe() {
+    if (!snipeRunId) { setRunning(false); stopTimer(); return; }
+    try {
+      // Tüm aktif oturumları sonlandır (tek bir snipe run çalışıyorsa etkili)
+      await fetch('/kill-sessions', { method: 'POST' });
+      log('Tarama durduruldu (oturumlar kapatıldı).', 'warn');
+    } catch (e) {
+      log('Durdurma hatası: ' + e?.message, 'err');
+    }
+    setRunning(false);
+    stopTimer();
+    snipeRunId = null;
+    lastLoggedTick = 0;
+    if (pollRow) pollRow.hidden = true;
+    if (pollSummary) pollSummary.textContent = '—';
+  }
+
+  function pollSnipeStatus() {
+    if (!snipeRunId) return;
+    const POLL_MS = 1200;
+    const iv = setInterval(async () => {
+      if (!snipeRunId) { clearInterval(iv); return; }
+      try {
+        const data = await fetch(`/run/${encodeURIComponent(snipeRunId)}/status`, { cache: 'no-store' }).then(r => r.json());
+        const st = data?.run?.snipeState;
+        if (st) {
+          if (statSeats    && st.seatsAcquired != null) statSeats.textContent = st.seatsAcquired;
+          if (statAccounts && st.accountCount  != null) {
+            const busy = (st.activeAccounts || []).length;
+            statAccounts.textContent = `${st.accountCount - busy}/${st.accountCount}`;
+          }
+          if (statBlocks && st.blockCount != null) statBlocks.textContent = st.blockCount;
+          if (st.lastTick && pollSummary) {
+            pollSummary.textContent = formatSnipeLastTick(st.lastTick);
+            if (pollRow) pollRow.hidden = false;
+            if (logEl && st.lastTick.tick > lastLoggedTick) {
+              lastLoggedTick = st.lastTick.tick;
+              log(formatSnipeLastTick(st.lastTick), tickLogClass(st.lastTick));
+            }
+          }
+        }
+        const status = data?.run?.status;
+        if (status === 'done' || status === 'error' || status === 'timeout' || status === 'killed') {
+          clearInterval(iv);
+          setRunning(false);
+          stopTimer();
+          log(`Tarama tamamlandı: ${status}`, status === 'done' ? 'ok' : 'warn');
+          snipeRunId = null;
+          lastLoggedTick = 0;
+          if (pollRow) pollRow.hidden = true;
+          if (pollSummary) pollSummary.textContent = '—';
+        }
+      } catch {}
+    }, POLL_MS);
+  }
+
+  // Event listeners
+  try {
+    $('btnOpenSnipeModal')?.addEventListener('click', openModal);
+    $('btnCloseSnipeModal')?.addEventListener('click', closeModal);
+    $('snipeModalBackdrop')?.addEventListener('click', closeModal);
+    teamSel?.addEventListener('change', () => loadTeamData(teamSel.value));
+    btnStart?.addEventListener('click', startSnipe);
+    btnStop?.addEventListener('click', stopSnipe);
+
+    $('btnSnipeSelectAllBlocks')?.addEventListener('click', () => {
+      _blocks.forEach(b => _selBlocks.add(b.id));
+      renderBlocks();
+    });
+    $('btnSnipeClearBlocks')?.addEventListener('click', () => {
+      _selBlocks.clear();
+      renderBlocks();
+    });
+    $('btnSnipeSelectAllAccounts')?.addEventListener('click', () => {
+      _accounts.forEach(a => _selAccounts.add(a.id));
+      renderAccounts();
+    });
+    $('btnSnipeClearAccounts')?.addEventListener('click', () => {
+      _selAccounts.clear();
+      renderAccounts();
+    });
+  } catch {}
+})();
 
 try {
   $('btnOpenSettings').addEventListener('click', () => openSettingsModalFresh());

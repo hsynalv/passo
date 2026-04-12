@@ -289,6 +289,8 @@ const blockCommonFields = {
 
 const blockPayloadSchema = z.object({
   ...blockCommonFields,
+  // Kategoriye bağlama (opsiyonel)
+  categoryId: z.string().optional().nullable().transform((v) => (v == null ? null : String(v).trim() || null)),
   // SVG fields
   svgBlockId: z.string().optional().nullable().transform((v) => (v == null ? '' : String(v).trim())),
   apiBlockId: z.union([z.number(), z.string()])
@@ -318,6 +320,7 @@ const blockPayloadSchema = z.object({
 const blockUpdatePayloadSchema = z.object({
   label: z.string().min(1).optional(),
   selectionMode: z.enum(['svg', 'legacy']).optional(),
+  categoryId: z.string().optional().nullable().transform((v) => (v == null ? null : String(v).trim() || null)),
   svgBlockId: z.string().optional().nullable().transform((v) => (v == null ? undefined : String(v).trim() || undefined)),
   apiBlockId: z.union([z.number(), z.string()])
     .optional()

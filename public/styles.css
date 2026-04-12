@@ -24,7 +24,9 @@ html,body{margin:0;padding:0;height:100%;overflow:auto;font-family:ui-sans-serif
 .modalFoot{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 14px;border-top:1px solid rgba(27,42,75,0.85)}
 .modalFootSpacer{flex:1}
 
-/* Takım havuzu modalı — tam ekran, içerik alanı genişler */
+/* ──────────────────────────────────────────────────────────
+   Catalog Modal — tam ekran yönetim sayfası
+────────────────────────────────────────────────────────── */
 .modalRootCatalog{
   display:block;
   padding:0;
@@ -35,81 +37,480 @@ html,body{margin:0;padding:0;height:100%;overflow:auto;font-family:ui-sans-serif
   z-index:1;
   width:100%;
   max-width:none;
-  min-height:100vh;
-  min-height:100dvh;
+  height:100vh;
+  height:100dvh;
   max-height:none;
   margin:0;
   border-radius:0;
   border-left:none;
   border-right:none;
   box-shadow:none;
+  display:flex;
+  flex-direction:column;
 }
 .modalRootCatalog .modalHead{
-  padding:14px 22px;
+  padding:12px 20px;
   flex-shrink:0;
+  gap:12px;
+}
+.catalogModalHeadLeft{
+  display:flex;
+  flex-direction:column;
+  gap:2px;
+  min-width:0;
 }
 .modalRootCatalog .modalHead h2{
-  font-size:16px;
+  font-size:15px;
+  margin:0;
 }
-.modalRootCatalog .modalIntro{
-  padding:12px 22px;
-  font-size:12px;
-  line-height:1.5;
-  flex-shrink:0;
+.catalogModalHeadSub{
+  font-size:10px;
+  color:var(--muted);
+  line-height:1.35;
 }
-.modalRootCatalog .modalBody{
+.catalogModalBody{
   flex:1;
   min-height:0;
   display:flex;
   flex-direction:column;
   overflow:hidden;
-  padding:16px 22px 22px;
+  padding:0;
 }
 .modalRootCatalog .modalFoot{
-  padding:12px 22px;
+  padding:10px 20px;
   flex-shrink:0;
 }
-.modalRootCatalog .managerWorkspace{
+
+/* ── Catalog workspace: sidebar + main ─────────────────── */
+.catalogWorkspace{
+  display:grid;
+  grid-template-columns:260px minmax(0,1fr);
+  height:100%;
+  min-height:0;
+  overflow:hidden;
+}
+
+/* ── Sidebar ───────────────────────────────────────────── */
+.catalogSidebar{
+  display:flex;
+  flex-direction:column;
+  gap:0;
+  border-right:1px solid rgba(27,42,75,0.85);
+  overflow:hidden;
+  background:rgba(8,13,25,0.45);
+  padding:14px 14px 10px;
+}
+.catalogSidebarHead{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:8px;
+}
+.catalogSidebarLabel{
+  font-size:11px;
+  font-weight:700;
+  color:#dbeafe;
+  text-transform:uppercase;
+  letter-spacing:.06em;
+}
+.btnIconMuted{
+  border:none;
+  background:transparent;
+  color:var(--muted);
+  font-size:16px;
+  min-height:auto;
+  padding:2px 6px;
+  border-radius:6px;
+  cursor:pointer;
+  line-height:1;
+}
+.btnIconMuted:hover{color:var(--text);background:rgba(255,255,255,0.06)}
+.catalogSearchInput{
+  width:100%;
+  min-height:34px;
+  font-size:11px;
+  margin-bottom:8px;
+}
+.catalogTeamList{
   flex:1;
   min-height:0;
-  grid-template-columns:minmax(280px,22vw) minmax(0,1fr);
-  gap:20px 28px;
-  align-items:stretch;
-}
-.modalRootCatalog .managerSidebar{
-  min-height:0;
+  max-height:none !important;
   overflow-y:auto;
   overflow-x:hidden;
-  padding-right:6px;
+  padding-right:2px;
+  margin-bottom:0;
+  display:flex;
+  flex-direction:column;
+  gap:2px;
 }
-.modalRootCatalog .managerContent{
+/* Sidebar takım listesi — nav-item stili, daha sade */
+.catalogTeamList .teamListItem{
+  padding:8px 10px;
+  border-radius:8px;
+  border-color:transparent;
+  background:transparent;
+}
+.catalogTeamList .teamListItem:hover{
+  border-color:transparent;
+  background:rgba(96,165,250,0.08);
+}
+.catalogTeamList .teamListItem.active{
+  border-color:transparent;
+  background:rgba(94,234,212,0.1);
+  box-shadow:none;
+}
+.catalogTeamList .teamListItem.active .teamListMeta strong{
+  color:var(--accent);
+}
+.catalogTeamList .teamListMeta strong{
+  font-size:11px;
+}
+.catalogTeamList .teamListMeta span{
+  font-size:9px;
+}
+.catalogSidebarDivider{
+  height:1px;
+  background:rgba(27,42,75,0.8);
+  margin:10px 0;
+  flex-shrink:0;
+}
+.catalogTeamForm{
+  flex-shrink:0;
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}
+.catalogTeamFormLabel{
+  font-size:10px;
+  color:var(--muted);
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  font-weight:600;
+}
+.catalogTeamForm input{
+  width:100%;
+  min-height:34px;
+  font-size:11px;
+}
+.catalogTeamFormActions{
+  display:flex;
+  gap:6px;
+  flex-wrap:wrap;
+}
+.btnPrimary{
+  border-color:rgba(94,234,212,0.45);
+  color:var(--accent);
+  background:rgba(94,234,212,0.1);
+  font-size:11px;
+  min-height:32px;
+  padding:5px 10px;
+}
+.btnPrimary:hover{background:rgba(94,234,212,0.18)}
+.btnSm{
+  font-size:11px;
+  min-height:30px;
+  padding:4px 9px;
+}
+
+/* ── Main area ─────────────────────────────────────────── */
+.catalogMain{
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
   min-height:0;
+}
+.catalogMain.disabled{
+  opacity:.5;
+  pointer-events:none;
+  filter:saturate(.6);
+}
+
+/* Team bar */
+.catalogTeamBar{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding:10px 18px;
+  border-bottom:1px solid rgba(27,42,75,0.75);
+  flex-shrink:0;
+  background:rgba(16,26,47,0.55);
+}
+.catalogTeamSummary{
+  display:flex;
+  flex-direction:column;
+  gap:2px;
+  min-width:0;
+}
+.catalogTeamSummary strong{
+  font-size:14px;
+  color:#dbeafe;
+}
+.catalogTeamSummary span{
+  font-size:10px;
+  color:var(--muted);
+}
+.btnCredentialManager{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  border-color:rgba(96,165,250,0.4);
+  color:var(--accent2);
+  background:rgba(96,165,250,0.08);
+  font-size:11px;
+  min-height:34px;
+  padding:6px 14px;
+  white-space:nowrap;
+  flex-shrink:0;
+}
+.btnCredentialManager:hover:not(:disabled){background:rgba(96,165,250,0.16)}
+.btnCredentialManager:disabled{opacity:.45;cursor:not-allowed}
+.btnCredentialManagerIcon{font-size:14px}
+
+/* Tab bar */
+.catalogTabBar{
+  display:flex;
+  gap:0;
+  padding:0 18px;
+  border-bottom:1px solid rgba(27,42,75,0.75);
+  flex-shrink:0;
+  background:rgba(8,13,25,0.3);
+}
+.catalogTab{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  border:none;
+  border-bottom:2px solid transparent;
+  background:transparent;
+  color:var(--muted);
+  font-size:12px;
+  font-weight:600;
+  padding:10px 16px;
+  border-radius:0;
+  cursor:pointer;
+  transition:color .15s, border-color .15s;
+  min-height:auto;
+  margin-bottom:-1px;
+}
+.catalogTab:hover{color:var(--text);background:transparent}
+.catalogTab.active{color:#dbeafe;border-bottom-color:rgba(94,234,212,0.7)}
+.catalogTab:active{transform:none}
+.catalogTabCount{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-width:20px;
+  padding:1px 6px;
+  border-radius:999px;
+  background:rgba(255,255,255,0.08);
+  border:1px solid rgba(27,42,75,0.7);
+  font-size:9px;
+  font-weight:700;
+  color:var(--muted);
+  line-height:1;
+}
+.catalogTab.active .catalogTabCount{
+  background:rgba(94,234,212,0.12);
+  border-color:rgba(94,234,212,0.3);
+  color:var(--accent);
+}
+
+/* Tab panels */
+.catalogTabPanel{
+  flex:1;
+  min-height:0;
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
+}
+.catalogTabPanel[hidden]{display:none!important}
+
+/* Panel layout: list | form */
+.catalogPanelLayout{
+  display:grid;
+  grid-template-columns:minmax(0,1fr) minmax(280px,360px);
+  gap:0;
+  height:100%;
+  min-height:0;
+  overflow:hidden;
+}
+.catalogPanelSection{
   overflow-y:auto;
   overflow-x:hidden;
-  gap:16px;
+  padding:14px 18px;
 }
-.modalRootCatalog .itemList{
-  max-height:min(48vh,560px);
+.catalogPanelList{
+  border-right:1px solid rgba(27,42,75,0.6);
 }
-.modalRootCatalog .teamList{
-  max-height:min(42vh,520px);
-}
-.modalRootCatalog .managerSection{
-  padding:14px 16px;
-}
-.modalRootCatalog .managerSection h3{
-  font-size:13px;
+.catalogPanelListHead{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
   margin-bottom:10px;
 }
-.modalRootCatalog .managerGridContent{
-  gap:20px;
+.catalogPanelListHead h3{
+  margin:0;
+  font-size:12px;
+  color:#dbeafe;
+}
+.catalogItemList{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  max-height:none !important;
+  overflow:visible;
+  margin-bottom:0;
+}
+.catalogPanelForm{
+  background:rgba(8,13,25,0.3);
+}
+.catalogPanelForm h3{
+  font-size:12px;
+  color:#dbeafe;
+  margin:0 0 12px 0;
+}
+.catalogFormFields{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.catalogFormFields .row{margin:0}
+.catalogFormFields input,
+.catalogFormFields select,
+.catalogFormFields textarea{width:100%;min-width:0;box-sizing:border-box}
+.catalogFormFields textarea{resize:vertical;min-height:60px;font-family:inherit;font-size:12px;line-height:1.4}
+.catalogFormSubLabel{
+  font-size:10px;
+  color:var(--accent2);
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+  margin:8px 0 4px;
+  padding:4px 8px;
+  border-radius:6px;
+  background:rgba(96,165,250,0.06);
+  border:1px solid rgba(96,165,250,0.15);
+}
+.catalogFormActions{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:14px;
+  padding-top:12px;
+  border-top:1px solid rgba(27,42,75,0.6);
+}
+
+/* ──────────────────────────────────────────────────────────
+   Credential Modal
+────────────────────────────────────────────────────────── */
+#credentialModal{
+  z-index:60;
+}
+.credentialModalDialog{
+  width:min(1000px,100%);
+  max-height:calc(100vh - 48px);
+}
+.credentialModalBody{
+  padding:0;
+  overflow:hidden;
+  flex:1;
+  min-height:0;
+  display:flex;
+}
+.credentialWorkspace{
+  display:grid;
+  grid-template-columns:340px minmax(0,1fr);
+  height:100%;
+  min-height:0;
+  width:100%;
+}
+.credentialFormAside{
+  border-right:1px solid rgba(27,42,75,0.8);
+  overflow-y:auto;
+  overflow-x:hidden;
+  padding:16px 18px;
+  background:rgba(8,13,25,0.35);
+  display:flex;
+  flex-direction:column;
+  gap:0;
+}
+.credentialFormAside h3{
+  font-size:12px;
+  color:#dbeafe;
+  margin:0 0 12px 0;
+}
+.credentialFormFields{
+  flex:1;
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.credentialFormFields .row{margin:0}
+.credentialFormFields input,
+.credentialFormFields select,
+.credentialFormFields textarea{width:100%;min-width:0;box-sizing:border-box}
+.credentialFormFields textarea{
+  resize:vertical;
+  min-height:60px;
+  font-family:inherit;
+  font-size:12px;
+  line-height:1.4;
+  display:block;
+}
+.credentialListMain{
+  overflow-y:auto;
+  overflow-x:hidden;
+  padding:16px 18px;
+  display:flex;
+  flex-direction:column;
+}
+.credentialListHead{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  margin-bottom:12px;
+  flex-shrink:0;
+}
+.credentialListHead h3{
+  font-size:12px;
+  color:#dbeafe;
+  margin:0;
+}
+.credentialList{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  flex:1;
 }
 .checkListCatalogCredentialCats{
-  max-height:min(28vh,240px);
+  max-height:min(24vh,180px);
 }
-@media (max-width:960px){
-  .modalRootCatalog .managerWorkspace{
+
+@media (max-width:680px){
+  .catalogWorkspace{
     grid-template-columns:1fr;
+  }
+  .catalogSidebar{
+    border-right:none;
+    border-bottom:1px solid rgba(27,42,75,0.85);
+    max-height:40vh;
+  }
+  .catalogPanelLayout{
+    grid-template-columns:1fr;
+  }
+  .catalogPanelList{
+    border-right:none;
+    border-bottom:1px solid rgba(27,42,75,0.6);
+  }
+  .credentialWorkspace{
+    grid-template-columns:1fr;
+  }
+  .credentialFormAside{
+    border-right:none;
+    border-bottom:1px solid rgba(27,42,75,0.8);
   }
 }
 .settingsSection{margin-bottom:14px}
@@ -148,9 +549,76 @@ html,body{margin:0;padding:0;height:100%;overflow:auto;font-family:ui-sans-serif
 .stepPanelHead p{margin:0;color:var(--muted);font-size:12px;line-height:1.5;max-width:720px}
 .stepPanelActions{display:flex;justify-content:flex-start;gap:8px}
 .setupStartActions{display:flex;justify-content:flex-end;margin-top:12px}
-#btnStart{min-height:44px;padding:10px 18px;font-size:14px}
 .stepGrid{display:grid;gap:12px;align-items:start}
 .stepGridSetup{grid-template-columns:repeat(2,minmax(0,1fr))}
+
+/* ── Setup premium redesign ──────────────────────────────── */
+.setupGrid{display:grid;grid-template-columns:minmax(360px,1fr) minmax(0,1.15fr);gap:14px;align-items:start}
+.setupConfigCard,.setupSelectionCard{background:linear-gradient(180deg,rgba(16,26,47,0.93),rgba(12,18,33,0.84));border:1px solid rgba(27,42,75,0.85);border-radius:14px;box-shadow:var(--shadow);overflow:hidden}
+.setupBlock{padding:14px 16px}
+.setupBlockSep{border-top:1px solid rgba(27,42,75,0.55)}
+.setupBlockHead{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.setupBlockIcon{font-size:16px;flex-shrink:0;line-height:1}
+.setupBlockTitle{font-size:12px;font-weight:700;color:#dbeafe;display:flex;align-items:center;gap:5px}
+.setupBlockSub{font-size:10px;color:var(--muted);margin-top:1px;line-height:1.35}
+.setupInlineCtrl{margin-left:auto;display:flex;gap:4px;flex-shrink:0}
+.setupBigInput{width:100%;min-height:44px;font-size:13px;padding:10px 14px;border-radius:10px;letter-spacing:.01em}
+.setupRow3{display:grid;grid-template-columns:1fr 90px 110px;gap:8px;align-items:end}
+.setupField{display:flex;flex-direction:column;gap:4px}
+.setupField label{font-size:10px;color:var(--muted)}
+.setupField input,.setupField select{min-height:34px;font-size:12px}
+/* Toggle pills */
+.setupToggles{display:flex;flex-direction:column;gap:10px}
+.setupToggleRow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.setupToggleLabel{font-size:11px;color:var(--muted);min-width:88px;flex-shrink:0}
+.setupToggleHint{font-size:10px;color:rgba(138,160,194,.6);flex-basis:100%;padding-left:98px}
+.togglePills{display:flex;gap:4px}
+.tPill{cursor:pointer}
+.tPill input[type=radio]{display:none}
+.tPill span{display:inline-flex;align-items:center;padding:4px 12px;border:1px solid rgba(27,42,75,.85);border-radius:999px;font-size:11px;font-weight:500;color:var(--muted);background:rgba(255,255,255,.02);transition:border-color .15s,color .15s,background .15s;user-select:none}
+.tPill input:checked+span{border-color:rgba(94,234,212,.5);background:rgba(94,234,212,.1);color:var(--accent);font-weight:700}
+.tPill span:hover{background:rgba(255,255,255,.05)}
+/* iOS switch */
+.iosSwitch{display:inline-flex;align-items:center;gap:8px;cursor:pointer}
+.iosSwitch input[type=checkbox]{display:none}
+.iosSwitchTrack{position:relative;width:34px;height:18px;background:rgba(27,42,75,.9);border-radius:999px;border:1px solid rgba(27,42,75,.8);flex-shrink:0;transition:background .2s}
+.iosSwitchTrack::after{content:'';position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:999px;background:var(--muted);transition:transform .2s,background .2s}
+.iosSwitch input:checked+.iosSwitchTrack{background:rgba(94,234,212,.2);border-color:rgba(94,234,212,.4)}
+.iosSwitch input:checked+.iosSwitchTrack::after{transform:translateX(16px);background:var(--accent)}
+.iosSwitch>span:last-child{font-size:11px;color:var(--text)}
+/* Collapsible details */
+.setupCollapse{padding:0}
+.setupCollapse>summary{list-style:none}
+.setupCollapse>summary::-webkit-details-marker{display:none}
+.setupCollapseHead{display:flex;align-items:center;gap:10px;padding:12px 16px;cursor:pointer;user-select:none;transition:background .15s}
+.setupCollapseHead:hover{background:rgba(255,255,255,.02)}
+.setupCollapseTitle{flex:1;display:flex;flex-direction:column;gap:1px}
+.setupCollapseTitle>span:first-child{font-size:12px;font-weight:700;color:#dbeafe}
+.setupCollapseSub{font-size:10px;color:var(--muted)}
+.setupCollapseArrow{font-size:18px;color:var(--muted);transition:transform .15s;line-height:1;flex-shrink:0}
+.setupCollapse[open] .setupCollapseArrow{transform:rotate(90deg)}
+.setupCollapseBody{padding:0 16px 14px}
+/* Start CTA */
+.setupStartWrap{padding:12px 16px 16px;border-top:1px solid rgba(27,42,75,.55)}
+.setupStartBtn{width:100%;min-height:48px;font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:10px;border-color:rgba(94,234,212,.45);background:linear-gradient(135deg,rgba(94,234,212,.12),rgba(96,165,250,.08));color:var(--accent);border-radius:12px;letter-spacing:.03em;transition:background .15s,border-color .15s,transform .1s}
+.setupStartBtn:hover{background:linear-gradient(135deg,rgba(94,234,212,.2),rgba(96,165,250,.12));border-color:rgba(94,234,212,.6)}
+.setupStartBtn:active{transform:scale(0.99)}
+/* Optional tag */
+.setupOptTag{font-size:9px;font-weight:600;padding:2px 6px;border-radius:999px;border:1px solid rgba(138,160,194,.3);color:rgba(138,160,194,.8);background:rgba(255,255,255,.03);text-transform:uppercase;letter-spacing:.04em}
+/* Issues banner */
+.setupIssuesBanner{display:flex;gap:10px;margin:14px 16px 0;padding:10px 12px;border:1px solid rgba(251,113,133,.35);border-radius:10px;background:rgba(251,113,133,.06)}
+.setupIssuesBanner[hidden]{display:none!important}
+.setupIssuesIcon{font-size:16px;flex-shrink:0}
+.setupIssuesTit{font-size:11px;font-weight:700;color:#ffd5dc;margin-bottom:4px}
+/* Credential grid */
+.setupCredGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.setupCredCol{display:flex;flex-direction:column;gap:6px}
+/* Responsive */
+@media(max-width:860px){
+  .setupGrid{grid-template-columns:1fr}
+  .setupRow3{grid-template-columns:1fr 1fr}
+  .setupCredGrid{grid-template-columns:1fr}
+}
 .stepGridRunTop{grid-template-columns:360px minmax(0,1fr)}
 .stepGridRunBottom{grid-template-columns:minmax(0,1.2fr) minmax(320px,0.8fr)}
 .stepCard{min-width:0}
@@ -405,4 +873,228 @@ input#teamSearchInput{min-height:38px}
   .recordsToolbar .actions{justify-content:flex-start}
   .proxyFormSection .row,
   .proxyFormSection .row2 .row{grid-template-columns:1fr}
+}
+
+/* ──────────────────────────────────────────────────────────
+   Piyasa Dinle (Snipe) Modalı
+────────────────────────────────────────────────────────── */
+
+/* Header butonu */
+.btnSnipeHeader{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:6px 12px;font-size:11px;font-weight:600;min-height:32px;
+  background:linear-gradient(135deg,rgba(94,234,212,0.15),rgba(96,165,250,0.1));
+  border:1px solid rgba(94,234,212,0.45);
+  border-radius:8px;color:var(--accent);cursor:pointer;
+  transition:background 0.18s,box-shadow 0.18s;
+}
+.btnSnipeHeader:hover{
+  background:linear-gradient(135deg,rgba(94,234,212,0.25),rgba(96,165,250,0.18));
+  box-shadow:0 0 12px rgba(94,234,212,0.18);
+}
+
+/* Modal diyalog */
+.snipeModalDialog{
+  width:min(1020px,100%);
+  max-height:calc(100vh - 48px);
+}
+#snipeModal{z-index:60}
+
+/* Modal body no-padding (workspace kendi padding'ini verir) */
+.snipeModalBody{padding:0!important}
+
+/* Ana workspace: aside + main */
+.snipeWorkspace{
+  display:grid;
+  grid-template-columns:280px 1fr;
+  height:100%;
+  min-height:0;
+  overflow:hidden;
+}
+
+/* Sol: ayar formu */
+.snipeConfigAside{
+  overflow-y:auto;
+  padding:14px;
+  border-right:1px solid rgba(27,42,75,0.7);
+  background:rgba(255,255,255,0.01);
+  display:flex;flex-direction:column;gap:12px;
+}
+#snipeForm{display:flex;flex-direction:column;gap:10px}
+
+.snipeSection{
+  display:flex;gap:10px;align-items:flex-start;
+  background:rgba(255,255,255,0.025);
+  border:1px solid rgba(27,42,75,0.6);
+  border-radius:10px;padding:10px 12px;
+}
+.snipeSectionIcon{font-size:18px;line-height:1;padding-top:2px;flex-shrink:0}
+.snipeSectionBody{flex:1;min-width:0}
+.snipeSectionTitle{
+  font-size:11px;font-weight:600;color:#93c5fd;
+  text-transform:uppercase;letter-spacing:0.04em;
+  margin-bottom:8px;
+}
+.snipeRow2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.snipeField{display:flex;flex-direction:column;gap:4px}
+.snipeLabel{font-size:10px;color:var(--muted)}
+.snipeBigInput{
+  width:100%;padding:7px 10px;font-size:12px;
+  background:rgba(255,255,255,0.04);
+  border:1px solid rgba(27,42,75,0.8);
+  border-radius:7px;color:var(--text);
+  outline:none;
+}
+.snipeBigInput:focus{border-color:rgba(94,234,212,0.5);box-shadow:0 0 0 2px rgba(94,234,212,0.08)}
+.snipeSelect,.snipeInput{
+  width:100%;padding:6px 8px;font-size:12px;
+  background:rgba(255,255,255,0.04);
+  border:1px solid rgba(27,42,75,0.8);
+  border-radius:7px;color:var(--text);
+  outline:none;
+}
+.snipeSelect:focus,.snipeInput:focus{border-color:rgba(94,234,212,0.5)}
+.snipeOptTag{
+  font-size:9px;font-weight:400;
+  color:var(--muted);text-transform:none;letter-spacing:0;
+  background:rgba(255,255,255,0.04);
+  border:1px solid rgba(27,42,75,0.7);
+  border-radius:4px;padding:1px 5px;margin-left:4px;
+}
+
+/* Sağ: ana içerik */
+.snipeMain{
+  display:flex;flex-direction:column;gap:0;
+  overflow-y:auto;
+  padding:12px;
+  gap:12px;
+}
+
+/* Panel (bloklar / hesaplar) */
+.snipePanel{
+  background:rgba(255,255,255,0.025);
+  border:1px solid rgba(27,42,75,0.6);
+  border-radius:10px;overflow:hidden;
+}
+.snipePanelHead{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:8px 12px;
+  border-bottom:1px solid rgba(27,42,75,0.6);
+  background:rgba(255,255,255,0.02);
+}
+.snipePanelTitle{font-size:11px;font-weight:600;color:#dbeafe}
+.snipePanelActions{display:flex;gap:6px}
+.snipePillBtn{
+  font-size:10px;padding:2px 8px;border-radius:5px;
+  border:1px solid rgba(27,42,75,0.8);
+  background:rgba(255,255,255,0.04);
+  color:var(--muted);cursor:pointer;
+  transition:all 0.15s;
+}
+.snipePillBtn:hover{background:rgba(94,234,212,0.1);color:var(--accent);border-color:rgba(94,234,212,0.3)}
+
+/* Checklist */
+.snipeCheckList{
+  display:flex;flex-wrap:wrap;gap:4px;
+  padding:8px 10px;
+  max-height:160px;overflow-y:auto;
+}
+.snipeCheckItem{
+  display:flex;align-items:center;gap:5px;
+  font-size:11px;color:var(--text);
+  background:rgba(255,255,255,0.03);
+  border:1px solid rgba(27,42,75,0.6);
+  border-radius:6px;padding:4px 8px;
+  cursor:pointer;
+  transition:all 0.15s;
+  user-select:none;
+}
+.snipeCheckItem:hover{border-color:rgba(94,234,212,0.35);background:rgba(94,234,212,0.06)}
+.snipeCheckItem.selected{
+  background:rgba(94,234,212,0.12);
+  border-color:rgba(94,234,212,0.5);
+  color:var(--accent);
+}
+.snipeCheckItem input[type=checkbox]{
+  width:13px;height:13px;accent-color:var(--accent);
+  flex-shrink:0;
+}
+.snipeEmpty{
+  font-size:11px;color:var(--muted);
+  padding:8px;margin:0;font-style:italic;
+}
+
+/* Durum kartı */
+.snipeStatusCard{
+  background:rgba(255,255,255,0.025);
+  border:1px solid rgba(27,42,75,0.6);
+  border-radius:10px;padding:12px;
+  display:flex;flex-direction:column;gap:10px;
+}
+.snipeStatusRow{
+  display:grid;grid-template-columns:repeat(4,1fr);gap:8px;
+}
+.snipeStatBox{
+  background:rgba(255,255,255,0.03);
+  border:1px solid rgba(27,42,75,0.6);
+  border-radius:8px;padding:8px;
+  text-align:center;
+}
+.snipeStatVal{font-size:22px;font-weight:700;color:var(--accent);line-height:1}
+.snipeStatLbl{font-size:9px;color:var(--muted);margin-top:4px;text-transform:uppercase;letter-spacing:0.04em}
+
+.snipePollRow{
+  display:flex;align-items:flex-start;gap:10px;
+  padding:8px 10px;border-radius:8px;
+  background:rgba(8,145,178,0.08);
+  border:1px solid rgba(8,145,178,0.22);
+  font-size:11px;line-height:1.45;
+}
+.snipePollLbl{
+  flex:0 0 auto;font-size:9px;font-weight:700;text-transform:uppercase;
+  letter-spacing:0.05em;color:var(--muted);padding-top:1px;
+}
+.snipePollVal{
+  flex:1;min-width:0;color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:10px;word-break:break-word;
+}
+
+.snipeLog{
+  background:rgba(0,0,0,0.25);
+  border:1px solid rgba(27,42,75,0.6);
+  border-radius:7px;padding:8px 10px;
+  font-size:10px;color:var(--muted);font-family:monospace;
+  max-height:160px;overflow-y:auto;
+  line-height:1.6;
+  white-space:pre-wrap;
+}
+.snipeLogEntry.ok{color:#4ade80}
+.snipeLogEntry.warn{color:#facc15}
+.snipeLogEntry.err{color:var(--danger)}
+
+.snipeCtrlRow{display:flex;gap:8px}
+.snipeStartBtn{
+  flex:1;display:flex;align-items:center;justify-content:center;gap:8px;
+  padding:10px 18px;font-size:13px;font-weight:700;
+  background:linear-gradient(135deg,#0d9488,#0891b2);
+  border:none;border-radius:9px;color:#fff;cursor:pointer;
+  transition:opacity 0.18s,box-shadow 0.18s;
+}
+.snipeStartBtn:hover:not(:disabled){box-shadow:0 0 20px rgba(13,148,136,0.45);opacity:0.9}
+.snipeStartBtn:disabled{opacity:0.4;cursor:not-allowed}
+.snipeStopBtn{
+  padding:10px 18px;font-size:13px;font-weight:700;
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  background:rgba(251,113,133,0.12);
+  border:1px solid rgba(251,113,133,0.35);
+  border-radius:9px;color:var(--danger);cursor:pointer;
+  transition:all 0.18s;
+}
+.snipeStopBtn:hover:not(:disabled){background:rgba(251,113,133,0.22)}
+.snipeStopBtn:disabled{opacity:0.35;cursor:not-allowed}
+
+@media(max-width:760px){
+  .snipeWorkspace{grid-template-columns:1fr}
+  .snipeConfigAside{border-right:none;border-bottom:1px solid rgba(27,42,75,0.7)}
+  .snipeStatusRow{grid-template-columns:repeat(2,1fr)}
 }

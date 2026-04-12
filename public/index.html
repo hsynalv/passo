@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="tr">
 <head>
   <meta charset="utf-8" />
@@ -20,6 +20,10 @@
         <button type="button" id="btnOpenCatalogManager" class="btnGhost">Takım Havuzu Yönet</button>
         <button type="button" id="btnOpenScanMapManager" class="btnGhost">Blok Haritası (Scan Map)</button>
         <button type="button" id="btnOpenProxyManager" class="btnGhost">Proxy Havuzu</button>
+        <button type="button" id="btnOpenSnipeModal" class="btnSnipeHeader">
+          <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><circle cx="12" cy="12" r="3"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8z"/></svg>
+          Piyasa Dinle
+        </button>
         <div class="status" id="connStatus">Disconnected</div>
       </div>
     </header>
@@ -44,218 +48,282 @@
       </div>
 
       <form id="botForm" class="form wizardForm">
-        <section class="stepPanel active" id="stepSetupPanel" data-step-panel="setup">
-          <div class="stepPanelHead">
-            <div>
-              <h2>Bot Başlatma Bilgileri</h2>
-              <p>İlk adımda etkinlik, takım, kategori, üyelik ve proxy ayarlarını gir. Bot başlayınca ikinci adımdan canlı takibi yaparsın.</p>
-            </div>
-          </div>
+                <section class="stepPanel active" id="stepSetupPanel" data-step-panel="setup">
+          <div class="setupGrid">
 
-          <div class="stepGrid stepGridSetup">
-            <section class="card stepCard">
-              <h2>Temel Ayarlar</h2>
-              <div class="row">
-                <label>Event URL</label>
-                <input name="eventAddress" type="url" placeholder="https://www.passo.com.tr/etkinlik/.../..." required />
+            <!-- Ayar kolonu -->
+            <section class="setupConfigCard">
+
+              <!-- Etkinlik -->
+              <div class="setupBlock">
+                <div class="setupBlockHead">
+                  <span class="setupBlockIcon">&#127919;</span>
+                  <div>
+                    <div class="setupBlockTitle">Etkinlik</div>
+                    <div class="setupBlockSub">Bilet alinacak etkinligin Passo URL'si</div>
+                  </div>
+                </div>
+                <input name="eventAddress" type="url" class="setupBigInput" placeholder="https://www.passo.com.tr/etkinlik/..." required />
               </div>
 
-              <div class="row2">
-                <div class="row">
-                  <label>Takım</label>
-                  <div class="inlineActions">
-                    <select id="teamSelect" name="teamId">
-                      <option value="">Takım seç</option>
+              <!-- Takim & Bilet -->
+              <div class="setupBlock setupBlockSep">
+                <div class="setupBlockHead">
+                  <span class="setupBlockIcon">&#9917;</span>
+                  <div><div class="setupBlockTitle">Takim &amp; Bilet</div></div>
+                </div>
+                <div class="setupRow3">
+                  <div class="setupField">
+                    <label>Takim</label>
+                    <div class="inlineActions">
+                      <select id="teamSelect" name="teamId" style="flex:1;min-width:0">
+                        <option value="">Sec...</option>
+                      </select>
+                      <button type="button" id="btnRefreshTeams" class="btnIconMuted" title="Yenile">&#8635;</button>
+                    </div>
+                  </div>
+                  <div class="setupField">
+                    <label>Bilet adedi</label>
+                    <input name="ticketCount" type="number" min="1" max="10" value="1" />
+                  </div>
+                  <div class="setupField">
+                    <label>Ticket type</label>
+                    <select name="ticketType">
+                      <option value="regular">regular</option>
+                      <option value="combined">combined</option>
                     </select>
-                    <button type="button" id="btnRefreshTeams" class="btnMuted">Yenile</button>
                   </div>
-                  <div class="hint">Kayıtlı takım seçildiğinde kategoriler ve üyelik havuzu otomatik yüklenir.</div>
-                </div>
-                <div class="row">
-                  <label>Ticket Type</label>
-                  <select name="ticketType">
-                    <option value="regular">regular</option>
-                    <option value="combined">combined</option>
-                  </select>
                 </div>
               </div>
 
-              <div class="row2">
-                <div class="row">
-                  <label>Bilet Adedi (ticketCount)</label>
-                  <input name="ticketCount" type="number" min="1" max="10" value="1" />
-                  <div class="hint">Hesap başına sepete atılacak bilet sayısı. Varsayılan 1.</div>
+              <!-- Davranis -->
+              <div class="setupBlock setupBlockSep">
+                <div class="setupBlockHead">
+                  <span class="setupBlockIcon">&#9881;&#65039;</span>
+                  <div><div class="setupBlockTitle">Davranis</div></div>
                 </div>
-                <div class="row" style="justify-content:flex-end">
-                  <label>Proxy Ayarı</label>
-                  <label class="chk"><input id="useProxyPoolInput" name="useProxyPool" type="checkbox" checked /> Proxy kullan</label>
-                  <div class="hint">Açıkken Proxy Havuzu kullanılır, kapalıysa proxysiz çalışır.</div>
+                <div class="setupToggles">
+                  <div class="setupToggleRow">
+                    <div class="setupToggleLabel">Kategori modu</div>
+                    <div class="togglePills">
+                      <label class="tPill"><input type="radio" name="categorySelectionMode" value="scan" checked /><span>SVG (Normal)</span></label>
+                      <label class="tPill"><input type="radio" name="categorySelectionMode" value="legacy" /><span>Legacy</span></label>
+                    </div>
+                    <div class="setupToggleHint">SVG haritadan secer, bulamazsa dropdown'a duser</div>
+                  </div>
+                  <div class="setupToggleRow">
+                    <div class="setupToggleLabel">Koltuk secimi</div>
+                    <div class="togglePills">
+                      <label class="tPill"><input type="radio" name="seatSelectionMode" value="random" checked /><span>Normal</span></label>
+                      <label class="tPill"><input type="radio" name="seatSelectionMode" value="deterministic" /><span>Ilk bos</span></label>
+                    </div>
+                    <div class="setupToggleHint">Ilk bos: seatmap'i tarar, en uygun koltuGu alir</div>
+                  </div>
+                  <div class="setupToggleRow">
+                    <div class="setupToggleLabel">Proxy</div>
+                    <label class="iosSwitch">
+                      <input id="useProxyPoolInput" name="useProxyPool" type="checkbox" checked />
+                      <span class="iosSwitchTrack"></span>
+                      <span>Proxy havuzu kullan</span>
+                    </label>
+                  </div>
                 </div>
               </div>
 
-              <div class="row2">
-                <div class="row">
-                  <label>Kategori Modu</label>
-                  <select name="categorySelectionMode">
-                    <option value="scan" selected>Normal Mod</option>
-                    <option value="legacy">Legacy (Eski)</option>
-                  </select>
-                  <div class="hint">Normal Mod: önce SVG varsa onu dener, olmazsa legacy dropdown’a düşer.</div>
-                </div>
-                <div class="row">
-                  <label>Öncelikli satış</label>
-                  <select name="prioritySale" id="prioritySaleSelect">
-                    <option value="off" selected>Kapalı</option>
-                    <option value="on">Açık</option>
-                  </select>
-                  <div class="hint">Açıkken Passo’daki öncelik satırı eşlemesi için seçim yapılır (diğer gruplar eklendikçe liste genişler).</div>
-                </div>
-              </div>
-
-              <div class="row2">
-                <div class="row">
-                  <label>Koltuk Seçim Modu</label>
-                  <select name="seatSelectionMode">
-                    <option value="random" selected>Normal</option>
-                    <option value="deterministic">Tarama Modu (ilk boş)</option>
-                  </select>
-                  <div class="hint">Tarama Modu: seatmap’te “ilk boş” koltuğu seçer (row/seat öncelikli).</div>
-                </div>
-                <div class="row"></div>
-              </div>
-              <div class="row" id="prioritySaleCategoryRow" hidden style="margin-top:4px">
-                <label>Öncelik kategorisi</label>
-                <select name="prioritySaleCategory" id="prioritySaleCategorySelect">
-                  <option value="">Seçin…</option>
-                  <option value="Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler">Yüksek Divan Kurulu, Kongre ve Temsilci Üyeler</option>
-                  <option value="Kara Kartal+ Öncelikli Bilet Alım">Kara Kartal+ Öncelikli Bilet Alım</option>
-                  <option value="GS PLUS Premium">GS PLUS Premium</option>
-                  <option value="GSPara Öncelik">GSPara Öncelik</option>
-                </select>
-              </div>
-
-              <details class="details divanPriorityFields" id="gsPlusPriorityFieldsDetails" hidden style="margin-top:10px">
-                <summary class="detailsTitle" style="cursor:pointer;user-select:none">GS PLUS Premium: cep telefonu</summary>
-                <div class="hint" style="margin-top:8px">Passo bu öncelikte telefon doğrulaması ister; tüm seçili hesap oturumlarında aynı numara kullanılır (üyelikte yoksa buradan).</div>
-                <div class="row" style="margin-top:8px">
-                  <label>Cep telefonu</label>
-                  <input name="priorityPhone" id="priorityPhoneInput" type="tel" inputmode="tel" autocomplete="tel" placeholder="5XX XXX XX XX veya 05XX…" />
+              <!-- Oncelikli Satis -->
+              <details class="setupBlock setupBlockSep setupCollapse">
+                <summary class="setupCollapseHead">
+                  <span class="setupBlockIcon">&#127894;&#65039;</span>
+                  <div class="setupCollapseTitle">
+                    <span>Oncelikli Satis</span>
+                    <span class="setupCollapseSub">GS Plus, GSPara, Divan oncelikleri</span>
+                  </div>
+                  <span class="setupCollapseArrow">&#8250;</span>
+                </summary>
+                <div class="setupCollapseBody">
+                  <div class="setupField" style="margin-bottom:10px">
+                    <label>Oncelik durumu</label>
+                    <select name="prioritySale" id="prioritySaleSelect">
+                      <option value="off" selected>Kapali</option>
+                      <option value="on">Acik</option>
+                    </select>
+                  </div>
+                  <div class="row" id="prioritySaleCategoryRow" hidden>
+                    <label>Oncelik kategorisi</label>
+                    <select name="prioritySaleCategory" id="prioritySaleCategorySelect">
+                      <option value="">Secin...</option>
+                      <option value="&#89;&#252;ksek Divan Kurulu, Kongre ve Temsilci &#220;yeler">&#89;&#252;ksek Divan Kurulu, Kongre ve Temsilci &#220;yeler</option>
+                      <option value="Kara Kartal+ &#214;ncelikli Bilet Alim">Kara Kartal+ &#214;ncelikli Bilet Alim</option>
+                      <option value="GS PLUS Premium">GS PLUS Premium</option>
+                      <option value="GSPara &#214;ncelik">GSPara &#214;ncelik</option>
+                    </select>
+                  </div>
+                  <details class="details divanPriorityFields" id="gsPlusPriorityFieldsDetails" hidden style="margin-top:8px">
+                    <summary class="detailsTitle" style="cursor:pointer;user-select:none">GS PLUS Premium - cep telefonu</summary>
+                    <div class="hint" style="margin-top:6px">Tum secili hesap oturumlarinda ayni numara kullanilir.</div>
+                    <div class="row" style="margin-top:8px">
+                      <label>Cep telefonu</label>
+                      <input name="priorityPhone" id="priorityPhoneInput" type="tel" inputmode="tel" autocomplete="tel" placeholder="5XX XXX XX XX" />
+                    </div>
+                  </details>
+                  <details class="details divanPriorityFields" id="gsParaPriorityFieldsDetails" hidden style="margin-top:8px">
+                    <summary class="detailsTitle" style="cursor:pointer;user-select:none">GSPara Oncelik - TCKN</summary>
+                    <div class="row" style="margin-top:8px">
+                      <label>T.C. kimlik no</label>
+                      <input name="priorityTckn" id="priorityTcknInput" type="text" inputmode="numeric" autocomplete="off" placeholder="11 hane" maxlength="11" />
+                    </div>
+                  </details>
+                  <details class="details divanPriorityFields" id="divanPriorityFieldsDetails" hidden style="margin-top:8px">
+                    <summary class="detailsTitle" style="cursor:pointer;user-select:none">Divan - Sicil No / oncelikli bilet kodu</summary>
+                    <div class="row2" style="margin-top:8px">
+                      <div class="row">
+                        <label>Sicil No</label>
+                        <input name="sicilNo" type="text" autocomplete="off" placeholder="TXXXX" />
+                      </div>
+                      <div class="row">
+                        <label>Oncelikli bilet kodu</label>
+                        <input name="priorityTicketCode" type="text" autocomplete="off" />
+                      </div>
+                    </div>
+                  </details>
                 </div>
               </details>
 
-              <details class="details divanPriorityFields" id="gsParaPriorityFieldsDetails" hidden style="margin-top:10px">
-                <summary class="detailsTitle" style="cursor:pointer;user-select:none">GSPara Öncelik: TCKN</summary>
-                <div class="hint" style="margin-top:8px">Passo bu öncelikte TCKN ister; tüm seçili hesap oturumlarında aynı numara kullanılır (üyelikte yoksa buradan gir — GS PLUS telefonu gibi).</div>
-                <div class="row" style="margin-top:8px">
-                  <label>T.C. kimlik no</label>
-                  <input name="priorityTckn" id="priorityTcknInput" type="text" inputmode="numeric" autocomplete="off" placeholder="11 hane" maxlength="11" />
+              <!-- Fallback Ayarlari -->
+              <details class="setupBlock setupBlockSep setupCollapse">
+                <summary class="setupCollapseHead">
+                  <span class="setupBlockIcon">&#128260;</span>
+                  <div class="setupCollapseTitle">
+                    <span>Fallback Ayarlari</span>
+                    <span class="setupCollapseSub">Kategori secilmemisse kullanilir</span>
+                  </div>
+                  <span class="setupCollapseArrow">&#8250;</span>
+                </summary>
+                <div class="setupCollapseBody">
+                  <div class="row2">
+                    <div class="row">
+                      <label>Fallback kategori</label>
+                      <input name="categoryType" type="text" placeholder="Maraton" />
+                    </div>
+                    <div class="row">
+                      <label>Alternatif kategori</label>
+                      <input name="alternativeCategory" type="text" placeholder="Kale Arkasi" />
+                    </div>
+                  </div>
                 </div>
               </details>
 
-              <details class="details divanPriorityFields" id="divanPriorityFieldsDetails" hidden style="margin-top:10px">
-                <summary class="detailsTitle" style="cursor:pointer;user-select:none">Divan: Sicil No / öncelikli bilet kodu (üyelikte yoksa)</summary>
-                <div class="hint" style="margin-top:8px">Bu öncelik seçiliyken bilgiler hesapta yoksa buradan girebilirsin; tüm seçili ana/tutucu hesaplar için ortak yedek olarak kullanılır.</div>
-                <div class="row2" style="margin-top:8px">
-                  <div class="row">
-                    <label>Sicil No</label>
-                    <input name="sicilNo" type="text" autocomplete="off" placeholder="Temsilci: T ile (TXXXX)" />
-                  </div>
-                  <div class="row">
-                    <label>Öncelikli bilet kodu</label>
-                    <input name="priorityTicketCode" type="text" autocomplete="off" placeholder="" />
-                  </div>
-                </div>
-              </details>
+              <!-- Baslat CTA -->
+              <div class="setupStartWrap">
+                <button type="submit" id="btnStart" class="setupStartBtn">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" style="flex-shrink:0"><path d="M3 2.5a.5.5 0 0 1 .765-.424l10 5.5a.5.5 0 0 1 0 .848l-10 5.5A.5.5 0 0 1 3 13.5V2.5z"/></svg>
+                  Botu Baslat
+                </button>
+              </div>
 
-              <div class="row2">
-                <div class="row">
-                  <label>Fallback Kategori (categoryType)</label>
-                  <input name="categoryType" type="text" placeholder="Maraton" />
-                  <div class="pill muted" style="margin-top:4px">Takım kategorisi seçilmezse yedek olarak kullanılır.</div>
-                </div>
-                <div class="row">
-                  <label>Alternatif Kategori</label>
-                  <input name="alternativeCategory" type="text" placeholder="Kale Arkası" />
-                </div>
-              </div>
-              <div class="setupStartActions">
-                <button type="submit" id="btnStart">Botu Başlat</button>
-              </div>
             </section>
 
-            <section class="card stepCard">
-              <h2>Kategori ve Üyelik Havuzu</h2>
-              <div id="setupIssuesCard" class="subcard" hidden>
-                <h3>Form Hatalari</h3>
-                <div id="setupIssuesList" class="setupIssuesList"></div>
+            <!-- Secim kolonu -->
+            <section class="setupSelectionCard">
+
+              <!-- Hata banner -->
+              <div id="setupIssuesCard" class="setupIssuesBanner" hidden>
+                <span class="setupIssuesIcon">&#9888;&#65039;</span>
+                <div>
+                  <div class="setupIssuesTit">Form Hatalari</div>
+                  <div id="setupIssuesList" class="setupIssuesList"></div>
+                </div>
               </div>
-              <div class="row">
-                <label>Kayıtlı Kategoriler</label>
-                <div class="inlineActions" style="margin-bottom:4px">
-                  <button type="button" id="btnSelectAllCategories" class="btnMuted">Tümünü Seç</button>
-                  <button type="button" id="btnClearCategories" class="btnMuted">Temizle</button>
+
+              <!-- Kategoriler -->
+              <div class="setupBlock">
+                <div class="setupBlockHead">
+                  <span class="setupBlockIcon">&#128203;</span>
+                  <div style="flex:1;min-width:0">
+                    <div class="setupBlockTitle">Kategoriler</div>
+                    <div class="setupBlockSub">Bilet alinacak tribunleri sec</div>
+                  </div>
+                  <div class="setupInlineCtrl">
+                    <button type="button" id="btnSelectAllCategories" class="btnMuted btnSm">Tumu</button>
+                    <button type="button" id="btnClearCategories" class="btnMuted btnSm">Temizle</button>
+                  </div>
                 </div>
                 <div id="teamCategoryList" class="checkList">
-                  <div class="checkListEmpty">Önce takım seç.</div>
+                  <div class="checkListEmpty">Once takim sec.</div>
                 </div>
               </div>
 
-              <div class="row">
-                <label>Seçili Bloklar</label>
-                <div class="inlineActions" style="margin-bottom:4px">
-                  <button type="button" id="btnSelectAllBlocks" class="btnMuted">Tümünü Seç</button>
-                  <button type="button" id="btnClearBlocks" class="btnMuted">Temizle</button>
+              <!-- Bloklar -->
+              <div class="setupBlock setupBlockSep">
+                <div class="setupBlockHead">
+                  <span class="setupBlockIcon">&#128506;&#65039;</span>
+                  <div style="flex:1;min-width:0">
+                    <div class="setupBlockTitle">Bloklar <span class="setupOptTag">opsiyonel</span></div>
+                    <div class="setupBlockSub">Secilmezse rastgele; secilirse hedefli blok</div>
+                  </div>
+                  <div class="setupInlineCtrl">
+                    <button type="button" id="btnSelectAllBlocks" class="btnMuted btnSm">Tumu</button>
+                    <button type="button" id="btnClearBlocks" class="btnMuted btnSm">Temizle</button>
+                  </div>
                 </div>
                 <div id="teamBlockList" class="checkList">
-                  <div class="checkListEmpty">Önce takım seç.</div>
+                  <div class="checkListEmpty">Once takim sec.</div>
                 </div>
               </div>
 
-              <div class="details detailsOpen" style="margin-top:10px">
-                <div class="detailsTitle">Takım Üyelik Havuzu</div>
-                <div class="row2" style="margin-top:10px">
-                  <div class="row">
+              <!-- Hesap Havuzu -->
+              <div class="setupBlock setupBlockSep">
+                <div class="setupBlockHead">
+                  <span class="setupBlockIcon">&#128101;</span>
+                  <div>
+                    <div class="setupBlockTitle">Hesap Havuzu</div>
+                    <div class="setupBlockSub">Bot calistiracak hesaplari sec</div>
+                  </div>
+                </div>
+                <div class="setupCredGrid">
+                  <div class="setupCredCol">
                     <div class="pickerHead">
-                      <label>Ana hesap için seçili üyelikler</label>
-                      <span id="aCredentialCount" class="pickerCount">0 seçili</span>
+                      <label>Ana hesaplar</label>
+                      <span id="aCredentialCount" class="pickerCount">0 secili</span>
                     </div>
                     <div id="aCredentialList" class="credentialPickerList">
-                      <div class="checkListEmpty">Önce takım seç.</div>
+                      <div class="checkListEmpty">Once takim sec.</div>
                     </div>
-                    <div class="hint">Birden fazla üyelik seçebilirsin. Her ana hesap için ayrıca `Odeme yapabilir` işaretini açıp kapatabilirsin.</div>
+                    <div class="hint" style="margin-top:5px">Her hesap icin odeme / transfer rolunu isaretleyebilirsin.</div>
                   </div>
-                  <div class="row">
+                  <div class="setupCredCol">
                     <div class="pickerHead">
-                      <label>Tutucu hesap için seçili üyelikler</label>
-                      <span id="bCredentialCount" class="pickerCount">0 seçili</span>
+                      <label>Tutucu hesaplar</label>
+                      <span id="bCredentialCount" class="pickerCount">0 secili</span>
                     </div>
                     <div id="bCredentialList" class="credentialPickerList">
-                      <div class="checkListEmpty">Önce takım seç.</div>
+                      <div class="checkListEmpty">Once takim sec.</div>
                     </div>
-                    <div class="hint">Birden fazla üyelik seçebilirsin. Üyeliklerde email, şifre, TCKN ve Fan Card tutulur.</div>
                   </div>
                 </div>
               </div>
+
             </section>
 
-            <section class="card stepCard" id="setupPaymentCard" hidden>
+            <!-- Odeme karti (gizli, acilinca tam genislik) -->
+            <section class="card stepCard" id="setupPaymentCard" hidden style="grid-column:1/-1">
               <h2>Kart Bilgileri</h2>
-              <div class="hint" style="margin-top:0">Bu alan ilk sayfada tutulur. Ana hesap havuzunda en az 1 hesap için `Odeme yapabilir` seçildiği anda açılır ve doldurulması zorunlu olur.</div>
+              <div class="hint" style="margin-top:0">Ana hesap havuzunda en az 1 hesap icin "Odeme yapabilir" secildiginde acilir ve doldurulmasi zorunlu olur.</div>
               <div class="row2" style="margin-top:10px">
                 <div class="row">
-                  <label>Card Holder</label>
+                  <label>Kart sahibi</label>
                   <input name="cardHolder" id="setupCardHolder" type="text" placeholder="AD SOYAD" autocomplete="cc-name" />
                 </div>
                 <div class="row">
-                  <label>Card Number</label>
+                  <label>Kart numarasi</label>
                   <input name="cardNumber" id="setupCardNumber" type="text" inputmode="numeric" placeholder="0000 0000 0000 0000" autocomplete="cc-number" />
                 </div>
               </div>
               <div class="row2">
                 <div class="row">
-                  <label>Expiry (MM / YY)</label>
+                  <label>Son kullanma (AA / YY)</label>
                   <div class="expiryRow">
-                    <input name="expiryMonth" id="setupExpiryMonth" type="text" inputmode="numeric" placeholder="MM" autocomplete="cc-exp-month" />
+                    <input name="expiryMonth" id="setupExpiryMonth" type="text" inputmode="numeric" placeholder="AA" autocomplete="cc-exp-month" />
                     <input name="expiryYear" id="setupExpiryYear" type="text" inputmode="numeric" placeholder="YY" autocomplete="cc-exp-year" />
                   </div>
                 </div>
@@ -267,9 +335,7 @@
             </section>
 
           </div>
-
         </section>
-
         <section class="stepPanel" id="stepRunPanel" data-step-panel="run" hidden>
           <div class="stepPanelHead">
             <div>
@@ -504,175 +570,252 @@
     <div class="modalBackdrop" id="catalogModalBackdrop"></div>
     <div class="modalDialog modalDialogCatalogFull" role="dialog" aria-modal="true" aria-labelledby="catalogModalTitle">
       <div class="modalHead">
-        <h2 id="catalogModalTitle">Takım, Kategori ve Üyelik Yönetimi</h2>
+        <div class="catalogModalHeadLeft">
+          <h2 id="catalogModalTitle">Takım, Kategori &amp; Blok Yönetimi</h2>
+          <span class="catalogModalHeadSub">Takım seç → kategori ve blokları yönet → üyelikleri ayrı modaldan yönet</span>
+        </div>
         <button type="button" class="modalClose" id="btnCloseCatalogModal" aria-label="Kapat">×</button>
       </div>
-      <p class="modalIntro">
-        Takım havuzunu buradan yönetebilirsin. Üyelik kayıtlarında <code>email</code>, <code>şifre</code>, <code>TCKN</code> ve <code>Fan Card</code> tutulur.
-      </p>
-      <div class="modalBody">
-        <div class="managerWorkspace">
-          <aside class="managerSidebar">
-            <section class="managerSection">
-              <h3>Sistemdeki Takımlar</h3>
-              <div class="hint" style="margin-top:0">Önce soldan takım seç. Sağ tarafta o takıma ait kategoriler ve üyelikler açılır.</div>
-              <div class="row" style="margin-top:10px">
-                <label>Takım Ara</label>
-                <input id="teamSearchInput" type="text" placeholder="Takım adına göre filtrele" />
-              </div>
-              <div id="manageTeamList" class="itemList teamList">
-                <div class="itemListEmpty">Henüz takım yok.</div>
-              </div>
-            </section>
 
-            <section class="managerSection">
-              <h3>Takım Formu</h3>
-              <div class="hint" style="margin-top:0">Yeni takım ekleyebilir veya listeden seçtiğin takımı güncelleyebilirsin. Yeni kayıtlar otomatik aktif kabul edilir.</div>
-              <div class="row">
-                <label>Yeni / Güncel Takım Adı</label>
-                <input id="teamNameInput" type="text" placeholder="Galatasaray" />
-              </div>
-              <div class="actions">
-                <button type="button" id="btnCreateTeam">Takım Ekle</button>
-                <button type="button" id="btnUpdateTeam" class="btnMuted">Seçili Takımı Güncelle</button>
-                <button type="button" id="btnDeleteTeam" class="btnDanger">Seçili Takımı Sil</button>
-              </div>
-            </section>
-          </aside>
+      <div class="modalBody catalogModalBody">
+        <div class="catalogWorkspace">
 
-          <div class="managerContent" id="managerContent">
-            <div class="row">
-              <div id="managerTeamSummary" class="managerSummary">
-                <strong>Takım seçilmedi</strong>
-                <span>Soldan bir takım seçmeden kategori ve üyelik yönetimi yapılamaz.</span>
+          <!-- ── Sol panel: Takım listesi + form ─────────────────────── -->
+          <aside class="catalogSidebar">
+            <div class="catalogSidebarHead">
+              <span class="catalogSidebarLabel">Takımlar</span>
+              <button type="button" id="btnRefreshTeams" class="btnIconMuted" title="Yenile">↻</button>
+            </div>
+            <input id="teamSearchInput" type="text" class="catalogSearchInput" placeholder="Takım ara…" autocomplete="off" />
+            <div id="manageTeamList" class="teamList catalogTeamList">
+              <div class="itemListEmpty">Henüz takım yok.</div>
+            </div>
+            <div class="catalogSidebarDivider"></div>
+            <div class="catalogTeamForm">
+              <span class="catalogTeamFormLabel">Takım ekle / düzenle</span>
+              <input id="teamNameInput" type="text" placeholder="Takım adı…" autocomplete="off" />
+              <div class="catalogTeamFormActions">
+                <button type="button" id="btnCreateTeam" class="btnPrimary btnSm">Ekle</button>
+                <button type="button" id="btnUpdateTeam" class="btnMuted btnSm">Güncelle</button>
+                <button type="button" id="btnDeleteTeam" class="btnDanger btnSm">Sil</button>
               </div>
             </div>
-            <div class="managerGrid managerGridContent">
-              <section class="managerSection">
-                <h3>Kategori Yönetimi</h3>
-                <div class="hint" style="margin-top:0">Takım için sadece kategori adını girmen yeterli. Liste giriş sırasına göre akar.</div>
-                <div id="manageCategoryList" class="itemList">
-                  <div class="itemListEmpty">Takım seçildiğinde kategoriler burada görünür.</div>
-                </div>
-                <input id="categoryEditId" type="hidden" />
-                <div class="managerFormStack">
-                <div class="row">
-                  <label>Kategori</label>
-                  <input id="categoryValueInput" type="text" placeholder="Maraton Alt" />
-                </div>
-                <div class="row2">
-                  <div class="row">
-                    <label>Bilet Adedi</label>
-                    <input id="categoryTicketCount" type="number" min="1" max="10" value="1" />
-                    <div class="hint">Bu kategoride hesap başına kaç bilet alınacak.</div>
-                  </div>
-                  <div class="row">
-                    <label>Koltuk Kuralı</label>
-                    <select id="categoryAdjacentSeats">
-                      <option value="false">Yanyana olmak zorunda değil</option>
-                      <option value="true">Yanyana koltuk seç</option>
-                    </select>
-                    <div class="hint">Birden fazla bilette koltuklar yanyana mı olsun.</div>
-                  </div>
-                </div>
-                </div>
-                <div class="actions">
-                  <button type="button" id="btnSaveCategory">Kategori Kaydet</button>
-                  <button type="button" id="btnDeleteCategory" class="btnDanger">Sil</button>
-                  <button type="button" id="btnResetCategory" class="btnMuted">Temizle</button>
-                </div>
-              </section>
+          </aside>
 
-              <section class="managerSection">
-                <h3>Blok Yönetimi</h3>
-                <div class="hint" style="margin-top:0">SVG haritadan veya manuel olarak blok hedefleri ekle. SVG modunda blok DOM kimliği (block17363), Legacy modda kategori metin + blok değeri kullanılır.</div>
-                <div id="manageBlockList" class="itemList">
-                  <div class="itemListEmpty">Takım seçildiğinde bloklar burada görünür.</div>
+          <!-- ── Sağ panel: Takım özeti + Tab (Kategori / Blok) ───────── -->
+          <div class="catalogMain" id="catalogMain">
+
+            <!-- Takım özeti + üyelik butonu -->
+            <div class="catalogTeamBar" id="catalogTeamBar">
+              <div id="managerTeamSummary" class="catalogTeamSummary">
+                <strong>Takım seçilmedi</strong>
+                <span>Soldan bir takım seç.</span>
+              </div>
+              <button type="button" id="btnOpenCredentialManager" class="btnCredentialManager" disabled>
+                <span class="btnCredentialManagerIcon">👤</span>
+                Üyelikleri Yönet
+              </button>
+            </div>
+
+            <!-- Tab bar -->
+            <div class="catalogTabBar" id="catalogTabBar" role="tablist">
+              <button type="button" class="catalogTab active" role="tab" data-catalog-tab="categories" aria-selected="true">
+                Kategoriler
+                <span class="catalogTabCount" id="tabCountCategories">0</span>
+              </button>
+              <button type="button" class="catalogTab" role="tab" data-catalog-tab="blocks" aria-selected="false">
+                Bloklar
+                <span class="catalogTabCount" id="tabCountBlocks">0</span>
+              </button>
+            </div>
+
+            <!-- ── Tab: Kategoriler ─────────────────────────────────── -->
+            <div class="catalogTabPanel active" id="catalogTabCategories" data-catalog-panel="categories" role="tabpanel">
+              <div class="catalogPanelLayout">
+
+                <!-- Liste -->
+                <div class="catalogPanelSection catalogPanelList">
+                  <div class="catalogPanelListHead">
+                    <h3>Kategori Listesi</h3>
+                    <span class="hint" style="margin:0">Kategori seç → sağ formu doldurur</span>
+                  </div>
+                  <div id="manageCategoryList" class="itemList catalogItemList">
+                    <div class="itemListEmpty">Takım seçildiğinde kategoriler burada görünür.</div>
+                  </div>
                 </div>
-                <input id="blockEditId" type="hidden" />
-                <div class="managerFormStack">
-                  <div class="row">
-                    <label>Blok Etiketi</label>
-                    <input id="blockLabelInput" type="text" placeholder="Maraton Kuzey Block 17363" />
-                  </div>
-                  <div class="row">
-                    <label>Seçim Modu</label>
-                    <select id="blockSelectionMode">
-                      <option value="svg">Normal — SVG haritadan seç (bulamazsa legacy dropdown'a geç)</option>
-                      <option value="legacy">Yalnızca Legacy — kategori + blok dropdown</option>
-                    </select>
-                  </div>
-                  <div id="blockSvgFields">
+
+                <!-- Form -->
+                <div class="catalogPanelSection catalogPanelForm">
+                  <h3 id="categoryFormTitle">Kategori Ekle</h3>
+                  <input id="categoryEditId" type="hidden" />
+                  <div class="catalogFormFields">
                     <div class="row">
-                      <label>SVG Blok ID</label>
-                      <input id="blockSvgBlockIdInput" type="text" placeholder="block17363" />
-                      <div class="hint">Scan Map sonucundan veya koltuk seçim sayfası DOM'undan alınır.</div>
+                      <label>Kategori metni</label>
+                      <input id="categoryValueInput" type="text" placeholder="Maraton Alt" />
                     </div>
-                    <div class="row">
-                      <label>Legacy Fallback — Kategori Metni <small>(opsiyonel)</small></label>
-                      <input id="blockCategoryTypeInput" type="text" placeholder="Maraton Alt" />
-                      <div class="hint">SVG seçim başarısız olursa bu kategori + blok değerinden legacy dropdown yoluyla seçilir.</div>
-                    </div>
-                    <div class="row">
-                      <label>Legacy Fallback — Blok Değeri <small>(opsiyonel)</small></label>
-                      <input id="blockBlockValInput" type="text" placeholder="17363" />
+                    <div class="row2">
+                      <div class="row">
+                        <label>Bilet adedi</label>
+                        <input id="categoryTicketCount" type="number" min="1" max="10" value="1" />
+                      </div>
+                      <div class="row">
+                        <label>Koltuk kuralı</label>
+                        <select id="categoryAdjacentSeats">
+                          <option value="false">Serbest</option>
+                          <option value="true">Yanyana</option>
+                        </select>
+                      </div>
                     </div>
                   </div>
-                  <div id="blockLegacyFields" hidden>
-                    <div class="row">
-                      <label>Kategori Metni</label>
-                      <input id="blockLegacyOnlyCategoryTypeInput" type="text" placeholder="Maraton Alt" />
-                    </div>
-                    <div class="row">
-                      <label>Blok Değeri (select#blocks option value)</label>
-                      <input id="blockLegacyOnlyBlockValInput" type="text" placeholder="17363" />
-                    </div>
+                  <div class="catalogFormActions">
+                    <button type="button" id="btnSaveCategory" class="btnPrimary">Kaydet</button>
+                    <button type="button" id="btnDeleteCategory" class="btnDanger">Sil</button>
+                    <button type="button" id="btnResetCategory" class="btnMuted">Temizle</button>
                   </div>
-                  <div class="row2">
+                </div>
+
+              </div>
+            </div>
+
+            <!-- ── Tab: Bloklar ────────────────────────────────────── -->
+            <div class="catalogTabPanel" id="catalogTabBlocks" data-catalog-panel="blocks" role="tabpanel" hidden>
+              <div class="catalogPanelLayout">
+
+                <!-- Liste -->
+                <div class="catalogPanelSection catalogPanelList">
+                  <div class="catalogPanelListHead">
+                    <h3>Blok Listesi</h3>
+                    <span class="hint" style="margin:0">Blok seç → sağ formu doldurur</span>
+                  </div>
+                  <div id="manageBlockList" class="itemList catalogItemList">
+                    <div class="itemListEmpty">Takım seçildiğinde bloklar burada görünür.</div>
+                  </div>
+                </div>
+
+                <!-- Form -->
+                <div class="catalogPanelSection catalogPanelForm">
+                  <h3 id="blockFormTitle">Blok Ekle</h3>
+                  <input id="blockEditId" type="hidden" />
+                  <div class="catalogFormFields">
                     <div class="row">
-                      <label>Bilet Adedi</label>
-                      <input id="blockTicketCount" type="number" min="1" max="10" value="1" />
+                      <label>Blok etiketi</label>
+                      <input id="blockLabelInput" type="text" placeholder="Maraton Kuzey K17363" />
                     </div>
                     <div class="row">
-                      <label>Koltuk Kuralı</label>
-                      <select id="blockAdjacentSeats">
-                        <option value="false">Yanyana olmak zorunda değil</option>
-                        <option value="true">Yanyana koltuk seç</option>
+                      <label>Kategoriye bağla <small>(opsiyonel — seçili kategoride bu blok kullanılır)</small></label>
+                      <select id="blockCategoryPicker">
+                        <option value="">— Bağlama —</option>
                       </select>
                     </div>
+                    <div class="row">
+                      <label>Seçim modu</label>
+                      <select id="blockSelectionMode">
+                        <option value="svg">SVG — haritadan direkt tıkla (bulamazsa legacy)</option>
+                        <option value="legacy">Yalnızca Legacy — dropdown</option>
+                      </select>
+                    </div>
+                    <div id="blockSvgFields">
+                      <div class="row">
+                        <label>SVG Blok ID <small>(scan map'ten veya DOM'dan)</small></label>
+                        <input id="blockSvgBlockIdInput" type="text" placeholder="block17363" />
+                      </div>
+                      <div class="catalogFormSubLabel">Legacy fallback (opsiyonel — SVG başarısız olursa)</div>
+                      <div class="row2">
+                        <div class="row">
+                          <label>Kategori metni</label>
+                          <input id="blockCategoryTypeInput" type="text" placeholder="Maraton Alt" />
+                        </div>
+                        <div class="row">
+                          <label>Blok değeri</label>
+                          <input id="blockBlockValInput" type="text" placeholder="17363" />
+                        </div>
+                      </div>
+                    </div>
+                    <div id="blockLegacyFields" hidden>
+                      <div class="row2">
+                        <div class="row">
+                          <label>Kategori metni</label>
+                          <input id="blockLegacyOnlyCategoryTypeInput" type="text" placeholder="Maraton Alt" />
+                        </div>
+                        <div class="row">
+                          <label>Blok değeri</label>
+                          <input id="blockLegacyOnlyBlockValInput" type="text" placeholder="17363" />
+                        </div>
+                      </div>
+                    </div>
+                    <div class="row2">
+                      <div class="row">
+                        <label>Bilet adedi</label>
+                        <input id="blockTicketCount" type="number" min="1" max="10" value="1" />
+                      </div>
+                      <div class="row">
+                        <label>Koltuk kuralı</label>
+                        <select id="blockAdjacentSeats">
+                          <option value="false">Serbest</option>
+                          <option value="true">Yanyana</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="catalogFormActions">
+                    <button type="button" id="btnSaveBlock" class="btnPrimary">Kaydet</button>
+                    <button type="button" id="btnDeleteBlock" class="btnDanger">Sil</button>
+                    <button type="button" id="btnResetBlock" class="btnMuted">Temizle</button>
                   </div>
                 </div>
-                <div class="actions">
-                  <button type="button" id="btnSaveBlock">Blok Kaydet</button>
-                  <button type="button" id="btnDeleteBlock" class="btnDanger">Sil</button>
-                  <button type="button" id="btnResetBlock" class="btnMuted">Temizle</button>
-                </div>
-              </section>
 
-              <section class="managerSection">
-                <div class="hint" style="margin-top:0">Buraya eklenen üyelikler bot başlatma ekranında ana ve tutucu havuzları için seçilebilir.</div>
-                <div id="manageCredentialList" class="itemList">
-                  <div class="itemListEmpty">Takım seçildiğinde üyelikler burada görünür.</div>
-                </div>
-                <input id="credentialEditId" type="hidden" />
-                <div class="managerFormStack">
-                <div class="row">
-                  <label>Email</label>
-                  <input id="credentialEmailInput" type="email" placeholder="uye@mail.com" />
-                </div>
-                <div class="row">
-                  <label>Şifre</label>
-                  <input id="credentialPasswordInput" type="password" placeholder="******" />
-                </div>
+              </div>
+            </div>
+
+          </div><!-- /catalogMain -->
+        </div><!-- /catalogWorkspace -->
+      </div><!-- /modalBody -->
+
+      <div class="modalFoot">
+        <span class="modalFootSpacer"></span>
+        <button type="button" id="btnCatalogModalDone" class="btnMuted">Kapat</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Üyelik Yönetimi Modalı ──────────────────────────────────────── -->
+  <div id="credentialModal" class="modalRoot" hidden>
+    <div class="modalBackdrop" id="credentialModalBackdrop"></div>
+    <div class="modalDialog credentialModalDialog" role="dialog" aria-modal="true" aria-labelledby="credentialModalTitle">
+      <div class="modalHead">
+        <div>
+          <h2 id="credentialModalTitle">Üyelik Yönetimi</h2>
+          <span class="catalogModalHeadSub" id="credentialModalTeamName"></span>
+        </div>
+        <button type="button" class="modalClose" id="btnCloseCredentialModal" aria-label="Kapat">×</button>
+      </div>
+      <div class="modalBody credentialModalBody">
+        <div class="credentialWorkspace">
+
+          <!-- Sol: Form -->
+          <aside class="credentialFormAside">
+            <h3 id="credentialFormTitle">Üyelik Ekle</h3>
+            <input id="credentialEditId" type="hidden" />
+            <div class="credentialFormFields">
+              <div class="row">
+                <label>Email</label>
+                <input id="credentialEmailInput" type="email" placeholder="uye@mail.com" autocomplete="off" />
+              </div>
+              <div class="row">
+                <label>Şifre</label>
+                <input id="credentialPasswordInput" type="password" placeholder="••••••" autocomplete="new-password" />
+              </div>
+              <div class="row2">
                 <div class="row">
                   <label>TCKN</label>
-                  <input id="credentialIdentityInput" type="text" placeholder="12345678901" />
+                  <input id="credentialIdentityInput" type="text" placeholder="12345678901" inputmode="numeric" />
                 </div>
                 <div class="row">
-                  <label>Cep Telefonu</label>
+                  <label>Cep telefonu</label>
                   <input id="credentialPhoneInput" type="tel" inputmode="tel" placeholder="5XX XXX XX XX" />
-                  <div class="hint">GS PLUS Premium önceliği için her hesabın kendine ait numarası (form'daki yerine bunu kullanır).</div>
                 </div>
+              </div>
+              <div class="row2">
                 <div class="row">
                   <label>Fan Card</label>
                   <input id="credentialFanCardInput" type="text" placeholder="ABC123" />
@@ -681,34 +824,43 @@
                   <label>Sicil No</label>
                   <input id="credentialSicilNoInput" type="text" placeholder="" />
                 </div>
-                <div class="row">
-                  <label>Öncelikli Bilet Kodu</label>
-                  <input id="credentialPriorityTicketCodeInput" type="text" placeholder="" />
-                </div>
-                <div class="row">
-                  <label>Not</label>
-                  <div class="hint" style="margin-top:0">Hesaba özel hatırlatma; yalnızca panelde görünür (şifrelenmez, takım üyelik kaydında saklanır).</div>
-                  <textarea id="credentialNotesInput" rows="3" maxlength="4000" placeholder="Örn. hangi maç / koltuk tercihi / iletişim…"></textarea>
-                </div>
-                <div class="row">
-                  <label>Atanmış Kategoriler</label>
-                  <div class="hint">Boş bırakılırsa tüm kategorilerden alır. Seçilirse sadece o kategorilerden alır.</div>
-                  <div id="credentialCategoryPicker" class="checkList checkListCatalogCredentialCats"></div>
-                </div>
-                </div>
-                <div class="actions">
-                  <button type="button" id="btnSaveCredential">Üyelik Kaydet</button>
-                  <button type="button" id="btnDeleteCredential" class="btnDanger">Sil</button>
-                  <button type="button" id="btnResetCredential" class="btnMuted">Temizle</button>
-                </div>
-              </section>
+              </div>
+              <div class="row">
+                <label>Öncelikli bilet kodu</label>
+                <input id="credentialPriorityTicketCodeInput" type="text" placeholder="" />
+              </div>
+              <div class="row">
+                <label>Not <small>(yalnızca panelde görünür)</small></label>
+                <textarea id="credentialNotesInput" rows="3" maxlength="4000" placeholder="Hangi maç, koltuk tercihi, iletişim…"></textarea>
+              </div>
+              <div class="row">
+                <label>Atanmış Kategoriler <small>(boşsa tümünden alır)</small></label>
+                <div id="credentialCategoryPicker" class="checkList checkListCatalogCredentialCats"></div>
+              </div>
+            </div>
+            <div class="catalogFormActions">
+              <button type="button" id="btnSaveCredential" class="btnPrimary">Kaydet</button>
+              <button type="button" id="btnDeleteCredential" class="btnDanger">Sil</button>
+              <button type="button" id="btnResetCredential" class="btnMuted">Temizle</button>
+            </div>
+          </aside>
+
+          <!-- Sağ: Liste -->
+          <div class="credentialListMain">
+            <div class="credentialListHead">
+              <h3>Kayıtlı Üyelikler</h3>
+              <span id="credentialListCount" class="pickerCount">0 üyelik</span>
+            </div>
+            <div id="manageCredentialList" class="credentialList">
+              <div class="itemListEmpty">Henüz üyelik yok.</div>
             </div>
           </div>
+
         </div>
       </div>
       <div class="modalFoot">
         <span class="modalFootSpacer"></span>
-        <button type="button" id="btnCatalogModalDone" class="btnMuted">Kapat</button>
+        <button type="button" id="btnCloseCredentialModalDone" class="btnMuted">Kapat</button>
       </div>
     </div>
   </div>
@@ -808,6 +960,170 @@
       </div>
     </div>
   </div>
+
+  <!-- ── Piyasa Dinle (Snipe) Modalı ────────────────────────────────── -->
+  <div id="snipeModal" class="modalRoot" hidden>
+    <div class="modalBackdrop" id="snipeModalBackdrop"></div>
+    <div class="modalDialog snipeModalDialog" role="dialog" aria-modal="true" aria-labelledby="snipeModalTitle">
+      <div class="modalHead">
+        <div>
+          <h2 id="snipeModalTitle">Piyasa Dinle</h2>
+          <span class="catalogModalHeadSub">Boşa düşen koltukları proaktif olarak tara ve otomatik satın al</span>
+        </div>
+        <button type="button" class="modalClose" id="btnCloseSnipeModal" aria-label="Kapat">×</button>
+      </div>
+      <div class="modalBody snipeModalBody">
+        <div class="snipeWorkspace">
+
+          <!-- Sol: Ayarlar formu -->
+          <aside class="snipeConfigAside">
+            <form id="snipeForm" autocomplete="off">
+
+              <div class="snipeSection">
+                <div class="snipeSectionIcon">🎯</div>
+                <div class="snipeSectionBody">
+                  <div class="snipeSectionTitle">Etkinlik</div>
+                  <input id="snipeEventUrl" name="eventAddress" type="url"
+                    class="snipeBigInput" placeholder="https://www.passo.com.tr/tr/etkinlik/..." />
+                </div>
+              </div>
+
+              <div class="snipeSection">
+                <div class="snipeSectionIcon">👥</div>
+                <div class="snipeSectionBody">
+                  <div class="snipeSectionTitle">Takım & Mod</div>
+                  <div class="snipeRow2">
+                    <div class="snipeField">
+                      <label class="snipeLabel">Takım</label>
+                      <select id="snipeTeamSelect" name="teamId" class="snipeSelect">
+                        <option value="">— Seçiniz —</option>
+                      </select>
+                    </div>
+                    <div class="snipeField">
+                      <label class="snipeLabel">Kategori Modu</label>
+                      <select id="snipeCategoryMode" name="categorySelectionMode" class="snipeSelect">
+                        <option value="scan">SVG (Scan Map)</option>
+                        <option value="legacy">Legacy</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="snipeSection">
+                <div class="snipeSectionIcon">⚙️</div>
+                <div class="snipeSectionBody">
+                  <div class="snipeSectionTitle">Tarama Ayarları</div>
+                  <div class="snipeRow2">
+                    <div class="snipeField">
+                      <label class="snipeLabel">Kontrol Aralığı (ms)</label>
+                      <input id="snipeIntervalMs" name="intervalMs" type="number"
+                        class="snipeInput" value="600" min="200" max="5000" step="100" />
+                    </div>
+                    <div class="snipeField">
+                      <label class="snipeLabel">Maks. Süre (dk)</label>
+                      <input id="snipeTimeoutMin" type="number"
+                        class="snipeInput" value="60" min="1" max="480" step="1" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="snipeSection">
+                <div class="snipeSectionIcon">🔍</div>
+                <div class="snipeSectionBody">
+                  <div class="snipeSectionTitle">Filtreler <span class="snipeOptTag">opsiyonel</span></div>
+                  <div class="snipeRow2">
+                    <div class="snipeField">
+                      <label class="snipeLabel">Maks. Fiyat (₺)</label>
+                      <input id="snipeMaxPrice" name="maxPrice" type="number"
+                        class="snipeInput" placeholder="Sınırsız" min="0" />
+                    </div>
+                    <div class="snipeField">
+                      <label class="snipeLabel">Koltuk Adedi</label>
+                      <input id="snipeAdjacentCount" name="adjacentCount" type="number"
+                        class="snipeInput" value="1" min="1" max="10" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+            </form>
+          </aside>
+
+          <!-- Sağ: Blok + Hesap seçimi + Durum -->
+          <div class="snipeMain">
+
+            <!-- Blok seçimi -->
+            <div class="snipePanel" id="snipeBlocksPanel">
+              <div class="snipePanelHead">
+                <span class="snipePanelTitle">İzlenecek Bloklar</span>
+                <div class="snipePanelActions">
+                  <button type="button" class="snipePillBtn" id="btnSnipeSelectAllBlocks">Tümü</button>
+                  <button type="button" class="snipePillBtn" id="btnSnipeClearBlocks">Temizle</button>
+                </div>
+              </div>
+              <div id="snipeBlocksList" class="snipeCheckList">
+                <p class="snipeEmpty">Takım seçince bloklar yüklenir</p>
+              </div>
+            </div>
+
+            <!-- Hesap seçimi -->
+            <div class="snipePanel" id="snipeAccountsPanel">
+              <div class="snipePanelHead">
+                <span class="snipePanelTitle">Tarayıcı Hesapları</span>
+                <div class="snipePanelActions">
+                  <button type="button" class="snipePillBtn" id="btnSnipeSelectAllAccounts">Tümü</button>
+                  <button type="button" class="snipePillBtn" id="btnSnipeClearAccounts">Temizle</button>
+                </div>
+              </div>
+              <div id="snipeAccountsList" class="snipeCheckList">
+                <p class="snipeEmpty">Takım seçince üyeler yüklenir</p>
+              </div>
+            </div>
+
+            <!-- Durum / Kontroller -->
+            <div class="snipeStatusCard" id="snipeStatusCard">
+              <div class="snipeStatusRow">
+                <div class="snipeStatBox" id="snipeStatBlocks">
+                  <div class="snipeStatVal">—</div>
+                  <div class="snipeStatLbl">Blok İzleniyor</div>
+                </div>
+                <div class="snipeStatBox" id="snipeStatAccounts">
+                  <div class="snipeStatVal">—</div>
+                  <div class="snipeStatLbl">Hesap Hazır</div>
+                </div>
+                <div class="snipeStatBox" id="snipeStatSeats">
+                  <div class="snipeStatVal">0</div>
+                  <div class="snipeStatLbl">Koltuk Alındı</div>
+                </div>
+                <div class="snipeStatBox" id="snipeStatElapsed">
+                  <div class="snipeStatVal">—</div>
+                  <div class="snipeStatLbl">Geçen Süre</div>
+                </div>
+              </div>
+              <div class="snipePollRow" id="snipePollRow" hidden>
+                <span class="snipePollLbl">Tarama turu</span>
+                <span class="snipePollVal" id="snipePollSummary">—</span>
+              </div>
+              <div id="snipeStatusLog" class="snipeLog"></div>
+              <div class="snipeCtrlRow">
+                <button type="button" id="btnSnipeStart" class="snipeStartBtn">
+                  <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M8 5v14l11-7z"/></svg>
+                  Taramayı Başlat
+                </button>
+                <button type="button" id="btnSnipeStop" class="snipeStopBtn" disabled>
+                  <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><rect x="6" y="6" width="12" height="12"/></svg>
+                  Durdur
+                </button>
+              </div>
+            </div>
+
+          </div><!-- /snipeMain -->
+        </div><!-- /snipeWorkspace -->
+      </div><!-- /modalBody -->
+    </div><!-- /modalDialog -->
+  </div><!-- /snipeModal -->
 
   <script src="/catalog.js"></script>
   <script src="/scanMapManager.js"></script>

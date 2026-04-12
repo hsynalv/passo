@@ -248,8 +248,11 @@ const snipeTargetSchema = z.object({
 const snipeRequestSchema = z.object({
   eventAddress: z.string().url('Geçerli bir URL giriniz'),
   serieId: z.string().optional().default(''),
-  targets: z.array(snipeTargetSchema).min(1, 'En az 1 hedef belirtilmelidir'),
-  accounts: z.array(accountSchema).min(1, 'En az 1 hesap zorunludur'),
+  /** Klasik hedef tanımı (categoryId + blockId listesi). selectedBlockIds ile birlikte kullanılabilir. */
+  targets: z.array(snipeTargetSchema).optional().default([]),
+  /** team_blocks koleksiyonundan MongoDB ID'leri — apiBlockId ve svgBlockId otomatik resolve edilir. */
+  selectedBlockIds: z.array(z.string().min(1)).optional(),
+  accounts: z.array(accountSchema).default([]),
   aCredentialIds: z.array(z.string().min(1)).optional(),
   teamId: z.string().optional(),
   intervalMs: z.number().int().min(200).max(5000).optional().default(800),

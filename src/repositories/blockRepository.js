@@ -25,6 +25,7 @@ function mapBlock(doc) {
     teamId: String(doc.teamId),
     label: String(doc.label || ''),
     selectionMode: mode === 'legacy' ? 'legacy' : 'svg',
+    categoryId: doc.categoryId ? String(doc.categoryId) : null,
     isActive: doc.isActive !== false,
     ticketCount: Number.isFinite(doc.ticketCount) && doc.ticketCount >= 1 ? doc.ticketCount : 1,
     adjacentSeats: doc.adjacentSeats === true,
@@ -35,6 +36,9 @@ function mapBlock(doc) {
   if (base.selectionMode === 'svg') {
     base.svgBlockId = String(doc.svgBlockId || '').trim() || null;
     base.apiBlockId = Number.isFinite(Number(doc.apiBlockId)) ? Number(doc.apiBlockId) : null;
+    // opsiyonel legacy fallback alanları
+    base.categoryType = String(doc.categoryType || '').trim() || null;
+    base.blockVal = String(doc.blockVal || '').trim() || null;
   } else {
     base.categoryType = String(doc.categoryType || '').trim() || null;
     base.blockVal = String(doc.blockVal || '').trim() || null;
@@ -56,6 +60,13 @@ function deriveApiBlockId(svgBlockId) {
 
 async function listBlocksByTeam(teamId, options = {}) {
   const filter = { teamId: String(teamId) };
+  if (!options.includeInactive) filter.isActive = { $ne: false };
+  const docs = await blocks().find(filter).sort({ sortOrder: 1, createdAt: 1, _id: 1 }).toArray();
+  return docs.map(mapBlock);
+}
+
+async function listBlocksByCategory(teamId, categoryId, options = {}) {
+  const filter = { teamId: String(teamId), categoryId: String(categoryId) };
   if (!options.includeInactive) filter.isActive = { $ne: false };
   const docs = await blocks().find(filter).sort({ sortOrder: 1, createdAt: 1, _id: 1 }).toArray();
   return docs.map(mapBlock);
@@ -91,6 +102,7 @@ async function createBlock(teamId, payload) {
     teamId: String(teamId),
     label: String(payload.label || '').trim(),
     selectionMode: mode,
+    categoryId: payload.categoryId ? String(payload.categoryId).trim() : null,
     isActive: payload.isActive !== false,
     ticketCount: Number.isFinite(payload.ticketCount) && payload.ticketCount >= 1 ? payload.ticketCount : 1,
     adjacentSeats: payload.adjacentSeats === true,
@@ -103,6 +115,9 @@ async function createBlock(teamId, payload) {
     doc.apiBlockId = payload.apiBlockId != null
       ? Number(payload.apiBlockId)
       : deriveApiBlockId(doc.svgBlockId);
+    // opsiyonel legacy fallback
+    if (payload.categoryType) doc.categoryType = String(payload.categoryType).trim();
+    if (payload.blockVal) doc.blockVal = String(payload.blockVal).trim();
   } else {
     doc.categoryType = String(payload.categoryType || '').trim() || undefined;
     doc.blockVal = String(payload.blockVal || '').trim() || undefined;
@@ -121,6 +136,7 @@ async function updateBlock(teamId, blockId, payload) {
   const next = { updatedAt: new Date().toISOString() };
   if (payload.label !== undefined) next.label = String(payload.label || '').trim();
   if (payload.isActive !== undefined) next.isActive = payload.isActive !== false;
+  if ('categoryId' in payload) next.categoryId = payload.categoryId ? String(payload.categoryId).trim() : null;
   if (payload.ticketCount !== undefined) {
     next.ticketCount = Number.isFinite(payload.ticketCount) && payload.ticketCount >= 1 ? payload.ticketCount : 1;
   }
@@ -141,6 +157,9 @@ async function updateBlock(teamId, blockId, payload) {
     } else if (payload.apiBlockId !== undefined) {
       next.apiBlockId = Number(payload.apiBlockId);
     }
+    // opsiyonel legacy fallback güncelleme
+    if (payload.categoryType !== undefined) next.categoryType = String(payload.categoryType || '').trim() || undefined;
+    if (payload.blockVal !== undefined) next.blockVal = String(payload.blockVal || '').trim() || undefined;
   } else {
     if (payload.categoryType !== undefined) next.categoryType = String(payload.categoryType || '').trim() || undefined;
     if (payload.blockVal !== undefined) next.blockVal = String(payload.blockVal || '').trim() || undefined;
@@ -216,6 +235,7 @@ module.exports = {
   deleteBlocksByTeam,
   getBlockById,
   getBlocksByIds,
+  listBlocksByCategory,
   listBlocksByTeam,
   updateBlock,
 };

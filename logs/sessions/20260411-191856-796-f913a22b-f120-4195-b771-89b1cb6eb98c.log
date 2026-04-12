@@ -1,0 +1,2 @@
+{"ts":"2026-04-11T16:18:56.796Z","level":"info","message":"startSnipe:launching_accounts","runId":"f913a22b-f120-4195-b771-89b1cb6eb98c","meta":{"runId":"f913a22b-f120-4195-b771-89b1cb6eb98c","count":3}}
+{"ts":"2026-04-11T16:20:34.686Z","level":"error","message":"startSnipe:no_accounts_launched","runId":"f913a22b-f120-4195-b771-89b1cb6eb98c","meta":{"runId":"f913a22b-f120-4195-b771-89b1cb6eb98c"}}
