@@ -3522,6 +3522,7 @@ async function dismissPassoLoginShellOverlays(page, email, tag) {
                     x.includes('agree') ||
                     x.includes('tümünü') ||
                     x.includes('tumunu') ||
+                    x.includes('izin ver') ||
                     (x.includes('devam') && x.length < 28) ||
                     x === 'evet'
                 );
@@ -3534,10 +3535,20 @@ async function dismissPassoLoginShellOverlays(page, email, tag) {
                     clicks++;
                 } catch {}
             };
-            try {
-                clickIf(document.querySelector('#onetrust-accept-btn-handler'));
-                clickIf(document.querySelector('#accept-recommended-btn-handler'));
-            } catch {}
+            const knownConsentSelectors = [
+                '#onetrust-accept-btn-handler',
+                '#accept-recommended-btn-handler',
+                'button#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowall',
+                '.cc-nb-accept',
+                '[data-action="accept"]',
+                '[class*="cookie" i] button[class*="accept" i]',
+                '[id*="cookie" i] button[class*="accept" i]',
+            ];
+            for (const sel of knownConsentSelectors) {
+                try {
+                    clickIf(document.querySelector(sel));
+                } catch {}
+            }
             try {
                 const swal = document.querySelector('.swal2-container.swal2-shown');
                 clickIf(swal?.querySelector('button.swal2-confirm, button.swal2-cancel, button'));
@@ -3582,6 +3593,23 @@ async function dismissPassoLoginShellOverlays(page, email, tag) {
                 try {
                     ef.style.setProperty('pointer-events', 'none', 'important');
                     ef.style.setProperty('visibility', 'hidden', 'important');
+                } catch {}
+            }
+            if (!clicks) {
+                try {
+                    const roots = Array.from(
+                        document.querySelectorAll('[role="dialog"], [class*="consent" i], [class*="cookie" i], [class*="banner" i]')
+                    );
+                    for (const root of roots) {
+                        for (const b of Array.from(root.querySelectorAll('button, a[role="button"], [role="button"]'))) {
+                            const t = b.innerText || b.textContent || b.getAttribute('aria-label') || '';
+                            if (wants(t)) {
+                                clickIf(b);
+                                break;
+                            }
+                        }
+                        if (clicks) break;
+                    }
                 } catch {}
             }
             return { clicks };
@@ -3817,16 +3845,17 @@ async function launchAndLogin(options) {
             const snapScript = loginSnapScript;
             const passoHomeTr = passoHomeTrLogin;
             let lastSnap = snap0;
-            const shellSig = (s) => [
+            /** Küçük DOM dalgalanmaları (docHtmlLen ±50 vb.) takılı SPA'yı "hareket" sanmasın diye kaba imza. */
+            const stagnantShellSig = (s) => [
                 Number(s?.inputCount || 0),
                 Number(s?.formCount || 0),
                 Number(s?.scriptCount || 0),
                 Number(s?.linkCount || 0),
-                Number(s?.bodyHtmlLen || 0),
-                Number(s?.docHtmlLen || 0),
+                Math.floor(Number(s?.bodyHtmlLen || 0) / 256),
+                Math.floor(Number(s?.docHtmlLen || 0) / 4096),
                 Number(s?.hasTurnstileWidget ? 1 : 0),
             ].join('|');
-            let prevSig = shellSig(lastSnap);
+            let prevStagnantSig = stagnantShellSig(lastSnap);
             let stagnantShellHits = 0;
             let tabRecycleUsed = false;
             const recycleLoginTab = async (tag = 'shell_stuck') => {
@@ -3941,18 +3970,18 @@ async function launchAndLogin(options) {
                     });
                     throw new Error('Login blocked: Cloudflare veya kenar ağı (403/shell); farklı proxy denenebilir');
                 }
-                const sig = shellSig(lastSnap);
-                if (sig === prevSig) stagnantShellHits += 1;
+                const stSig = stagnantShellSig(lastSnap);
+                if (stSig === prevStagnantSig) stagnantShellHits += 1;
                 else stagnantShellHits = 0;
-                prevSig = sig;
+                prevStagnantSig = stSig;
                 const noFieldsNoTurnstile = noLoginFieldsYet(lastSnap) && !lastSnap?.hasTurnstileWidget;
-                if (!tabRecycleUsed && noFieldsNoTurnstile && attempt >= 5 && stagnantShellHits >= 2) {
+                if (!tabRecycleUsed && noFieldsNoTurnstile && attempt >= 4 && stagnantShellHits >= 2) {
                     tabRecycleUsed = await recycleLoginTab(`attempt_${attempt}`);
                     if (tabRecycleUsed) {
                         try {
                             await delay(900);
                             lastSnap = await evalOnPage(page, snapScript);
-                            prevSig = shellSig(lastSnap);
+                            prevStagnantSig = stagnantShellSig(lastSnap);
                             stagnantShellHits = 0;
                             logger.info('launchAndLogin: tab recycle sonrası snapshot', { email, attempt, snap: lastSnap });
                         } catch {}
