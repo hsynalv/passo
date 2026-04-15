@@ -1,6 +1,6 @@
 /**
- * Bu hatalar çoğunlukla proxy kalitesi / credential değil; CF, shell, ulaşım.
- * Havuz blacklist ardışık sayacına yansıtılmamalı (soft markLoginFailure).
+ * "Soft" = havuzda başka proxy ile tekrar denemeye değer (CF, shell, tünel vb.).
+ * Blacklist ardışık sayacı bunu ayırt etmek için kullanılmaz; ayrıca `shouldSkipProxyBlacklistStreak`.
  */
 function isSoftProxyLoginFailure(msg) {
   const m = String(msg || '').toLowerCase();
@@ -47,8 +47,35 @@ function shouldRetryLoginWithAnotherPoolProxy(msg) {
   return isSoftProxyLoginFailure(msg) || isLikelyProxyTransportFailure(msg);
 }
 
+/**
+ * Üç başarısızlıkta proxy blacklist sayacına ekleme (aynı proxy başka hesapta işe yarayabilir).
+ * Açık bilgi reddi metinleri; belirsiz "giriş başarısız" burada sayılmaz.
+ */
+function shouldSkipProxyBlacklistStreak(msg) {
+  const m = String(msg || '').toLowerCase();
+  if (!m) return false;
+  if (m.includes('run_killed')) return true;
+  if (m.includes('login_credential_rejected')) return true;
+  if ((m.includes('e-posta') || m.includes('e posta')) && (m.includes('şifre') || m.includes('sifre'))) {
+    if (
+      m.includes('hatalı') ||
+      m.includes('hatali') ||
+      m.includes('yanlış') ||
+      m.includes('yanlis') ||
+      m.includes('geçersiz') ||
+      m.includes('gecersiz')
+    ) {
+      return true;
+    }
+  }
+  if (m.includes('wrong password') || m.includes('wrong email') || m.includes('invalid credentials')) return true;
+  if (m.includes('hesap') && (m.includes('bulunamadı') || m.includes('bulunamadi'))) return true;
+  return false;
+}
+
 module.exports = {
   isSoftProxyLoginFailure,
   isLikelyProxyTransportFailure,
-  shouldRetryLoginWithAnotherPoolProxy
+  shouldRetryLoginWithAnotherPoolProxy,
+  shouldSkipProxyBlacklistStreak
 };
