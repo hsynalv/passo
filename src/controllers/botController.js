@@ -4004,11 +4004,36 @@ async function launchAndLogin(options) {
                         } catch {}
                     }
                 }
+                // Ana sayfa sıfırlaması stagnantShellHits'i sıfırlayabildiği için attempt tabanlı da bırakıldı.
+                const spaStuckForProxySwap =
+                    noLoginFieldsYet(lastSnap) &&
+                    !lastSnap?.hasTurnstileWidget &&
+                    ((tabRecycleUsed &&
+                        ((attempt >= 6 && stagnantShellHits >= 3) || attempt >= 9)) ||
+                        (!tabRecycleUsed && attempt >= 11 && stagnantShellHits >= 5));
+                if (spaStuckForProxySwap) {
+                    logger.warn('launchAndLogin: SPA shell kalıcı takılı (form yok) — havuzda başka proxy', {
+                        email,
+                        attempt,
+                        stagnantShellHits,
+                        tabRecycleUsed,
+                    });
+                    throw new Error(
+                        'PASSO_LOGIN_SPA_STUCK: Passo /giris SPA kabuğu (giriş alanları gelmiyor); farklı proxy denenebilir'
+                    );
+                }
+            }
+            if (noLoginFieldsYet(lastSnap) && !lastSnap?.hasTurnstileWidget) {
+                logger.warn('launchAndLogin: SPA shell 15 tur sonunda giriş alanı yok — havuzda başka proxy', { email });
+                throw new Error(
+                    'PASSO_LOGIN_SPA_STUCK: Passo /giris SPA kabuğu (15 tur); farklı proxy denenebilir'
+                );
             }
         }
     } catch (e) {
         if (e && e.code === 'RUN_KILLED') throw e;
         if (String(e?.message || '').includes('Login blocked:')) throw e;
+        if (String(e?.message || '').includes('PASSO_LOGIN_SPA_STUCK')) throw e;
     }
 
     try { page.removeListener('response', onResp); } catch {}
@@ -4080,6 +4105,27 @@ async function launchAndLogin(options) {
     const ensureLoginFormWithReload = async () => {
         for (let attempt = 1; attempt <= 12; attempt++) {
             assertLaunchRunNotKilled(loginRunId, `ensure_reload_${attempt}`);
+            if (attempt >= 2) {
+                try {
+                    const snap = await evalOnPage(page, loginSnapScript);
+                    const t = String(snap?.title || '').toLowerCase();
+                    const marketingShell =
+                        (Number(snap?.inputCount) || 0) === 0 &&
+                        !snap?.hasTurnstileWidget &&
+                        (t.includes('maç biletleri') || t.includes('mac biletleri'));
+                    if (marketingShell) {
+                        logger.warn('launchAndLogin: ensureLoginForm marketing kabuğunda takılı — havuzda başka proxy', {
+                            email,
+                            attempt,
+                        });
+                        throw new Error(
+                            'PASSO_LOGIN_SPA_STUCK: Passo /giris SPA kabuğu (ensure); farklı proxy denenebilir'
+                        );
+                    }
+                } catch (e) {
+                    if (String(e?.message || '').includes('PASSO_LOGIN_SPA_STUCK')) throw e;
+                }
+            }
             const ctx = await tryEnsureLoginForm(24000);
             if (ctx) return ctx;
             logger.warn('launchAndLogin: form hâlâ yok, tekrar giriş URL + yenileme', { email, attempt });
@@ -13228,6 +13274,8 @@ async function startSnipe(req, res) {
             eventAddress: String(eventAddress || '').slice(0, 800),
             snipeState: {
                 accountCount: accountList.length,
+                accountTarget: accountList.length,
+                accountsLoggedIn: 0,
                 seatsAcquired: 0,
                 activeAccounts: [],
                 coordinatorRunning: false,
@@ -13288,6 +13336,15 @@ async function startSnipe(req, res) {
                             ctx.email = acc.email;
                             ctx.password = acc.password;
                             logger.info('startSnipe:account_ready', { email: acc.email, idx, total: accountList.length });
+                            try {
+                                const prevRun = runStore.get(runId) || {};
+                                const s = { ...(prevRun.snipeState || {}) };
+                                const tgt = Number(s.accountTarget) > 0 ? Number(s.accountTarget) : accountList.length;
+                                s.accountTarget = tgt;
+                                s.accountCount = tgt;
+                                s.accountsLoggedIn = Math.min(tgt, (Number(s.accountsLoggedIn) || 0) + 1);
+                                runStore.upsert(runId, { snipeState: s });
+                            } catch {}
                             resolve({ ok: true, ctx });
                         } catch (e) {
                             logger.warn('startSnipe:account_launch_failed', {
@@ -13453,10 +13510,21 @@ async function startSnipe(req, res) {
                     coordinator.addAccount(ctx);
                 }
 
-                // Update run store
+                // Update run store (giriş yapan = coordinator'a giren; hedef = seçilen hesap sayısı)
+                const prevSnipe = (() => {
+                    try {
+                        return runStore.get(runId)?.snipeState || {};
+                    } catch {
+                        return {};
+                    }
+                })();
+                const targetTotal = Number(prevSnipe.accountTarget) > 0 ? Number(prevSnipe.accountTarget) : accountList.length;
                 runStore.upsert(runId, {
                     snipeState: {
+                        ...prevSnipe,
                         accountCount: accountCtxList.length,
+                        accountsLoggedIn: accountCtxList.length,
+                        accountTarget: targetTotal,
                         seatsAcquired: 0,
                         activeAccounts: [],
                         coordinatorRunning: true,

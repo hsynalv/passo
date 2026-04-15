@@ -2158,9 +2158,12 @@ try {
         const st = data?.run?.snipeState;
         if (st) {
           if (statSeats    && st.seatsAcquired != null) statSeats.textContent = st.seatsAcquired;
-          if (statAccounts && st.accountCount  != null) {
-            const busy = (st.activeAccounts || []).length;
-            statAccounts.textContent = `${st.accountCount - busy}/${st.accountCount}`;
+          if (statAccounts) {
+            const target = st.accountTarget != null ? st.accountTarget : st.accountCount;
+            if (target != null) {
+              const logged = st.accountsLoggedIn != null ? st.accountsLoggedIn : 0;
+              statAccounts.textContent = `${logged}/${target}`;
+            }
           }
           if (statBlocks && st.blockCount != null) statBlocks.textContent = st.blockCount;
           if (st.lastTick && pollSummary) {

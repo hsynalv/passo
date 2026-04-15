@@ -11,6 +11,7 @@ function isSoftProxyLoginFailure(msg) {
   if (m.includes('goto_failed')) return true;
   if (m.includes('login sayfasina erisilemedi')) return true;
   if (m.includes('login formu bulunamad')) return true;
+  if (m.includes('passo_login_spa_stuck')) return true;
   return false;
 }
 
