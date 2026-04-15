@@ -3796,6 +3796,57 @@ async function launchAndLogin(options) {
             const snapScript = loginSnapScript;
             const passoHomeTr = passoHomeTrLogin;
             let lastSnap = snap0;
+            const shellSig = (s) => [
+                Number(s?.inputCount || 0),
+                Number(s?.formCount || 0),
+                Number(s?.scriptCount || 0),
+                Number(s?.linkCount || 0),
+                Number(s?.bodyHtmlLen || 0),
+                Number(s?.docHtmlLen || 0),
+                Number(s?.hasTurnstileWidget ? 1 : 0),
+            ].join('|');
+            let prevSig = shellSig(lastSnap);
+            let stagnantShellHits = 0;
+            let tabRecycleUsed = false;
+            const recycleLoginTab = async (tag = 'shell_stuck') => {
+                try {
+                    const br = (() => { try { return page?.browser?.(); } catch { return null; } })();
+                    if (!br || typeof br.newPage !== 'function') return false;
+                    const oldPage = page;
+                    const nextPage = await br.newPage().catch(() => null);
+                    if (!nextPage) return false;
+                    if (proxyApplied && proxyUsername && proxyPassword) {
+                        try {
+                            await nextPage.authenticate({ username: String(proxyUsername), password: String(proxyPassword) });
+                        } catch {}
+                    }
+                    try {
+                        await installTurnstileSiteKeyNetworkWatcher(nextPage);
+                        await installTurnstileCallbackInterceptor(nextPage);
+                    } catch {}
+                    try { oldPage.removeListener('response', onResp); } catch {}
+                    page = nextPage;
+                    try { page.on('response', onResp); } catch {}
+                    try {
+                        const baseLogin = getCfg().PASSO_LOGIN;
+                        const resetUrl = `${baseLogin}${baseLogin.includes('?') ? '&' : '?'}pb_tabreset=${Date.now()}_${tag}`;
+                        await gotoWithRetry(page, resetUrl, {
+                            retries: 1,
+                            waitUntil: 'domcontentloaded',
+                            expectedUrlIncludes: '/giris',
+                            timeoutMs: 65000,
+                            backoffMs: 400
+                        });
+                    } catch {}
+                    await dismissPassoLoginShellOverlays(page, email, `tab_recycle_${tag}`);
+                    try { await oldPage.close({ runBeforeUnload: false }); } catch {}
+                    logger.warn('launchAndLogin: shell stuck -> login tab recycle uygulandı', { email, tag });
+                    return true;
+                } catch (e) {
+                    logger.warn('launchAndLogin: tab recycle başarısız', { email, tag, error: e?.message || String(e) });
+                    return false;
+                }
+            };
             await dismissPassoLoginShellOverlays(page, email, 'shell_once_before_loop');
             lastSnap = await evalOnPage(page, snapScript);
             logger.info('launchAndLogin: çerez sonrası snapshot', { email, snap: lastSnap });
@@ -3860,6 +3911,23 @@ async function launchAndLogin(options) {
                 } catch {}
                 lastSnap = await evalOnPage(page, snapScript);
                 logger.info('launchAndLogin: shell yenileme sonrası snapshot', { email, attempt, snap: lastSnap });
+                const sig = shellSig(lastSnap);
+                if (sig === prevSig) stagnantShellHits += 1;
+                else stagnantShellHits = 0;
+                prevSig = sig;
+                const noFieldsNoTurnstile = noLoginFieldsYet(lastSnap) && !lastSnap?.hasTurnstileWidget;
+                if (!tabRecycleUsed && noFieldsNoTurnstile && attempt >= 5 && stagnantShellHits >= 2) {
+                    tabRecycleUsed = await recycleLoginTab(`attempt_${attempt}`);
+                    if (tabRecycleUsed) {
+                        try {
+                            await delay(900);
+                            lastSnap = await evalOnPage(page, snapScript);
+                            prevSig = shellSig(lastSnap);
+                            stagnantShellHits = 0;
+                            logger.info('launchAndLogin: tab recycle sonrası snapshot', { email, attempt, snap: lastSnap });
+                        } catch {}
+                    }
+                }
             }
         }
     } catch {}
