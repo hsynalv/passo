@@ -151,6 +151,18 @@ function snapshotLooksLikeCloudflareBlock(snap, httpStatus) {
     return false;
 }
 
+/** "Just a moment" gibi geçici sayfalar hariç — IP/proxy bloklarında havuzda başka çıkış denemek için. */
+function snapshotLooksLikeCloudflareHardBlock(snap, httpStatus) {
+    if (!snap || typeof snap !== 'object') return false;
+    const t = String(snap.title || '').toLowerCase();
+    if (t.includes('just a moment')) return false;
+    if (t.includes('sorry') && (t.includes('blocked') || t.includes('unable to access'))) return true;
+    if (t.includes('attention required') && t.includes('cloudflare')) return true;
+    const ic = Number(snap.inputCount) || 0;
+    if (Number(httpStatus) === 403 && ic < 2 && t.includes('attention')) return true;
+    return false;
+}
+
 function buildCategoryRoamTexts(selectedCategories, fallbackCategoryType, fallbackAlternativeCategory) {
     const values = [];
     for (const item of Array.isArray(selectedCategories) ? selectedCategories : []) {
@@ -3788,6 +3800,15 @@ async function launchAndLogin(options) {
             }
         }
 
+        if (snapshotLooksLikeCloudflareHardBlock(snap0, lastLoginDoc?.status)) {
+            logger.warn('launchAndLogin: Cloudflare kalıcı engel (CF kurtarma sonrası) — havuzda başka proxy', {
+                email,
+                title: snap0?.title,
+                docStatus: lastLoginDoc?.status
+            });
+            throw new Error('Login blocked: Cloudflare veya kenar ağı (403/shell); farklı proxy denenebilir');
+        }
+
         // Passo SPA: bazen /giris açılır ama sadece shell (logo) kalır; inputCount=0 iken body büyük olabilir.
         // Eski kod yalnızca bodyHtmlLen<500 iken reload ediyordu — bu yüzden form hiç gelmeyebiliyordu.
         const girisUrlNow = (() => { try { return String(page.url() || ''); } catch { return ''; } })();
@@ -3911,6 +3932,15 @@ async function launchAndLogin(options) {
                 } catch {}
                 lastSnap = await evalOnPage(page, snapScript);
                 logger.info('launchAndLogin: shell yenileme sonrası snapshot', { email, attempt, snap: lastSnap });
+                if (snapshotLooksLikeCloudflareHardBlock(lastSnap, lastLoginDoc?.status)) {
+                    logger.warn('launchAndLogin: Cloudflare kalıcı engel (shell döngüsü) — havuzda başka proxy', {
+                        email,
+                        attempt,
+                        title: lastSnap?.title,
+                        docStatus: lastLoginDoc?.status
+                    });
+                    throw new Error('Login blocked: Cloudflare veya kenar ağı (403/shell); farklı proxy denenebilir');
+                }
                 const sig = shellSig(lastSnap);
                 if (sig === prevSig) stagnantShellHits += 1;
                 else stagnantShellHits = 0;
@@ -3930,7 +3960,10 @@ async function launchAndLogin(options) {
                 }
             }
         }
-    } catch {}
+    } catch (e) {
+        if (e && e.code === 'RUN_KILLED') throw e;
+        if (String(e?.message || '').includes('Login blocked:')) throw e;
+    }
 
     try { page.removeListener('response', onResp); } catch {}
 
