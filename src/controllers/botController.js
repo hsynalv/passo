@@ -12871,6 +12871,132 @@ async function startBotAfterValidation(req, res, validatedData) {
     }
 }
 
+/**
+ * Piyasa dinle (snipe): ana bottaki mantığa paralel — havuzdan proxy veya tek hesapta panel manuel proxy.
+ * Çoklu hesapta manuel tek proxy kullanılmaz; havuz açık olmalı (useProxyPool, varsayılan true).
+ */
+async function launchSnipeAccountWithManagedProxy({
+    runId,
+    email,
+    password,
+    userDataDir,
+    idx,
+    totalAccounts,
+    useProxyPool,
+    proxyHost,
+    proxyPort,
+    proxyUsername,
+    proxyPassword,
+}) {
+    const attachProtocolToHost = (host, fallbackProtocol = 'socks5') => {
+        const h = String(host || '').trim();
+        if (!h) return '';
+        if (/^(http|https|socks4|socks5):\/\//i.test(h)) return h;
+        return `${String(fallbackProtocol || 'socks5').toLowerCase()}://${h}`;
+    };
+
+    const manualProxyConfigured = !!(String(proxyHost || '').trim() && String(proxyPort || '').trim());
+    const manualProxyLaunchConfig = manualProxyConfigured
+        ? {
+            proxyHost: attachProtocolToHost(proxyHost, 'socks5'),
+            proxyPort,
+            proxyUsername,
+            proxyPassword,
+        }
+        : null;
+
+    const poolOn = useProxyPool !== false && useProxyPool !== 'false';
+    const onlyOneAccount = Math.max(1, Number(totalAccounts) || 1) <= 1;
+    const useManualSingleBrowserOnly = !!(manualProxyLaunchConfig && onlyOneAccount);
+
+    const baseOpts = { email, password, userDataDir, runId };
+
+    if (useManualSingleBrowserOnly) {
+        logger.info('startSnipe:proxy_selected_manual', { email, idx, proxy: `${manualProxyLaunchConfig.proxyHost}:${manualProxyLaunchConfig.proxyPort}` });
+        return launchAndLogin({ ...baseOpts, ...manualProxyLaunchConfig });
+    }
+
+    if (manualProxyLaunchConfig && !useManualSingleBrowserOnly) {
+        logger.info('startSnipe:proxy_manual_skipped_multi_browser', {
+            email,
+            idx,
+            reason: 'coklu_hesap_icin_havuz_gerekli',
+        });
+    }
+
+    if (poolOn) {
+        const maxPoolAttempts = Math.max(
+            1,
+            Math.min(8, Number(getCfg()?.TIMEOUTS?.PROXY_POOL_LOGIN_MAX_ATTEMPTS) || 3)
+        );
+        let lastErr = null;
+        for (let poolAttempt = 1; poolAttempt <= maxPoolAttempts; poolAttempt++) {
+            assertLaunchRunNotKilled(runId, `snipe_proxy_pool_${poolAttempt}`);
+            let activeProxy = null;
+            try {
+                activeProxy = await proxyRepo.acquireNextActiveProxy();
+            } catch (e) {
+                throw new Error(`Proxy havuzu okunamadi: ${e?.message || String(e)}`);
+            }
+            if (!activeProxy) {
+                throw new Error('Aktif proxy bulunamadi (proxy havuzu bos ya da blacklistte). Snipe icin MongoDB proxy havuzuna en az bir aktif proxy ekleyin.');
+            }
+            const opts = {
+                ...baseOpts,
+                proxyHost: attachProtocolToHost(activeProxy.host, activeProxy.protocol || 'socks5'),
+                proxyPort: activeProxy.port,
+                proxyUsername: activeProxy.username || '',
+                proxyPassword: activeProxy.password || '',
+            };
+            logger.info('startSnipe:proxy_selected_from_pool', {
+                email,
+                idx,
+                proxyId: activeProxy.id,
+                poolAttempt,
+                proxy: `${activeProxy.host}:${activeProxy.port}`,
+            });
+            try {
+                const result = await launchAndLogin(opts);
+                if (activeProxy?.id) {
+                    try { await proxyRepo.markLoginSuccess(activeProxy.id); } catch {}
+                }
+                return result;
+            } catch (error) {
+                if (error && error.code === 'RUN_KILLED') throw error;
+                lastErr = error;
+                const soft = isSoftProxyLoginFailure(error?.message);
+                const retryAnother =
+                    shouldRetryLoginWithAnotherPoolProxy(error?.message) && poolAttempt < maxPoolAttempts;
+                if (activeProxy?.id) {
+                    try {
+                        await proxyRepo.markLoginFailure(activeProxy.id, {
+                            threshold: 3,
+                            reason: error?.message || 'login_failed',
+                            soft,
+                        });
+                    } catch {}
+                }
+                if (retryAnother) {
+                    logger.warn('startSnipe:proxy_pool_launch_retry', { email, idx, poolAttempt, nextAttempt: poolAttempt + 1 });
+                    await delay(400 + Math.floor(Math.random() * 500));
+                    continue;
+                }
+                throw error;
+            }
+        }
+        throw lastErr || new Error('Proxy havuz girisi basarisiz');
+    }
+
+    if (manualProxyLaunchConfig && !useManualSingleBrowserOnly) {
+        throw new Error(
+            'Birden fazla snipe hesabi: her hesap icin ayri cikis IP gerekir. Proxy havuzunu kullanin veya tek hesap + istekte manuel proxy alanlari doldurun.'
+        );
+    }
+
+    logger.info('startSnipe:proxy_skipped_direct_connection', { email, idx, reason: 'useProxyPool=false' });
+    return launchAndLogin(baseOpts);
+}
+
 // ─── Snipe Mode ───────────────────────────────────────────────────────────────
 
 async function startSnipe(req, res) {
@@ -12904,6 +13030,7 @@ async function startSnipe(req, res) {
             timeoutMs = 1_800_000,
             pollConcurrency = 4,
             categorySelectionMode = 'scan',
+            useProxyPool,
             proxyHost, proxyPort, proxyUsername, proxyPassword,
         } = validatedData;
 
@@ -12972,7 +13099,23 @@ async function startSnipe(req, res) {
             try {
                 // Hesapları staggered paralel başlat — her tarayıcı 2 sn arayla açılır
                 // ama hepsi eş zamanlı login sürecini yürütür (sırayla bitmesini beklemez)
-                logger.info('startSnipe:launching_accounts', { runId, count: accountList.length, mode: 'staggered_parallel' });
+                logger.info('startSnipe:launching_accounts', {
+                    runId,
+                    count: accountList.length,
+                    mode: 'staggered_parallel',
+                    useProxyPool,
+                });
+                try {
+                    const assignableProxyCount = await proxyRepo.countAssignableProxies();
+                    logger.info('startSnipe:proxy_pool_scan', {
+                        runId,
+                        assignableProxyCount,
+                        accountCount: accountList.length,
+                        useProxyPool,
+                    });
+                } catch (e) {
+                    logger.warn('startSnipe:proxy_pool_scan_failed', { runId, error: e?.message || String(e) });
+                }
 
                 const launchPromises = accountList.map((acc, idx) => new Promise(resolve => {
                     setTimeout(async () => {
@@ -12981,12 +13124,18 @@ async function startSnipe(req, res) {
                             ? `${String(getCfg().USER_DATA_DIR_A).replace(/[\\\/]$/, '')}/${label}`
                             : undefined;
                         try {
-                            const ctx = await launchAndLogin({
+                            const ctx = await launchSnipeAccountWithManagedProxy({
+                                runId,
                                 email: acc.email,
                                 password: acc.password,
                                 userDataDir,
-                                proxyHost, proxyPort, proxyUsername, proxyPassword,
-                                runId,
+                                idx,
+                                totalAccounts: accountList.length,
+                                useProxyPool,
+                                proxyHost,
+                                proxyPort,
+                                proxyUsername,
+                                proxyPassword,
                             });
                             ctx.accountProfile = acc;
                             ctx.email = acc.email;

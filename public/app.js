@@ -2079,12 +2079,16 @@ try {
     const maxPriceRaw  = parseFloat($('snipeMaxPrice')?.value || '');
     const adjacentCount= parseInt($('snipeAdjacentCount')?.value || '1', 10);
 
+    const useProxyPoolEl = $('snipeUseProxyPool');
+    const useProxyPool = useProxyPoolEl ? !!useProxyPoolEl.checked : true;
+
     const body = {
       eventAddress: eventUrl,
       teamId,
       selectedBlockIds: selBlockIds,
       aCredentialIds: selAccountIds,
       accounts: [],
+      useProxyPool,
       categorySelectionMode: catMode,
       intervalMs: Math.max(200, Math.min(5000, intervalMs)),
       timeoutMs,
