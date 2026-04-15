@@ -2169,11 +2169,12 @@ try {
           }
         }
         const status = data?.run?.status;
-        if (status === 'done' || status === 'error' || status === 'timeout' || status === 'killed') {
+        const snipeTerminalOk = status === 'done' || status === 'completed';
+        if (snipeTerminalOk || status === 'error' || status === 'timeout' || status === 'killed') {
           clearInterval(iv);
           setRunning(false);
           stopTimer();
-          log(`Tarama tamamlandı: ${status}`, status === 'done' ? 'ok' : 'warn');
+          log(`Tarama tamamlandı: ${status}`, snipeTerminalOk ? 'ok' : 'warn');
           snipeRunId = null;
           lastLoggedTick = 0;
           if (pollRow) pollRow.hidden = true;

@@ -13171,9 +13171,9 @@ async function startSnipe(req, res) {
                 let seatsAcquired = 0;
 
                 // Handle seat found → pick seat → return to idle
-                coordinator.on('seat_found', async ({ seatId, blockId, categoryId, categoryName, blockName, assignedCtx, markDone }) => {
+                coordinator.on('seat_found', async ({ seatId, blockId, categoryId, categoryName, blockName, svgBlockId, assignedCtx, markDone }) => {
                     logger.info('startSnipe:seat_found', {
-                        runId, seatId, blockId, categoryId,
+                        runId, seatId, blockId, categoryId, svgBlockId,
                         email: assignedCtx.email,
                     });
 
@@ -13244,7 +13244,11 @@ async function startSnipe(req, res) {
                         }
 
                         // Pick the exact seat
-                        const seatInfo = { seatId, blockId: String(blockId), svgBlockId: `block${blockId}` };
+                        const seatInfo = {
+                            seatId,
+                            blockId: String(blockId),
+                            svgBlockId: svgBlockId || (blockId != null ? `block${blockId}` : null),
+                        };
                         const pickedSeat = await pickExactSeatWithVerify_ReleaseAware(
                             assignedCtx.page, seatInfo, 30_000
                         );
