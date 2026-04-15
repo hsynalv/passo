@@ -157,9 +157,12 @@ function snapshotLooksLikeCloudflareHardBlock(snap, httpStatus) {
     const t = String(snap.title || '').toLowerCase();
     if (t.includes('just a moment')) return false;
     if (t.includes('sorry') && (t.includes('blocked') || t.includes('unable to access'))) return true;
-    if (t.includes('attention required') && t.includes('cloudflare')) return true;
+    const docL = Number(snap.docHtmlLen || 0);
+    const bodyL = Number(snap.bodyHtmlLen || 0);
     const ic = Number(snap.inputCount) || 0;
+    if (t.includes('attention required') && (t.includes('cloudflare') || docL < 12000)) return true;
     if (Number(httpStatus) === 403 && ic < 2 && t.includes('attention')) return true;
+    if (docL > 0 && docL < 9000 && bodyL > 0 && bodyL < 9000 && ic < 2 && t.includes('cloudflare')) return true;
     return false;
 }
 
@@ -3793,7 +3796,9 @@ async function launchAndLogin(options) {
             }
         })();
 
+        let didCfRecoverLoop = false;
         if (snapshotLooksLikeCloudflareBlock(snap0, lastLoginDoc?.status)) {
+            didCfRecoverLoop = true;
             logger.warn('launchAndLogin: olası Cloudflare/403, ana sayfa → /giris kurtarma', {
                 email,
                 docStatus: lastLoginDoc?.status
@@ -3825,6 +3830,18 @@ async function launchAndLogin(options) {
                 snap0 = await evalOnPage(page, loginSnapScript);
                 logger.info('launchAndLogin: CF kurtarma sonrası snapshot', { email, cfRound, snap: snap0 });
                 if (!snapshotLooksLikeCloudflareBlock(snap0, lastLoginDoc?.status)) break;
+            }
+        }
+
+        if (didCfRecoverLoop && snapshotLooksLikeCloudflareBlock(snap0, lastLoginDoc?.status)) {
+            const tLo = String(snap0?.title || '').toLowerCase();
+            if (!tLo.includes('just a moment')) {
+                logger.warn('launchAndLogin: CF kurtarma bitti, hâlâ WAF/CF görünümü — havuzda başka proxy', {
+                    email,
+                    title: snap0?.title,
+                    docStatus: lastLoginDoc?.status
+                });
+                throw new Error('Login blocked: Cloudflare veya kenar ağı (403/shell); farklı proxy denenebilir');
             }
         }
 
