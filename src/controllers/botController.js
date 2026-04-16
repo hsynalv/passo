@@ -3239,6 +3239,288 @@ function seedTicketingWebUrlForSnipePoll(eventAddress) {
 }
 
 /**
+ * ticketingweb SPA bazen token'ı localStorage'a birkaç saniye geciktirir.
+ * SeatCoordinator başlamadan önce beklenir; getseatstatus 401 InComingToken gürültüsü azalır.
+ * @param {import('puppeteer').Page} page
+ * @param {{ email?: string, timeoutMs?: number }} [opts]
+ */
+async function waitForSnipeTicketingPollToken(page, opts = {}) {
+    if (!page || (typeof page.isClosed === 'function' && page.isClosed())) return false;
+    const timeoutMs = Math.max(1200, Math.min(45000, Number(opts.timeoutMs) || 24000));
+    const pollMs = 280;
+    const email = opts.email || '';
+    const t0 = Date.now();
+
+    const probe = () => {
+        function extractTokenString(v) {
+            var s = String(v == null ? '' : v).trim();
+            if (!s) return '';
+            if (s.charAt(0) === '{') {
+                try {
+                    var o = JSON.parse(s);
+                    var t = o.access_token || o.token || o.accessToken || o.jwt || o.inComingToken || o.InComingToken;
+                    return t ? String(t) : '';
+                } catch (e) { return ''; }
+            }
+            if (s.length > 40 && s.indexOf('.') > 0 && s.split('.').length >= 3) return s;
+            return '';
+        }
+        function scan(store) {
+            var token = '';
+            try {
+                for (var i = 0; i < store.length; i++) {
+                    var k = store.key(i);
+                    if (!k) continue;
+                    var lk = String(k).toLowerCase();
+                    if (lk.indexOf('token') < 0 && lk.indexOf('auth') < 0 && lk.indexOf('jwt') < 0) continue;
+                    token = extractTokenString(store.getItem(k));
+                    if (token) return token;
+                }
+            } catch (e) {}
+            return '';
+        }
+        var token = '';
+        var fixed = ['access_token', 'token', 'jwt', 'id_token', 'accessToken', 'authToken', 'passo_token', 'passoToken', 'pb_token', 'pb-token'];
+        try {
+            for (var fi = 0; fi < fixed.length; fi++) {
+                var fk = fixed[fi];
+                token = extractTokenString(localStorage.getItem(fk) || sessionStorage.getItem(fk) || '');
+                if (token) return token.length;
+            }
+            token = scan(localStorage) || scan(sessionStorage);
+            if (token) return token.length;
+            for (var j = 0; j < localStorage.length; j++) {
+                var k2 = localStorage.key(j);
+                if (!k2) continue;
+                token = extractTokenString(localStorage.getItem(k2));
+                if (token && token.length > 50) return token.length;
+            }
+        } catch (e) {}
+        return 0;
+    };
+
+    while (Date.now() - t0 < timeoutMs) {
+        let n = 0;
+        try {
+            n = await evaluateSafe(page, probe);
+        } catch (_) {}
+        if (Number(n) >= 40) {
+            logger.info('startSnipe:ticketingweb_poll_token_ready', { email, tokenLen: n, waitedMs: Date.now() - t0 });
+            return true;
+        }
+        await delay(pollMs);
+    }
+    logger.warn('startSnipe:ticketingweb_poll_token_timeout', { email, waitedMs: Date.now() - t0 });
+    return false;
+}
+
+/**
+ * Poll ile aynı token keşfi + sayfa meta + ilginç storage anahtarları (uzun değerler kısaltılır).
+ * Tam sırları logSnipePassowebPollDebugBundle üst seviyede ekler.
+ */
+async function evaluateSnipeTicketingPollDebugFromPage(page) {
+    const snapshot = () => {
+        function extractTokenString(v) {
+            var s = String(v == null ? '' : v).trim();
+            if (!s) return '';
+            if (s.charAt(0) === '{') {
+                try {
+                    var o = JSON.parse(s);
+                    var t = o.access_token || o.token || o.accessToken || o.jwt || o.inComingToken || o.InComingToken;
+                    return t ? String(t) : '';
+                } catch (e) { return ''; }
+            }
+            if (s.length > 40 && s.indexOf('.') > 0 && s.split('.').length >= 3) return s;
+            return '';
+        }
+        function scan(store) {
+            var best = { key: '', len: 0 };
+            try {
+                for (var i = 0; i < store.length; i++) {
+                    var k = store.key(i);
+                    if (!k) continue;
+                    var lk = String(k).toLowerCase();
+                    if (lk.indexOf('token') < 0 && lk.indexOf('auth') < 0 && lk.indexOf('jwt') < 0) continue;
+                    var t = extractTokenString(store.getItem(k));
+                    var L = t ? t.length : 0;
+                    if (L > best.len) best = { key: k, len: L };
+                }
+            } catch (e) {}
+            return best;
+        }
+        var token = '';
+        var fixedKeyHit = '';
+        var fixed = ['access_token', 'token', 'jwt', 'id_token', 'accessToken', 'authToken', 'passo_token', 'passoToken', 'pb_token', 'pb-token'];
+        try {
+            for (var fi = 0; fi < fixed.length; fi++) {
+                var fk = fixed[fi];
+                var t0 = extractTokenString(localStorage.getItem(fk) || sessionStorage.getItem(fk) || '');
+                if (t0) {
+                    token = t0;
+                    fixedKeyHit = fk;
+                    break;
+                }
+            }
+            if (!token) {
+                var sl = scan(localStorage);
+                var ss = scan(sessionStorage);
+                if (ss.len > sl.len) {
+                    token = extractTokenString(sessionStorage.getItem(ss.key) || '');
+                    fixedKeyHit = ss.key || 'session_scan';
+                } else if (sl.len > 0) {
+                    token = extractTokenString(localStorage.getItem(sl.key) || '');
+                    fixedKeyHit = sl.key || 'local_scan';
+                }
+            }
+            if (!token) {
+                for (var j = 0; j < localStorage.length; j++) {
+                    var k2 = localStorage.key(j);
+                    if (!k2) continue;
+                    var t2 = extractTokenString(localStorage.getItem(k2));
+                    if (t2 && t2.length > 50) {
+                        token = t2;
+                        fixedKeyHit = k2;
+                        break;
+                    }
+                }
+            }
+        } catch (e) {}
+        var maxV = 25000;
+        function interestingDump(store, cap) {
+            var re = /token|auth|jwt|passo|pb|incoming|session|user|basket|cart|event|serie|ticket|login/i;
+            var arr = [];
+            try {
+                for (var i = 0; i < store.length; i++) {
+                    var k = store.key(i);
+                    if (!k) continue;
+                    var v = store.getItem(k) || '';
+                    if (!re.test(k) && v.length < 80) continue;
+                    var rawLen = v.length;
+                    var vv = v.length > maxV ? v.slice(0, maxV) + '…[truncated rawLen=' + rawLen + ']' : v;
+                    arr.push({ key: k, value: vv, rawLen: rawLen });
+                }
+            } catch (e2) {}
+            arr.sort(function (a, b) { return b.rawLen - a.rawLen; });
+            return arr.slice(0, cap);
+        }
+        return {
+            pageHref: (function () { try { return String(location.href || ''); } catch (e) { return ''; } })(),
+            userAgent: (function () { try { return String(navigator.userAgent || ''); } catch (e3) { return ''; } })(),
+            jwtFromStorage: token,
+            tokenKeyHint: fixedKeyHit,
+            tokenLen: token ? token.length : 0,
+            localStorageInteresting: interestingDump(localStorage, 80),
+            sessionStorageInteresting: interestingDump(sessionStorage, 80),
+            localStorageKeyCount: localStorage.length,
+            sessionStorageKeyCount: sessionStorage.length,
+        };
+    };
+    try {
+        return await evaluateSafe(page, snapshot);
+    } catch (e) {
+        return { error: e?.message || String(e) };
+    }
+}
+
+function buildPassowebGetSeatStatusUrl(eventId, serieId, blockId) {
+    const base = (getCfg().TICKETING_API_BASE || 'https://ticketingweb.passo.com.tr').replace(/\/$/, '');
+    const enc = (v) => encodeURIComponent(String(v == null ? '' : v));
+    return `${base}/api/passoweb/getseatstatus?eventId=${enc(eventId)}&serieId=${enc(serieId)}&blockId=${Number(blockId)}`;
+}
+
+function passoCookieNamesFromHeaderString(cookieString) {
+    const s = String(cookieString || '').trim();
+    if (!s) return [];
+    const names = [];
+    const seen = new Set();
+    for (const part of s.split(';')) {
+        const p = part.trim();
+        if (!p) continue;
+        const eq = p.indexOf('=');
+        const name = (eq >= 0 ? p.slice(0, eq) : p).trim();
+        if (name && !seen.has(name)) {
+            seen.add(name);
+            names.push(name);
+        }
+    }
+    return names;
+}
+
+/**
+ * Postman / curl / terminal tek seferde: tam Cookie, JWT, URL, sayfa meta, storage özeti (tek log satırı / tek meta objesi).
+ * Kişisel makinede tam sırlar; paylaşımlı sunucu loguna düşürme.
+ */
+async function logSnipePassowebPollDebugBundle({
+    page,
+    email,
+    runId,
+    eventId,
+    serieId,
+    sampleBlockId,
+    cookieString,
+}) {
+    const getSeatStatusUrl = buildPassowebGetSeatStatusUrl(eventId, serieId, sampleBlockId);
+    const cookieHeader = String(cookieString || '').trim();
+    const cookieNames = passoCookieNamesFromHeaderString(cookieHeader);
+    const fromPage = await evaluateSnipeTicketingPollDebugFromPage(page);
+    const jwt = String(fromPage.jwtFromStorage || '').trim();
+    const authorizationHeader = jwt ? `Bearer ${jwt}` : '';
+    const incomingTokenHeader = jwt;
+
+    const postmanHeadersRaw = JSON.stringify({
+        Cookie: cookieHeader,
+        Authorization: authorizationHeader,
+        InComingToken: incomingTokenHeader,
+        Accept: 'application/json, text/plain, */*',
+    }, null, 2);
+
+    const psEsc = (s) => String(s).replace(/'/g, "''");
+    const powershellSnippet = jwt && cookieHeader
+        ? `$uri = '${psEsc(getSeatStatusUrl)}'\n`
+        + `$h = @{\n`
+        + `  Cookie = '${psEsc(cookieHeader)}'\n`
+        + `  Authorization = '${psEsc(authorizationHeader)}'\n`
+        + `  InComingToken = '${psEsc(incomingTokenHeader)}'\n`
+        + `  Accept = 'application/json, text/plain, */*'\n`
+        + `}\n`
+        + `(Invoke-WebRequest -Uri $uri -Headers $h -UseBasicParsing).Content`
+        : '(jwt veya cookie bos — sayfa storage veya cookie toplamini kontrol et)';
+
+    const bundle = {
+        tag: 'passoweb_poll_debug_bundle',
+        runId,
+        email,
+        eventId: String(eventId || ''),
+        serieId: String(serieId || ''),
+        sampleBlockId: Number(sampleBlockId),
+        getSeatStatusUrl,
+        pageHref: fromPage.pageHref,
+        userAgent: fromPage.userAgent,
+        cookieHeader,
+        cookieNameList: cookieNames,
+        cookiePairCount: cookieNames.length,
+        jwtFromStorage: jwt,
+        tokenKeyHint: fromPage.tokenKeyHint,
+        tokenLen: jwt ? jwt.length : 0,
+        authorizationHeader,
+        incomingTokenHeader,
+        postmanMethod: 'GET',
+        postmanUrl: getSeatStatusUrl,
+        postmanHeadersJson: postmanHeadersRaw,
+        powershellInvokeSnippet: powershellSnippet,
+        fromPageSnapshot: {
+            localStorageKeyCount: fromPage.localStorageKeyCount,
+            sessionStorageKeyCount: fromPage.sessionStorageKeyCount,
+            localStorageInteresting: fromPage.localStorageInteresting,
+            sessionStorageInteresting: fromPage.sessionStorageInteresting,
+            evaluateError: fromPage.error,
+        },
+    };
+
+    logger.info('startSnipe:passoweb_poll_debug_bundle', bundle);
+}
+
+/**
  * Form submit başarısızsa doğrudan API ile giriş dener.
  * Şifreleme sayfa tarafında yapıldığı için page.evaluate ile form submit'ı tetikler.
  */
@@ -13419,9 +13701,18 @@ async function startSnipe(req, res) {
                     }
                 }));
 
-                // ticketingweb SPA token/localStorage dolsun — getseatstatus 401 InComingToken azaltır
-                await delay(1000);
-                logger.info('startSnipe:ticketingweb_bootstrap_wait', { ms: 1000 });
+                // ticketingweb SPA token/localStorage — poll öncesi coordinator ile aynı keşif mantığı
+                await delay(400);
+                const tokenWaitResults = await Promise.all(
+                    accountCtxList.map((ctx) =>
+                        waitForSnipeTicketingPollToken(ctx.page, { email: ctx.email, timeoutMs: 25000 })
+                    )
+                );
+                logger.info('startSnipe:ticketingweb_token_wait_done', {
+                    runId,
+                    readyCount: tokenWaitResults.filter(Boolean).length,
+                    total: accountCtxList.length,
+                });
 
                 // Collect categoryIds from targets
                 const allCategoryIds = targets.flatMap(t => Array.isArray(t.seatCategoryIds) ? t.seatCategoryIds : []);
@@ -13494,6 +13785,21 @@ async function startSnipe(req, res) {
                     logger.error('startSnipe:no_blocks_to_watch', { runId });
                     runStore.upsert(runId, { status: 'error', error: 'İzlenecek blok bulunamadı' });
                     return;
+                }
+
+                const sampleBlockId = [...blockMap.keys()][0];
+                try {
+                    await logSnipePassowebPollDebugBundle({
+                        page: monitorCtx.page,
+                        email: monitorCtx.email,
+                        runId,
+                        eventId,
+                        serieId: String(serieId || ''),
+                        sampleBlockId,
+                        cookieString: monitorCtx.cookieString || '',
+                    });
+                } catch (e) {
+                    logger.warn('startSnipe:passoweb_poll_debug_bundle_failed', { error: e?.message || String(e) });
                 }
 
                 // Merge per-target filters (use first target's filter as default)

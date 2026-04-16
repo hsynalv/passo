@@ -70,8 +70,11 @@ function computeSnipeMinIntervalMs(blockCount, accountCount) {
   const perAccount = Math.ceil(B / A);
   const accountFactor = 1 + (A - 1) * 0.38;
   const load = perAccount * 38 + Math.sqrt(B + 1) * 18;
-  const v = 480 + load * accountFactor;
-  return Math.min(7800, Math.max(650, Math.round(v)));
+  let v = 480 + load * accountFactor;
+  const pressure = B * A;
+  if (pressure >= 20) v *= 1.22;
+  if (pressure >= 32) v *= 1.08;
+  return Math.min(12000, Math.max(700, Math.round(v)));
 }
 
 /**
@@ -139,6 +142,7 @@ class SeatCoordinator extends EventEmitter {
     this._elapsed       = 0;
     this._tickRunning   = false;
     this._totalDispatched = 0;
+    this._consecutive429Ticks = 0;
   }
 
   addAccount(accountCtx) { this._idlePool.push(accountCtx); }
@@ -182,6 +186,10 @@ class SeatCoordinator extends EventEmitter {
         effective: this._effectivePollConcurrency,
       });
     }
+    this._consecutive429Ticks = 0;
+    const seqPoll =
+      (blockIds.length >= 55 && ac0 >= 2) ||
+      (ac0 >= 2 && blockIds.length * Math.max(1, ac0) >= 20);
     logger.info('SeatCoordinator:started', {
       eventId: this.eventId,
       blockCount: blockIds.length,
@@ -191,7 +199,7 @@ class SeatCoordinator extends EventEmitter {
       intervalMs: this.intervalMs,
       pollConcurrency: this.pollConcurrency,
       pollConcurrencyEffective: this._effectivePollConcurrency,
-      sequentialAccountPoll: blockIds.length >= 55 && ac0 >= 2,
+      sequentialAccountPoll: seqPoll,
       timeoutMs: this.timeoutMs,
     });
     this._timer = setInterval(() => this._tick(blockIds), this.intervalMs);
@@ -281,7 +289,10 @@ class SeatCoordinator extends EventEmitter {
 
       const pc = this._effectivePollConcurrency != null ? this._effectivePollConcurrency : this.pollConcurrency;
 
-      const useSequentialAccounts = blockIds.length >= 55 && idleAccounts.length >= 2;
+      const accountParallelPressure = blockIds.length * Math.max(1, idleAccounts.length);
+      const useSequentialAccounts =
+        (blockIds.length >= 55 && idleAccounts.length >= 2) ||
+        (idleAccounts.length >= 2 && accountParallelPressure >= 20);
 
       const runChunk = async (ctx, i) => {
         const chunk = chunks[i] || [];
@@ -291,7 +302,7 @@ class SeatCoordinator extends EventEmitter {
         if (!page || (typeof page.isClosed === 'function' && page.isClosed())) return [];
 
         try {
-          if (!useSequentialAccounts && i > 0) await delay(60 * i);
+          if (!useSequentialAccounts && i > 0) await delay(90 + 110 * i);
 
           const rows = await evaluateSafe(
               page,
@@ -357,7 +368,10 @@ class SeatCoordinator extends EventEmitter {
                 return (async function () {
                   var acc = [];
                   for (var o = 0; o < blocks.length; o += lim) {
-                    if (o > 0) await new Promise(function (r) { setTimeout(r, 55); });
+                    if (o > 0) {
+                      var gapMs = blocks.length > 5 ? 160 : (blocks.length > 3 ? 110 : 70);
+                      await new Promise(function (r) { setTimeout(r, gapMs); });
+                    }
                     var slice = blocks.slice(o, o + lim);
                     var batch = await Promise.all(slice.map(function (blockId) {
                       return (async function () {
@@ -449,7 +463,7 @@ class SeatCoordinator extends EventEmitter {
       if (useSequentialAccounts) {
         chunkResults = [];
         for (let i = 0; i < idleAccounts.length; i++) {
-          if (i > 0) await delay(420);
+          if (i > 0) await delay(520 + 90 * i);
           try {
             chunkResults.push({ status: 'fulfilled', value: await runChunk(idleAccounts[i], i) });
           } catch (reason) {
@@ -517,6 +531,19 @@ class SeatCoordinator extends EventEmitter {
         && httpSum.http200 === 0
         && httpSum.httpNot200 === allResults.length
         && Number((httpSum.statusBreakdown || {})['429'] || 0) === allResults.length;
+
+      if (httpSum.http200 > 0) {
+        this._consecutive429Ticks = 0;
+      } else if (allBlocks429) {
+        this._consecutive429Ticks = (this._consecutive429Ticks || 0) + 1;
+        if (this._consecutive429Ticks >= 2) {
+          this._adaptAfterSustained429(minIntervalByLoad, blockIds);
+          this._consecutive429Ticks = 0;
+        }
+      } else {
+        this._consecutive429Ticks = 0;
+      }
+
       const pollHint = allBlocks429
         ? 'Tüm yanıtlar 429 (hız limiti / Cloudflare). Aralık blok ve hesap sayısına göre dinamik tabana çekilir; tick_stats.intervalMs ve minIntervalByLoad alanlarına bak. Gerekirse pollConcurrency veya hesap sayısını azalt.'
         : allBlocksCf403
@@ -591,6 +618,48 @@ class SeatCoordinator extends EventEmitter {
     } finally {
       this._tickRunning = false;
     }
+  }
+
+  _rescheduleTickTimer(blockIds) {
+    if (!this._running || !Array.isArray(blockIds) || !blockIds.length) return;
+    if (this._timer) {
+      clearInterval(this._timer);
+      this._timer = null;
+    }
+    this._timer = setInterval(() => this._tick(blockIds), this.intervalMs);
+  }
+
+  /**
+   * Üst üste tüm bloklar 429 → aralığı ve sekme içi paralelliği düşür, timer'ı yeniden kur.
+   */
+  _adaptAfterSustained429(minIntervalFloor, blockIds) {
+    const prevInt = this.intervalMs;
+    const prevPc = this._effectivePollConcurrency ?? 1;
+    const nextPc = Math.max(1, prevPc - 1);
+    const intervalBump = nextPc < prevPc ? 1.48 : 1.32;
+    const bumped = Math.min(
+      16000,
+      Math.max(minIntervalFloor, Math.round(prevInt * intervalBump))
+    );
+    let changed = false;
+    if (nextPc < prevPc) {
+      this._effectivePollConcurrency = nextPc;
+      changed = true;
+    }
+    if (bumped > prevInt) {
+      this.intervalMs = bumped;
+      changed = true;
+    }
+    if (!changed) return;
+    logger.warn('SeatCoordinator:429_sustained_backoff', {
+      eventId: this.eventId,
+      intervalMs: this.intervalMs,
+      intervalMsBefore: prevInt,
+      pollConcurrencyEffective: this._effectivePollConcurrency,
+      pollConcurrencyBefore: prevPc,
+      minIntervalFloor: minIntervalFloor,
+    });
+    this._rescheduleTickTimer(blockIds);
   }
 
   _matchesFilter(seat, blockId) {
