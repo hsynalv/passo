@@ -24,6 +24,64 @@ function passoTicketingBrowserLikeHeaders({ forNode = false } = {}) {
   return h;
 }
 
+/**
+ * Tarayıcı `--proxy-server` ile aynı çıkışı Node axios’a verir (Cloudflare 403 / IP uyumsuzluğu).
+ * @returns {{ httpAgent?: import('http').Agent, httpsAgent?: import('http').Agent, proxy: boolean } | { proxy: boolean }}
+ */
+function buildAxiosAgentsFromSnipeOutboundProxy(snipeOutboundProxy) {
+  const none = { proxy: false };
+  const p = snipeOutboundProxy;
+  if (!p) return none;
+  const portFromOpts = String(p.proxyPort == null ? '' : p.proxyPort).trim();
+  if (!portFromOpts) return none;
+  const user = String(p.proxyUsername || '').trim();
+  const pass = String(p.proxyPassword || '').trim();
+  const auth =
+    user || pass ? `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@` : '';
+
+  let raw = String(p.proxyHost || '').trim();
+  if (!raw) return none;
+
+  let proto = 'socks5';
+  let hostname = '';
+  let port = portFromOpts;
+
+  if (/^(https?|socks4|socks5):\/\//i.test(raw)) {
+    try {
+      const normalized = raw.replace(/^socks5h:/i, 'socks5:');
+      const u = new URL(normalized);
+      proto = (u.protocol || 'socks5:').replace(/:$/, '').toLowerCase();
+      if (proto === 'socks5h') proto = 'socks5';
+      hostname = u.hostname;
+      if (u.port) port = u.port;
+    } catch {
+      return none;
+    }
+  } else {
+    hostname = raw.replace(/^\/+/, '');
+  }
+  if (!hostname) return none;
+
+  const hostPort = `${hostname}:${port}`;
+  try {
+    if (proto === 'socks4' || proto === 'socks5') {
+      const { SocksProxyAgent } = require('socks-proxy-agent');
+      const url = `${proto}://${auth}${hostPort}`;
+      const agent = new SocksProxyAgent(url);
+      return { httpAgent: agent, httpsAgent: agent, proxy: false };
+    }
+    if (proto === 'http' || proto === 'https') {
+      const { HttpsProxyAgent } = require('https-proxy-agent');
+      const proxyHttpUrl = `http://${auth}${hostPort}`;
+      const agent = new HttpsProxyAgent(proxyHttpUrl);
+      return { httpAgent: agent, httpsAgent: agent, proxy: false };
+    }
+  } catch (e) {
+    logger.warn('buildAxiosAgentsFromSnipeOutboundProxy:failed', { error: e?.message || String(e) });
+  }
+  return none;
+}
+
 /** Ham gövdeyi log / runStore için kısalt. */
 function previewHttpBody(data, maxLen = 900) {
   try {
@@ -245,7 +303,7 @@ class SeatCoordinator extends EventEmitter {
       ...(this.pollTransport === 'node'
         ? {
             nodePollNote:
-              'getseats / getseatsbyblockid Node(axios) ile; tarayici SOCKS proxy otomatik uygulanmaz — gerekirse ayni IP icin HTTP proxy veya CDP eklenebilir.',
+              'getseats / getseatsbyblockid Node(axios); hesapta snipeOutboundProxy varsa axios ayni SOCKS/HTTP ile cikar (CF 403 onleme).',
           }
         : {}),
     });
@@ -379,6 +437,15 @@ class SeatCoordinator extends EventEmitter {
       return { blockId, seatCategoryId };
     });
 
+    const axiosAgentOpts = buildAxiosAgentsFromSnipeOutboundProxy(ctx.snipeOutboundProxy);
+    if (axiosAgentOpts.httpsAgent && !ctx._snipeNodePollProxyLogged) {
+      ctx._snipeNodePollProxyLogged = true;
+      logger.info('SeatCoordinator:node_poll_uses_outbound_proxy', {
+        email: ctx.email,
+        hasAuth: !!(ctx.snipeOutboundProxy?.proxyUsername || ctx.snipeOutboundProxy?.proxyPassword),
+      });
+    }
+
     for (let o = 0; o < specs.length; o += lim) {
       if (o > 0) {
         const gapMs = specs.length > 5 ? 160 : (specs.length > 3 ? 110 : 70);
@@ -403,6 +470,7 @@ class SeatCoordinator extends EventEmitter {
               timeout: reqMs,
               validateStatus: () => true,
               responseType: 'text',
+              ...axiosAgentOpts,
             });
             const httpStatus = res.status;
             const txt = typeof res.data === 'string' ? res.data : String(res.data || '');
@@ -808,11 +876,25 @@ class SeatCoordinator extends EventEmitter {
         this._consecutive429Ticks = 0;
       }
 
+      let cf403Hint = null;
+      if (allBlocksCf403) {
+        const pools = [...this._idlePool, ...this._busyPool];
+        const hasOutProxy = pools.some(
+          (c) => c && c.snipeOutboundProxy && String(c.snipeOutboundProxy.proxyPort || '').trim()
+        );
+        if (this.pollTransport === 'node') {
+          cf403Hint = hasOutProxy
+            ? 'ticketingweb: tüm yanıtlar 403 (Cloudflare). Axios tarayıcıyla aynı outbound proxy kullanıyor; buna rağmen 403 ise cookie/JWT veya ek CF kuralı deneyin.'
+            : 'ticketingweb: tüm yanıtlar 403 (Cloudflare). Node axios doğrudan makine IP ile çıktı (hesapta proxy yok); tarayıcı SOCKS ile çıkış farklı → CF sık bloklar. Snipe için proxy havuzu veya manuel SOCKS kullanın; axios bu proxy ile eşlenir.';
+        } else {
+          cf403Hint =
+            'ticketingweb: tüm yanıtlar 403 (Cloudflare HTML). Sayfayı ticketing alanında yenile veya oturumu doğrula; hâlâ olmazsa IP/bölge kısıtı olabilir.';
+        }
+      }
+
       const pollHint = allBlocks429
         ? 'Tüm yanıtlar 429 (hız limiti / Cloudflare). Aralık blok ve hesap sayısına göre dinamik tabana çekilir; tick_stats.intervalMs ve minIntervalByLoad alanlarına bak. Gerekirse pollConcurrency veya hesap sayısını azalt.'
-        : allBlocksCf403
-          ? 'ticketingweb: tüm yanıtlar 403 (Cloudflare HTML). Sayfayı ticketing alanında yenile veya oturumu doğrula; hâlâ olmazsa IP/bölge kısıtı olabilir.'
-          : null;
+        : cf403Hint;
       this.emit('tick_stats', {
         tick,
         tickMs: Date.now() - tickT0,
