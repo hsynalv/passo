@@ -6,6 +6,10 @@ const logger       = require('../utils/logger');
 const delay        = require('../utils/delay');
 const { evaluateSafe } = require('../utils/browserEval');
 const { buildPassoApiCookieHeader } = require('./passoSessionCookies');
+const {
+  pickBestPassoPollToken,
+  collectPassoTokenLikeStoragePairsSource,
+} = require('./passoPollToken');
 
 /**
  * Gerçek passo.com.tr (Network panel) ile hizalı ek başlıklar.
@@ -334,61 +338,15 @@ class SeatCoordinator extends EventEmitter {
     this.emit('account_done', { accountCtx });
   }
 
-  /** www (veya mevcut) sekmeden JWT — Node axios poll için. */
+  /** www (veya mevcut) sekmeden API bearer — storage_token + normalize (SEO metni Bearer sanılmasın). */
   async _extractPollTokenFromPage(page) {
-    const probe = () => {
-      function extractTokenString(v) {
-        if (!v || typeof v !== 'string') return '';
-        const s = v.trim();
-        if (!s) return '';
-        if (s.charAt(0) === '{') {
-          try {
-            const o = JSON.parse(s);
-            const t = o.access_token || o.token || o.accessToken || o.jwt || o.inComingToken || o.InComingToken;
-            return t ? String(t) : '';
-          } catch (e) {
-            return '';
-          }
-        }
-        if (s.length > 40 && s.indexOf('.') > 0 && s.split('.').length >= 3) return s;
-        return '';
-      }
-      function scan(store) {
-        let best = '';
-        try {
-          for (let i = 0; i < store.length; i++) {
-            const k = store.key(i);
-            if (!k) continue;
-            const lk = String(k).toLowerCase();
-            if (lk.indexOf('token') < 0 && lk.indexOf('auth') < 0 && lk.indexOf('jwt') < 0) continue;
-            const t = extractTokenString(store.getItem(k));
-            if (t && t.length > best.length) best = t;
-          }
-        } catch (e) {}
-        return best;
-      }
-      let token = '';
-      const fixed = ['access_token', 'token', 'jwt', 'id_token', 'accessToken', 'authToken', 'passo_token', 'passoToken', 'pb_token', 'pb-token'];
-      try {
-        for (let fi = 0; fi < fixed.length; fi++) {
-          const fk = fixed[fi];
-          token = extractTokenString(localStorage.getItem(fk) || sessionStorage.getItem(fk) || '');
-          if (token) return token;
-        }
-        token = scan(localStorage) || scan(sessionStorage);
-        if (token) return token;
-        for (let j = 0; j < localStorage.length; j++) {
-          const k2 = localStorage.key(j);
-          if (!k2) continue;
-          const t2 = extractTokenString(localStorage.getItem(k2));
-          if (t2 && t2.length > 50) return t2;
-        }
-      } catch (e) {}
-      return token || '';
-    };
     try {
-      const t = await evaluateSafe(page, probe);
-      return typeof t === 'string' ? t : '';
+      const collectFn = new Function(
+        `${collectPassoTokenLikeStoragePairsSource()}\nreturn collectPassoTokenLikeStoragePairs();`
+      );
+      const pairs = await evaluateSafe(page, collectFn);
+      const { token } = pickBestPassoPollToken(Array.isArray(pairs) ? pairs : []);
+      return typeof token === 'string' ? token : '';
     } catch {
       return '';
     }
@@ -618,59 +576,16 @@ class SeatCoordinator extends EventEmitter {
             return { blockId, seatCategoryId };
           });
 
+          const pollToken = await this._extractPollTokenFromPage(page);
           const rows = await evaluateSafe(
               page,
-              function browserPollSeatList(blockSpecs, eId, sId, maxParallel, pollModeStr) {
+              function browserPollSeatList(blockSpecs, eId, sId, maxParallel, pollModeStr, preResolvedToken) {
                 function enc(v) {
                   return encodeURIComponent(String(v == null ? '' : v));
                 }
-                function extractTokenString(v) {
-                  if (!v || typeof v !== 'string') return '';
-                  var s = v.trim();
-                  if (!s) return '';
-                  if (s.charAt(0) === '{') {
-                    try {
-                      var o = JSON.parse(s);
-                      var t = o.access_token || o.token || o.accessToken || o.jwt || o.inComingToken || o.InComingToken;
-                      return t ? String(t) : '';
-                    } catch (e) { return ''; }
-                  }
-                  if (s.length > 40 && s.indexOf('.') > 0 && s.split('.').length >= 3) return s;
-                  return '';
-                }
                 function buildPassoFetchHeaders() {
                   var h = {};
-                  var token = '';
-                  var fixed = ['access_token', 'token', 'jwt', 'id_token', 'accessToken', 'authToken', 'passo_token', 'passoToken', 'pb_token', 'pb-token'];
-                  try {
-                    for (var fi = 0; fi < fixed.length; fi++) {
-                      var fk = fixed[fi];
-                      token = extractTokenString(localStorage.getItem(fk) || sessionStorage.getItem(fk) || '');
-                      if (token) break;
-                    }
-                    if (!token) {
-                      function scan(store) {
-                        for (var i = 0; i < store.length; i++) {
-                          var k = store.key(i);
-                          if (!k) continue;
-                          var lk = String(k).toLowerCase();
-                          if (lk.indexOf('token') < 0 && lk.indexOf('auth') < 0 && lk.indexOf('jwt') < 0) continue;
-                          token = extractTokenString(store.getItem(k));
-                          if (token) return token;
-                        }
-                        return '';
-                      }
-                      token = scan(localStorage) || scan(sessionStorage);
-                    }
-                    if (!token) {
-                      for (var j = 0; j < localStorage.length; j++) {
-                        var k2 = localStorage.key(j);
-                        if (!k2) continue;
-                        token = extractTokenString(localStorage.getItem(k2));
-                        if (token && token.length > 50) break;
-                      }
-                    }
-                  } catch (e) {}
+                  var token = String(preResolvedToken || '').trim();
                   if (token) {
                     h.Authorization = 'Bearer ' + token;
                     h.IncomingToken = token;
@@ -776,7 +691,8 @@ class SeatCoordinator extends EventEmitter {
               evId,
               seId,
               pc,
-              this.seatListPollMode
+              this.seatListPollMode,
+              pollToken
             );
             const list = Array.isArray(rows) ? rows : [];
             for (const row of list) {

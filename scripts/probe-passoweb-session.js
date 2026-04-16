@@ -26,6 +26,10 @@ const fs = require('fs');
 const readline = require('readline');
 const axios = require('axios');
 const { connect } = require('puppeteer-real-browser');
+const {
+  pickBestPassoPollToken,
+  collectPassoTokenLikeStoragePairsSource,
+} = require('../src/helpers/passoPollToken');
 
 const eventUrlWww = process.argv[2] || '';
 const blockIdArg = process.argv[3] ? parseInt(process.argv[3], 10) : null;
@@ -88,101 +92,32 @@ function mergeCookieHeader(cookieArrays) {
 }
 
 async function evaluateTokenSnapshot(page) {
-  return page.evaluate(() => {
-    function extractTokenString(v) {
-        const s = String(v == null ? '' : v).trim();
-        if (!s) return '';
-        if (s.charAt(0) === '{') {
-          try {
-            const o = JSON.parse(s);
-            const t =
-              o.access_token ||
-              o.token ||
-              o.accessToken ||
-              o.jwt ||
-              o.inComingToken ||
-              o.InComingToken;
-            return t ? String(t) : '';
-          } catch {
-            return '';
-          }
-        }
-        if (s.length > 40 && s.includes('.') && s.split('.').length >= 3) return s;
-        return '';
-      }
-      function scan(store) {
-        let best = { key: '', len: 0, token: '' };
-        try {
-          for (let i = 0; i < store.length; i++) {
-            const k = store.key(i);
-            if (!k) continue;
-            const lk = k.toLowerCase();
-            if (!lk.includes('token') && !lk.includes('auth') && !lk.includes('jwt')) continue;
-            const t = extractTokenString(store.getItem(k));
-            const L = t ? t.length : 0;
-            if (L > best.len) best = { key: k, len: L, token: t };
-          }
-        } catch {}
-        return best;
-      }
-      let token = '';
-      let tokenKeyHint = '';
-      const fixed = [
-        'access_token',
-        'token',
-        'jwt',
-        'id_token',
-        'accessToken',
-        'authToken',
-        'passo_token',
-        'passoToken',
-        'pb_token',
-        'pb-token',
-      ];
-      try {
-        for (const fk of fixed) {
-          const t0 = extractTokenString(
-            localStorage.getItem(fk) || sessionStorage.getItem(fk) || ''
-          );
-          if (t0) {
-            token = t0;
-            tokenKeyHint = fk;
-            break;
-          }
-        }
-        if (!token) {
-          const sl = scan(localStorage);
-          const ss = scan(sessionStorage);
-          if (ss.len > sl.len && ss.token) {
-            token = ss.token;
-            tokenKeyHint = ss.key || 'session_scan';
-          } else if (sl.token) {
-            token = sl.token;
-            tokenKeyHint = sl.key || 'local_scan';
-          }
-        }
-        if (!token) {
-          for (let j = 0; j < localStorage.length; j++) {
-            const k2 = localStorage.key(j);
-            if (!k2) continue;
-            const t2 = extractTokenString(localStorage.getItem(k2));
-            if (t2 && t2.length > 50) {
-              token = t2;
-              tokenKeyHint = k2;
-              break;
-            }
-          }
-        }
-      } catch {}
-
-    return {
-      pageHref: location.href,
-      userAgent: navigator.userAgent,
-      token,
-      tokenKeyHint,
-      tokenLen: token ? token.length : 0,
-    };
+  const collectFn = new Function(
+    `${collectPassoTokenLikeStoragePairsSource()}\nreturn collectPassoTokenLikeStoragePairs();`
+  );
+  const pairs = await page.evaluate(collectFn);
+  const picked = pickBestPassoPollToken(Array.isArray(pairs) ? pairs : []);
+  const pageHref = await page.evaluate(() => {
+    try {
+      return String(location.href || '');
+    } catch {
+      return '';
+    }
   });
+  const userAgent = await page.evaluate(() => {
+    try {
+      return String(navigator.userAgent || '');
+    } catch {
+      return '';
+    }
+  });
+  return {
+    pageHref,
+    userAgent,
+    token: picked.token || '',
+    tokenKeyHint: picked.key || '',
+    tokenLen: picked.token ? picked.token.length : 0,
+  };
 }
 
 (async () => {

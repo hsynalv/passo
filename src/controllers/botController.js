@@ -3230,59 +3230,20 @@ async function waitForSnipeTicketingPollToken(page, opts = {}) {
     const pollMs = 280;
     const email = opts.email || '';
     const t0 = Date.now();
-
-    const probe = () => {
-        function extractTokenString(v) {
-            var s = String(v == null ? '' : v).trim();
-            if (!s) return '';
-            if (s.charAt(0) === '{') {
-                try {
-                    var o = JSON.parse(s);
-                    var t = o.access_token || o.token || o.accessToken || o.jwt || o.inComingToken || o.InComingToken;
-                    return t ? String(t) : '';
-                } catch (e) { return ''; }
-            }
-            if (s.length > 40 && s.indexOf('.') > 0 && s.split('.').length >= 3) return s;
-            return '';
-        }
-        function scan(store) {
-            var token = '';
-            try {
-                for (var i = 0; i < store.length; i++) {
-                    var k = store.key(i);
-                    if (!k) continue;
-                    var lk = String(k).toLowerCase();
-                    if (lk.indexOf('token') < 0 && lk.indexOf('auth') < 0 && lk.indexOf('jwt') < 0) continue;
-                    token = extractTokenString(store.getItem(k));
-                    if (token) return token;
-                }
-            } catch (e) {}
-            return '';
-        }
-        var token = '';
-        var fixed = ['access_token', 'token', 'jwt', 'id_token', 'accessToken', 'authToken', 'passo_token', 'passoToken', 'pb_token', 'pb-token'];
-        try {
-            for (var fi = 0; fi < fixed.length; fi++) {
-                var fk = fixed[fi];
-                token = extractTokenString(localStorage.getItem(fk) || sessionStorage.getItem(fk) || '');
-                if (token) return token.length;
-            }
-            token = scan(localStorage) || scan(sessionStorage);
-            if (token) return token.length;
-            for (var j = 0; j < localStorage.length; j++) {
-                var k2 = localStorage.key(j);
-                if (!k2) continue;
-                token = extractTokenString(localStorage.getItem(k2));
-                if (token && token.length > 50) return token.length;
-            }
-        } catch (e) {}
-        return 0;
-    };
+    const {
+        pickBestPassoPollToken,
+        collectPassoTokenLikeStoragePairsSource,
+    } = require('../helpers/passoPollToken');
+    const collectPairs = new Function(
+        `${collectPassoTokenLikeStoragePairsSource()}\nreturn collectPassoTokenLikeStoragePairs();`
+    );
 
     while (Date.now() - t0 < timeoutMs) {
         let n = 0;
         try {
-            n = await evaluateSafe(page, probe);
+            const pairs = await evaluateSafe(page, collectPairs);
+            const { token } = pickBestPassoPollToken(Array.isArray(pairs) ? pairs : []);
+            n = token ? token.length : 0;
         } catch (_) {}
         if (Number(n) >= 40) {
             logger.info('startSnipe:ticketingweb_poll_token_ready', { email, tokenLen: n, waitedMs: Date.now() - t0 });
@@ -3299,104 +3260,50 @@ async function waitForSnipeTicketingPollToken(page, opts = {}) {
  * Tam sırları logSnipePassowebPollDebugBundle üst seviyede ekler.
  */
 async function evaluateSnipeTicketingPollDebugFromPage(page) {
-    const snapshot = () => {
-        function extractTokenString(v) {
-            var s = String(v == null ? '' : v).trim();
-            if (!s) return '';
-            if (s.charAt(0) === '{') {
-                try {
-                    var o = JSON.parse(s);
-                    var t = o.access_token || o.token || o.accessToken || o.jwt || o.inComingToken || o.InComingToken;
-                    return t ? String(t) : '';
-                } catch (e) { return ''; }
-            }
-            if (s.length > 40 && s.indexOf('.') > 0 && s.split('.').length >= 3) return s;
-            return '';
-        }
-        function scan(store) {
-            var best = { key: '', len: 0 };
-            try {
-                for (var i = 0; i < store.length; i++) {
-                    var k = store.key(i);
-                    if (!k) continue;
-                    var lk = String(k).toLowerCase();
-                    if (lk.indexOf('token') < 0 && lk.indexOf('auth') < 0 && lk.indexOf('jwt') < 0) continue;
-                    var t = extractTokenString(store.getItem(k));
-                    var L = t ? t.length : 0;
-                    if (L > best.len) best = { key: k, len: L };
-                }
-            } catch (e) {}
-            return best;
-        }
-        var token = '';
-        var fixedKeyHit = '';
-        var fixed = ['access_token', 'token', 'jwt', 'id_token', 'accessToken', 'authToken', 'passo_token', 'passoToken', 'pb_token', 'pb-token'];
-        try {
-            for (var fi = 0; fi < fixed.length; fi++) {
-                var fk = fixed[fi];
-                var t0 = extractTokenString(localStorage.getItem(fk) || sessionStorage.getItem(fk) || '');
-                if (t0) {
-                    token = t0;
-                    fixedKeyHit = fk;
-                    break;
-                }
-            }
-            if (!token) {
-                var sl = scan(localStorage);
-                var ss = scan(sessionStorage);
-                if (ss.len > sl.len) {
-                    token = extractTokenString(sessionStorage.getItem(ss.key) || '');
-                    fixedKeyHit = ss.key || 'session_scan';
-                } else if (sl.len > 0) {
-                    token = extractTokenString(localStorage.getItem(sl.key) || '');
-                    fixedKeyHit = sl.key || 'local_scan';
-                }
-            }
-            if (!token) {
-                for (var j = 0; j < localStorage.length; j++) {
-                    var k2 = localStorage.key(j);
-                    if (!k2) continue;
-                    var t2 = extractTokenString(localStorage.getItem(k2));
-                    if (t2 && t2.length > 50) {
-                        token = t2;
-                        fixedKeyHit = k2;
-                        break;
-                    }
-                }
-            }
-        } catch (e) {}
-        var maxV = 25000;
-        function interestingDump(store, cap) {
-            var re = /token|auth|jwt|passo|pb|incoming|session|user|basket|cart|event|serie|ticket|login/i;
-            var arr = [];
-            try {
-                for (var i = 0; i < store.length; i++) {
-                    var k = store.key(i);
-                    if (!k) continue;
-                    var v = store.getItem(k) || '';
-                    if (!re.test(k) && v.length < 80) continue;
-                    var rawLen = v.length;
-                    var vv = v.length > maxV ? v.slice(0, maxV) + '…[truncated rawLen=' + rawLen + ']' : v;
-                    arr.push({ key: k, value: vv, rawLen: rawLen });
-                }
-            } catch (e2) {}
-            arr.sort(function (a, b) { return b.rawLen - a.rawLen; });
-            return arr.slice(0, cap);
-        }
-        return {
-            pageHref: (function () { try { return String(location.href || ''); } catch (e) { return ''; } })(),
-            userAgent: (function () { try { return String(navigator.userAgent || ''); } catch (e3) { return ''; } })(),
-            jwtFromStorage: token,
-            tokenKeyHint: fixedKeyHit,
-            tokenLen: token ? token.length : 0,
-            localStorageInteresting: interestingDump(localStorage, 80),
-            sessionStorageInteresting: interestingDump(sessionStorage, 80),
-            localStorageKeyCount: localStorage.length,
-            sessionStorageKeyCount: sessionStorage.length,
-        };
-    };
+    const {
+        pickBestPassoPollToken,
+        collectPassoTokenLikeStoragePairsSource,
+    } = require('../helpers/passoPollToken');
+    const snapshot = new Function(`
+${collectPassoTokenLikeStoragePairsSource()}
+var maxV = 25000;
+function interestingDump(store, cap) {
+    var re = /token|auth|jwt|passo|pb|incoming|session|user|basket|cart|event|serie|ticket|login/i;
+    var arr = [];
     try {
-        return await evaluateSafe(page, snapshot);
+        for (var i = 0; i < store.length; i++) {
+            var k = store.key(i);
+            if (!k) continue;
+            var v = store.getItem(k) || '';
+            if (!re.test(k) && v.length < 80) continue;
+            var rawLen = v.length;
+            var vv = v.length > maxV ? v.slice(0, maxV) + '…[truncated rawLen=' + rawLen + ']' : v;
+            arr.push({ key: k, value: vv, rawLen: rawLen });
+        }
+    } catch (e2) {}
+    arr.sort(function (a, b) { return b.rawLen - a.rawLen; });
+    return arr.slice(0, cap);
+}
+return {
+    pairs: collectPassoTokenLikeStoragePairs(),
+    pageHref: (function () { try { return String(location.href || ''); } catch (e) { return ''; } })(),
+    userAgent: (function () { try { return String(navigator.userAgent || ''); } catch (e3) { return ''; } })(),
+    localStorageInteresting: interestingDump(localStorage, 80),
+    sessionStorageInteresting: interestingDump(sessionStorage, 80),
+    localStorageKeyCount: localStorage.length,
+    sessionStorageKeyCount: sessionStorage.length,
+};
+`);
+    try {
+        const raw = await evaluateSafe(page, snapshot);
+        const picked = pickBestPassoPollToken(Array.isArray(raw?.pairs) ? raw.pairs : []);
+        const { pairs, ...rest } = raw || {};
+        return {
+            ...rest,
+            jwtFromStorage: picked.token || '',
+            tokenKeyHint: picked.key || '',
+            tokenLen: picked.token ? picked.token.length : 0,
+        };
     } catch (e) {
         return { error: e?.message || String(e) };
     }
