@@ -3220,7 +3220,7 @@ async function getcaptchaGuid() {
 
 /**
  * ticketingweb SPA bazen token'ı localStorage'a birkaç saniye geciktirir.
- * SeatCoordinator başlamadan önce beklenir; getseatstatus 401 InComingToken gürültüsü azalır.
+ * SeatCoordinator başlamadan önce beklenir; koltuk listesi API 401 InComingToken gürültüsü azalır.
  * @param {import('puppeteer').Page} page
  * @param {{ email?: string, timeoutMs?: number }} [opts]
  */
@@ -3402,10 +3402,16 @@ async function evaluateSnipeTicketingPollDebugFromPage(page) {
     }
 }
 
-function buildPassowebGetSeatStatusUrl(eventId, serieId, blockId) {
+function buildPassowebSeatListPollUrl({ seatListPollMode, eventId, serieId, blockId, seatCategoryId }) {
     const base = (getCfg().TICKETING_API_BASE || 'https://ticketingweb.passo.com.tr').replace(/\/$/, '');
     const enc = (v) => encodeURIComponent(String(v == null ? '' : v));
-    return `${base}/api/passoweb/getseatstatus?eventId=${enc(eventId)}&serieId=${enc(serieId)}&blockId=${Number(blockId)}`;
+    const mode = String(seatListPollMode || 'legacy').toLowerCase() === 'svg' ? 'svg' : 'legacy';
+    const sc = enc(seatCategoryId != null && seatCategoryId !== '' ? String(seatCategoryId) : '');
+    const bid = Number(blockId);
+    if (mode === 'svg') {
+        return `${base}/api/passoweb/getseatsbyblockid?eventId=${enc(eventId)}&serieId=${enc(serieId)}&seatCategoryId=${sc}&blockId=${bid}&campaignId=undefined`;
+    }
+    return `${base}/api/passoweb/getseats?eventId=${enc(eventId)}&serieId=${enc(serieId)}&seatCategoryId=${sc}&blockId=${bid}`;
 }
 
 function passoCookieNamesFromHeaderString(cookieString) {
@@ -3438,8 +3444,16 @@ async function logSnipePassowebPollDebugBundle({
     serieId,
     sampleBlockId,
     cookieString,
+    seatListPollMode = 'legacy',
+    sampleSeatCategoryId = null,
 }) {
-    const getSeatStatusUrl = buildPassowebGetSeatStatusUrl(eventId, serieId, sampleBlockId);
+    const getSeatStatusUrl = buildPassowebSeatListPollUrl({
+        seatListPollMode,
+        eventId,
+        serieId,
+        blockId: sampleBlockId,
+        seatCategoryId: sampleSeatCategoryId,
+    });
     const cookieHeader = String(cookieString || '').trim();
     const cookieNames = passoCookieNamesFromHeaderString(cookieHeader);
     const fromPage = await evaluateSnipeTicketingPollDebugFromPage(page);
@@ -3481,6 +3495,8 @@ async function logSnipePassowebPollDebugBundle({
         eventId: String(eventId || ''),
         serieId: String(serieId || ''),
         sampleBlockId: Number(sampleBlockId),
+        seatListPollMode: String(seatListPollMode || 'legacy'),
+        sampleSeatCategoryId: sampleSeatCategoryId != null ? String(sampleSeatCategoryId) : null,
         getSeatStatusUrl,
         pageHref: fromPage.pageHref,
         userAgent: fromPage.userAgent,
@@ -13656,7 +13672,7 @@ async function startSnipe(req, res) {
                 }
 
                 // Poll için koltuk-secim'e GİTME — Passo SPA orada frame detach yapar.
-                // getseatstatus: Node axios (CORS yok); sekme www etkinlikte kalır — ticketingweb HTML/403/404 acilmaz.
+                // getseats / getseatsbyblockid: Node axios (CORS yok); sekme www etkinlikte kalır.
                 const seatSelectionUrl = String(eventAddress).replace(/\/+$/, '') + '/koltuk-secim';
                 const ticketingApiBaseForPoll = String(getCfg().TICKETING_API_BASE || 'https://ticketingweb.passo.com.tr').replace(/\/$/, '');
                 await Promise.allSettled(accountCtxList.map(async (ctx) => {
@@ -13753,15 +13769,19 @@ async function startSnipe(req, res) {
                 if (!blockMap.size) {
                     const explicitBlockIds = (targets || []).flatMap(t => Array.isArray(t.blockIds) ? t.blockIds : []);
                     if (explicitBlockIds.length) {
+                        const sharedCatId = allCategoryIds.length === 1 ? allCategoryIds[0] : null;
                         for (const blkId of explicitBlockIds) {
                             blockMap.set(Number(blkId), {
-                                categoryId: null,
+                                categoryId: sharedCatId != null ? sharedCatId : null,
                                 categoryName: '',
                                 blockName: String(blkId),
                                 svgBlockId: null,
                             });
                         }
-                        logger.info('startSnipe:using_explicit_blockIds', { count: blockMap.size });
+                        logger.info('startSnipe:using_explicit_blockIds', {
+                            count: blockMap.size,
+                            sharedSeatCategoryId: sharedCatId != null ? sharedCatId : null,
+                        });
                     } else {
                         logger.info('startSnipe:fetching_block_map', { eventId, categoryCount: allCategoryIds.length });
                         try {
@@ -13784,7 +13804,21 @@ async function startSnipe(req, res) {
                     return;
                 }
 
+                const catSel = String(categorySelectionMode || 'scan').toLowerCase();
+                const seatListPollMode = catSel === 'legacy'
+                    ? 'legacy'
+                    : (catSel === 'svg' || catSel === 'scan_map')
+                        ? 'svg'
+                        : [...blockMap.values()].some((m) => m && m.svgBlockId) ? 'svg' : 'legacy';
+
+                logger.info('startSnipe:seat_list_poll_mode', {
+                    seatListPollMode,
+                    categorySelectionMode: catSel,
+                    note: 'svg → getseatsbyblockid; legacy → getseats (Passo web)',
+                });
+
                 const sampleBlockId = [...blockMap.keys()][0];
+                const sampleSeatCategoryId = (blockMap.get(sampleBlockId) || {}).categoryId ?? null;
                 try {
                     await logSnipePassowebPollDebugBundle({
                         page: monitorCtx.page,
@@ -13794,6 +13828,8 @@ async function startSnipe(req, res) {
                         serieId: String(serieId || ''),
                         sampleBlockId,
                         cookieString: monitorCtx.cookieString || '',
+                        seatListPollMode,
+                        sampleSeatCategoryId,
                     });
                 } catch (e) {
                     logger.warn('startSnipe:passoweb_poll_debug_bundle_failed', { error: e?.message || String(e) });
@@ -13808,6 +13844,7 @@ async function startSnipe(req, res) {
                     intervalMs, timeoutMs, pollConcurrency,
                     ticketingApiBase: ticketingApiBaseForPoll,
                     pollTransport: 'node',
+                    seatListPollMode,
                 });
 
                 // Register all accounts as idle

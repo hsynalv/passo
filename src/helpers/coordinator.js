@@ -56,7 +56,7 @@ function previewNetworkErrorBody(data, maxLen = 400) {
 }
 
 /**
- * getseatstatus JSON: valueList çok büyük olabilir — uzunluk + ilk koltuk + diğer alanlar.
+ * Koltuk listesi JSON (`getseats` / `getseatsbyblockid`): value / valueList büyük olabilir.
  */
 function previewSeatStatusPayload(data, maxLen = 900) {
   try {
@@ -102,8 +102,8 @@ function computeSnipeMinIntervalMs(blockCount, accountCount) {
  * Proaktif koltuk tarama motoru.
  *
  * Tasarım ilkeleri:
- *  1. Multi-page polling   — `pollTransport: 'node'`: Node axios + sayfadan Cookie/JWT (CORS yok; sekme www’de kalabilir).
- *     `pollTransport: 'browser'` (varsayılan): sayfa içi `fetch('/api/...')` — sekme ticketingweb origin’inde olmalı.
+   *  1. Multi-page polling   — `pollTransport: 'node'`: Node axios + sayfadan Cookie/JWT (CORS yok; sekme www’de kalabilir).
+   *     `pollTransport: 'browser'`: sayfa içi `fetch('/api/...')` — mümkünse ticketingweb / aynı origin; URL `getseats` veya `getseatsbyblockid`.
  *     Bloklar hesaplar arasında bölünür; her sekmede pollConcurrency kadar paralel,
  *     kalanı sırayla (429 / Cloudflare rate limit azaltma).
  *  2. Seat TTL tracking    — Boşa düşen koltukların "ilk görülme" zamanı tutulur.
@@ -134,9 +134,10 @@ class SeatCoordinator extends EventEmitter {
    * @param {string[]|null} [opts.filter.rows]
    * @param {number}   [opts.intervalMs=1400]
    * @param {number}   [opts.timeoutMs=1800000]  30 dakika default
-   * @param {number}   [opts.pollConcurrency=4]  Tek tick’te sekme başına eşzamanlı getseatstatus üst sınırı
+   * @param {number}   [opts.pollConcurrency=4]  Tek tick’te sekme başına eşzamanlı koltuk listesi isteği üst sınırı
    * @param {string}   [opts.ticketingApiBase=''] Node poll kökü (örn. https://ticketingweb.passo.com.tr); boşsa varsayılan.
    * @param {string}   [opts.pollTransport='browser'] `browser` | `node` — snipe için `node` (www + axios).
+   * @param {string}   [opts.seatListPollMode='legacy'] `svg` → getseatsbyblockid; `legacy` → getseats (Passo web ile aynı).
    */
   constructor({
     eventId,
@@ -148,6 +149,7 @@ class SeatCoordinator extends EventEmitter {
     pollConcurrency = 4,
     ticketingApiBase = '',
     pollTransport = 'browser',
+    seatListPollMode = 'legacy',
   }) {
     super();
     this.eventId    = eventId;
@@ -155,6 +157,7 @@ class SeatCoordinator extends EventEmitter {
     const tab = String(ticketingApiBase || '').trim().replace(/\/+$/, '');
     this.ticketingApiBase = tab || 'https://ticketingweb.passo.com.tr';
     this.pollTransport = String(pollTransport || 'browser').toLowerCase() === 'node' ? 'node' : 'browser';
+    this.seatListPollMode = String(seatListPollMode || 'legacy').toLowerCase() === 'svg' ? 'svg' : 'legacy';
     this.blockMap   = blockMap || new Map();
     this.filter     = { adjacentCount: 1, maxPrice: null, rows: null, ...filter };
     let im = Number(intervalMs);
@@ -237,10 +240,12 @@ class SeatCoordinator extends EventEmitter {
       timeoutMs: this.timeoutMs,
       ticketingApiBase: this.ticketingApiBase,
       pollTransport: this.pollTransport,
+      seatListPollMode: this.seatListPollMode,
+      seatListPollPath: this.seatListPollMode === 'svg' ? 'getseatsbyblockid' : 'getseats',
       ...(this.pollTransport === 'node'
         ? {
             nodePollNote:
-              'getseatstatus Node(axios) ile; tarayici SOCKS proxy otomatik uygulanmaz — gerekirse ayni IP icin HTTP proxy veya CDP eklenebilir.',
+              'getseats / getseatsbyblockid Node(axios) ile; tarayici SOCKS proxy otomatik uygulanmaz — gerekirse ayni IP icin HTTP proxy veya CDP eklenebilir.',
           }
         : {}),
     });
@@ -332,9 +337,20 @@ class SeatCoordinator extends EventEmitter {
   }
 
   /**
-   * getseatstatus Node üzerinden (CORS yok). Cookie/JWT tarayıcıdan okunur.
-   * SOCKS proxy tarayıcıda; Node isteği şimdilik doğrudan çıkış — havuz IP’si farklı olabilir.
+   * `getseats` (legacy) veya `getseatsbyblockid` (SVG) — Node axios (CORS yok). Cookie/JWT sayfadan.
    */
+  _buildSeatListPollUrl(blockId, seatCategoryId) {
+    const base =
+      String(this.ticketingApiBase || '').replace(/\/+$/, '') || 'https://ticketingweb.passo.com.tr';
+    const enc = (v) => encodeURIComponent(String(v == null ? '' : v));
+    const bid = Number(blockId);
+    const sc = enc(String(seatCategoryId != null && seatCategoryId !== '' ? seatCategoryId : ''));
+    if (this.seatListPollMode === 'svg') {
+      return `${base}/api/passoweb/getseatsbyblockid?eventId=${enc(this.eventId)}&serieId=${enc(this.serieId || '')}&seatCategoryId=${sc}&blockId=${bid}&campaignId=undefined`;
+    }
+    return `${base}/api/passoweb/getseats?eventId=${enc(this.eventId)}&serieId=${enc(this.serieId || '')}&seatCategoryId=${sc}&blockId=${bid}`;
+  }
+
   async _pollChunkNodeHttp(ctx, blocks, eId, sId, effectivePc) {
     const page = ctx.page;
     if (!page) return [];
@@ -352,21 +368,35 @@ class SeatCoordinator extends EventEmitter {
       headers.InComingToken = token;
       headers.IncomingToken = token;
     }
-    const base = String(this.ticketingApiBase || '').replace(/\/+$/, '') || 'https://ticketingweb.passo.com.tr';
-    const enc = (v) => encodeURIComponent(String(v == null ? '' : v));
     const reqMs = Math.min(25000, Math.max(8000, Number(this.timeoutMs) || 20000));
     const lim = Math.max(1, Math.min(12, Number(effectivePc) || 4));
     const acc = [];
+    const specs = (blocks || []).map((bid) => {
+      const blockId = Number(bid);
+      const meta = this.blockMap.get(blockId) || {};
+      const rawCat = meta.categoryId;
+      const seatCategoryId = rawCat != null && rawCat !== '' ? String(rawCat) : '';
+      return { blockId, seatCategoryId };
+    });
 
-    for (let o = 0; o < blocks.length; o += lim) {
+    for (let o = 0; o < specs.length; o += lim) {
       if (o > 0) {
-        const gapMs = blocks.length > 5 ? 160 : (blocks.length > 3 ? 110 : 70);
+        const gapMs = specs.length > 5 ? 160 : (specs.length > 3 ? 110 : 70);
         await delay(gapMs);
       }
-      const slice = blocks.slice(o, o + lim);
+      const slice = specs.slice(o, o + lim);
       const batch = await Promise.all(
-        slice.map(async (blockId) => {
-          const url = `${base}/api/passoweb/getseatstatus?eventId=${enc(eId)}&serieId=${enc(sId)}&blockId=${Number(blockId)}`;
+        slice.map(async ({ blockId, seatCategoryId }) => {
+          if (!seatCategoryId) {
+            return {
+              blockId,
+              seats: null,
+              httpStatus: null,
+              axiosError: 'missing_seatCategoryId',
+              bodyPreview: 'blockMap.categoryId (seatCategoryId) gerekli',
+            };
+          }
+          const url = this._buildSeatListPollUrl(blockId, seatCategoryId);
           try {
             const res = await axios.get(url, {
               headers,
@@ -512,9 +542,17 @@ class SeatCoordinator extends EventEmitter {
             return list;
           }
 
+          const chunkSpecs = chunk.map((bid) => {
+            const blockId = Number(bid);
+            const meta = this.blockMap.get(blockId) || {};
+            const rawCat = meta.categoryId;
+            const seatCategoryId = rawCat != null && rawCat !== '' ? String(rawCat) : '';
+            return { blockId, seatCategoryId };
+          });
+
           const rows = await evaluateSafe(
               page,
-              function browserPollGetSeatStatus(blocks, eId, sId, maxParallel) {
+              function browserPollSeatList(blockSpecs, eId, sId, maxParallel, pollModeStr) {
                 function enc(v) {
                   return encodeURIComponent(String(v == null ? '' : v));
                 }
@@ -576,18 +614,32 @@ class SeatCoordinator extends EventEmitter {
                   return h;
                 }
                 var lim = Math.max(1, Math.min(12, parseInt(maxParallel, 10) || 4));
+                var mode = String(pollModeStr || 'legacy').toLowerCase() === 'svg' ? 'svg' : 'legacy';
                 return (async function () {
                   var acc = [];
-                  for (var o = 0; o < blocks.length; o += lim) {
+                  for (var o = 0; o < blockSpecs.length; o += lim) {
                     if (o > 0) {
-                      var gapMs = blocks.length > 5 ? 160 : (blocks.length > 3 ? 110 : 70);
+                      var gapMs = blockSpecs.length > 5 ? 160 : (blockSpecs.length > 3 ? 110 : 70);
                       await new Promise(function (r) { setTimeout(r, gapMs); });
                     }
-                    var slice = blocks.slice(o, o + lim);
-                    var batch = await Promise.all(slice.map(function (blockId) {
+                    var slice = blockSpecs.slice(o, o + lim);
+                    var batch = await Promise.all(slice.map(function (spec) {
                       return (async function () {
                         try {
-                          const url = '/api/passoweb/getseatstatus?eventId=' + enc(eId) + '&serieId=' + enc(sId) + '&blockId=' + Number(blockId);
+                          var blockId = spec.blockId;
+                          var seatCat = String(spec.seatCategoryId || '');
+                          if (!seatCat) {
+                            return {
+                              blockId: blockId,
+                              seats: null,
+                              httpStatus: null,
+                              axiosError: 'missing_seatCategoryId',
+                              bodyPreview: null,
+                            };
+                          }
+                          var url = mode === 'svg'
+                            ? '/api/passoweb/getseatsbyblockid?eventId=' + enc(eId) + '&serieId=' + enc(sId) + '&seatCategoryId=' + enc(seatCat) + '&blockId=' + Number(blockId) + '&campaignId=undefined'
+                            : '/api/passoweb/getseats?eventId=' + enc(eId) + '&serieId=' + enc(sId) + '&seatCategoryId=' + enc(seatCat) + '&blockId=' + Number(blockId);
                           var r;
                           var httpStatus;
                           var ct;
@@ -652,10 +704,11 @@ class SeatCoordinator extends EventEmitter {
                   return acc;
                 })();
               },
-              chunk,
+              chunkSpecs,
               evId,
               seId,
-              pc
+              pc,
+              this.seatListPollMode
             );
             const list = Array.isArray(rows) ? rows : [];
             for (const row of list) {

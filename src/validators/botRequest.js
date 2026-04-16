@@ -257,7 +257,7 @@ const snipeRequestSchema = z.object({
   teamId: z.string().optional(),
   /** Çok düşük değer + çok blok → Cloudflare 429. Varsayılan biraz yüksek tutuldu. */
   intervalMs: z.number().int().min(400).max(8000).optional().default(1400),
-  /** Tek tick içinde aynı sekmede en fazla kaç getseatstatus paralel (429 önleme). */
+  /** Tek tick içinde aynı sekmede en fazla kaç koltuk listesi isteği paralel (429 önleme). */
   pollConcurrency: z.number().int().min(1).max(12).optional().default(4),
   timeoutMs: z.number().int().min(10000).optional().default(1_800_000),
   categorySelectionMode: z.enum(['legacy', 'scan', 'svg', 'scan_map']).optional().default('scan'),
