@@ -3219,26 +3219,6 @@ async function getcaptchaGuid() {
 }
 
 /**
- * Snipe sırasında sayfa içi fetch('/api/passoweb/...') same-origin olmalı.
- * www etkinlik URL'sini ticketingweb host'una taşır (path/query korunur).
- */
-function seedTicketingWebUrlForSnipePoll(eventAddress) {
-    const tw = (getCfg().TICKETING_API_BASE || 'https://ticketingweb.passo.com.tr').replace(/\/$/, '');
-    const s = String(eventAddress || '').trim();
-    if (!s) return `${tw}/`;
-    try {
-        const u = new URL(s);
-        const h = u.hostname.toLowerCase();
-        if (h === 'www.passo.com.tr' || h === 'passo.com.tr') {
-            u.hostname = 'ticketingweb.passo.com.tr';
-            return u.toString();
-        }
-        if (h === 'ticketingweb.passo.com.tr') return s;
-    } catch {}
-    return `${tw}/`;
-}
-
-/**
  * ticketingweb SPA bazen token'ı localStorage'a birkaç saniye geciktirir.
  * SeatCoordinator başlamadan önce beklenir; getseatstatus 401 InComingToken gürültüsü azalır.
  * @param {import('puppeteer').Page} page
@@ -13653,9 +13633,9 @@ async function startSnipe(req, res) {
                 }
 
                 // Poll için koltuk-secim'e GİTME — Passo SPA orada frame detach yapar.
-                // Polling: sayfa içi fetch same-origin olmalı → önce ticketingweb seed URL.
+                // ticketingweb kökü /tr çoğu ortamda 403/404 HTML; sekme www etkinlikte kalır, getseatstatus mutlak API URL (CORS+credentials).
                 const seatSelectionUrl = String(eventAddress).replace(/\/+$/, '') + '/koltuk-secim';
-                const ticketingSeedUrl = seedTicketingWebUrlForSnipePoll(eventAddress);
+                const ticketingApiBaseForPoll = String(getCfg().TICKETING_API_BASE || 'https://ticketingweb.passo.com.tr').replace(/\/$/, '');
                 await Promise.allSettled(accountCtxList.map(async (ctx) => {
                     try {
                         // Şu anki URL etkinlik sayfasıysa yeniden navigate etmeye gerek yok
@@ -13668,24 +13648,12 @@ async function startSnipe(req, res) {
                             });
                         }
                         ctx.seatSelectionUrl = seatSelectionUrl;
-                        logger.info('startSnipe:account_at_event_page', { email: ctx.email, url: eventAddress });
-                        try {
-                            await gotoWithRetry(ctx.page, ticketingSeedUrl, {
-                                retries: 2,
-                                waitUntil: 'domcontentloaded',
-                                rejectIfHome: false,
-                                backoffMs: 500,
-                            });
-                            logger.info('startSnipe:account_at_ticketingweb_for_poll', {
-                                email: ctx.email,
-                                url: ticketingSeedUrl,
-                            });
-                        } catch (e) {
-                            logger.warn('startSnipe:ticketingweb_seed_nav_failed', {
-                                email: ctx.email,
-                                error: e?.message,
-                            });
-                        }
+                        logger.info('startSnipe:account_at_event_page_poll', {
+                            email: ctx.email,
+                            url: eventAddress,
+                            ticketingApiBase: ticketingApiBaseForPoll,
+                            note: 'getseatstatus cross-origin fetch; ticketingweb HTML acilmiyor',
+                        });
                     } catch (e) {
                         logger.warn('startSnipe:account_navigate_failed', { email: ctx.email, error: e?.message });
                     }
@@ -13713,10 +13681,11 @@ async function startSnipe(req, res) {
                         waitForSnipeTicketingPollToken(ctx.page, { email: ctx.email, timeoutMs: 25000 })
                     )
                 );
-                logger.info('startSnipe:ticketingweb_token_wait_done', {
+                logger.info('startSnipe:poll_token_wait_done', {
                     runId,
                     readyCount: tokenWaitResults.filter(Boolean).length,
                     total: accountCtxList.length,
+                    context: 'www_event_page_localStorage',
                 });
 
                 // Collect categoryIds from targets
@@ -13814,6 +13783,7 @@ async function startSnipe(req, res) {
                     eventId, serieId, blockMap,
                     filter: mergedFilter,
                     intervalMs, timeoutMs, pollConcurrency,
+                    ticketingApiBase: ticketingApiBaseForPoll,
                 });
 
                 // Register all accounts as idle

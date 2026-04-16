@@ -84,7 +84,8 @@ function computeSnipeMinIntervalMs(blockCount, accountCount) {
  *
  * Tasarım ilkeleri:
  *  1. Multi-page polling   — Her idle hesabın Puppeteer sayfasında `fetch(..., credentials:include)`
- *     ile getseatstatus çağrılır (Cloudflare / tarayıcı oturumu ile uyumlu).
+ *     ile getseatstatus çağrılır. `ticketingApiBase` doluysa mutlak ticketingweb API URL (www sekmesinden
+ *     CORS); boşsa relative `/api/...` (ticketingweb ile same-origin).
  *     Bloklar hesaplar arasında bölünür; her sekmede pollConcurrency kadar paralel,
  *     kalanı sırayla (429 / Cloudflare rate limit azaltma).
  *  2. Seat TTL tracking    — Boşa düşen koltukların "ilk görülme" zamanı tutulur.
@@ -116,11 +117,16 @@ class SeatCoordinator extends EventEmitter {
    * @param {number}   [opts.intervalMs=1400]
    * @param {number}   [opts.timeoutMs=1800000]  30 dakika default
    * @param {number}   [opts.pollConcurrency=4]  Tek tick’te sekme başına eşzamanlı getseatstatus üst sınırı
+   * @param {string}   [opts.ticketingApiBase=''] ticketingweb kökü (örn. https://ticketingweb.passo.com.tr) — doluysa
+   *                   getseatstatus mutlak URL ile çağrılır (sekme www’de kalabilir; ticketingweb HTML 403/404 kaçınılır).
    */
-  constructor({ eventId, serieId = '', blockMap, filter = {}, intervalMs = 1400, timeoutMs = 1_800_000, pollConcurrency = 4 }) {
+  constructor({ eventId, serieId = '', blockMap, filter = {}, intervalMs = 1400, timeoutMs = 1_800_000, pollConcurrency = 4, ticketingApiBase = '' }) {
     super();
     this.eventId    = eventId;
     this.serieId    = serieId;
+    const tab = String(ticketingApiBase || '').trim().replace(/\/+$/, '');
+    /** @type {string|null} */
+    this.ticketingApiBase = tab || null;
     this.blockMap   = blockMap || new Map();
     this.filter     = { adjacentCount: 1, maxPrice: null, rows: null, ...filter };
     let im = Number(intervalMs);
@@ -201,6 +207,8 @@ class SeatCoordinator extends EventEmitter {
       pollConcurrencyEffective: this._effectivePollConcurrency,
       sequentialAccountPoll: seqPoll,
       timeoutMs: this.timeoutMs,
+      ticketingApiBase: this.ticketingApiBase,
+      pollFetchMode: this.ticketingApiBase ? 'absolute_cross_origin' : 'relative_same_origin',
     });
     this._timer = setInterval(() => this._tick(blockIds), this.intervalMs);
     this._tick(blockIds); // ilk tick hemen
@@ -283,9 +291,10 @@ class SeatCoordinator extends EventEmitter {
         blockIds.slice(i * chunkSize, (i + 1) * chunkSize)
       );
 
-      // Same-origin: sekme ticketingweb.passo.com.tr üzerinde olmalı (startSnipe seed URL).
+      // getseatstatus: ticketingApiBase doluysa mutlak URL (www etkinlik sekmesinden CORS+credentials).
       const evId  = this.eventId;
       const seId  = this.serieId;
+      const apiBase = this.ticketingApiBase || '';
 
       const pc = this._effectivePollConcurrency != null ? this._effectivePollConcurrency : this.pollConcurrency;
 
@@ -306,10 +315,11 @@ class SeatCoordinator extends EventEmitter {
 
           const rows = await evaluateSafe(
               page,
-              function browserPollGetSeatStatus(blocks, eId, sId, maxParallel) {
+              function browserPollGetSeatStatus(blocks, eId, sId, maxParallel, ticketingOrigin) {
                 function enc(v) {
                   return encodeURIComponent(String(v == null ? '' : v));
                 }
+                var apiRoot = String(ticketingOrigin || '').replace(/\/+$/, '');
                 function extractTokenString(v) {
                   if (!v || typeof v !== 'string') return '';
                   var s = v.trim();
@@ -376,7 +386,8 @@ class SeatCoordinator extends EventEmitter {
                     var batch = await Promise.all(slice.map(function (blockId) {
                       return (async function () {
                         try {
-                          const url = '/api/passoweb/getseatstatus?eventId=' + enc(eId) + '&serieId=' + enc(sId) + '&blockId=' + Number(blockId);
+                          var pathQs = '/api/passoweb/getseatstatus?eventId=' + enc(eId) + '&serieId=' + enc(sId) + '&blockId=' + Number(blockId);
+                          var url = apiRoot ? (apiRoot + pathQs) : pathQs;
                           var r;
                           var httpStatus;
                           var ct;
@@ -444,7 +455,8 @@ class SeatCoordinator extends EventEmitter {
               chunk,
               evId,
               seId,
-              pc
+              pc,
+              apiBase
             );
             const list = Array.isArray(rows) ? rows : [];
             for (const row of list) {

@@ -12,6 +12,8 @@
  *   node scripts/probe-network.js https://www.passo.com.tr/tr/etkinlik/xxx 90 mail@x.com sifre123
  *
  * Cikti: logs/probe-network-<timestamp>.txt dosyasina da kaydedilir.
+ *
+ * Cookie + JWT + getseatstatus tek JSON: scripts/probe-passoweb-session.js
  */
 
 'use strict';
