@@ -3,8 +3,8 @@
 /**
  * probe-passoweb-session.js
  * ─────────────────────────────────────────────────────────────────
- * Snipe / SeatCoordinator ile aynı fikir: ticketingweb oturumunda
- * çerez + localStorage JWT + sayfa içi getseatstatus sonucunu tek seferde döker.
+ * Snipe ile aynı fikir: www etkinlikte kal, çerez + JWT oku, getseatstatus’u **Node axios**
+ * ile ticketingweb’e at (CORS yok; tarayıcıda mutlak fetch www’den bloklanır).
  *
  * Kullanım:
  *   node scripts/probe-passoweb-session.js "<www_etkinlik_url>" [blockId]
@@ -14,9 +14,9 @@
  *
  * Akış:
  *   1) Tarayıcı açılır → Passo’da manuel giriş yap → ENTER
- *   2) Etkinlik www URL’sinde kalınır (ticketingweb HTML çoğu path’te 403/404)
- *   3) Çerezleri (www + ticketingweb jar) birleştirir, storage’dan JWT arar
- *   4) getseatstatus: mutlak https://ticketingweb.../api/... (CORS+credentials) ile dener
+ *   2) www etkinlik
+ *   3) Çerez + storage JWT
+ *   4) getseatstatus: bu script içinde axios (ticketingweb tam URL)
  *
  * Çıktı: logs/probe-passoweb-session-<timestamp>.json (tam Cookie + JWT — paylaşma)
  */
@@ -24,6 +24,7 @@
 const path = require('path');
 const fs = require('fs');
 const readline = require('readline');
+const axios = require('axios');
 const { connect } = require('puppeteer-real-browser');
 
 const eventUrlWww = process.argv[2] || '';
@@ -76,8 +77,6 @@ function extractEventId(url) {
   return m ? m[1] : null;
 }
 
-const TICKETING_API_BASE = 'https://ticketingweb.passo.com.tr';
-
 function mergeCookieHeader(cookieArrays) {
   const byName = new Map();
   for (const arr of cookieArrays) {
@@ -88,15 +87,9 @@ function mergeCookieHeader(cookieArrays) {
   return Array.from(byName.values()).join('; ');
 }
 
-async function evaluateTokenAndTestFetch(page, eventId, serieId, blockId, apiRoot) {
-  const bIdForBrowser =
-    blockId != null && !Number.isNaN(Number(blockId)) ? Number(blockId) : 0;
-  return page.evaluate(
-    async (eId, sId, bId, apiBase) => {
-      function enc(v) {
-        return encodeURIComponent(String(v == null ? '' : v));
-      }
-      function extractTokenString(v) {
+async function evaluateTokenSnapshot(page) {
+  return page.evaluate(() => {
+    function extractTokenString(v) {
         const s = String(v == null ? '' : v).trim();
         if (!s) return '';
         if (s.charAt(0) === '{') {
@@ -182,52 +175,14 @@ async function evaluateTokenAndTestFetch(page, eventId, serieId, blockId, apiRoo
         }
       } catch {}
 
-      var root = String(apiBase || '').replace(/\/+$/, '');
-      var pathQs =
-        '/api/passoweb/getseatstatus?eventId=' +
-        enc(eId) +
-        '&serieId=' +
-        enc(sId) +
-        '&blockId=' +
-        Number(bId);
-      var url = root ? root + pathQs : pathQs;
-      let fetchResult = null;
-      if (bId) {
-        try {
-          const hdrs = {};
-          if (token) {
-            hdrs.Authorization = 'Bearer ' + token;
-            hdrs.IncomingToken = token;
-            hdrs.InComingToken = token;
-          }
-          const init = { credentials: 'include', cache: 'no-store' };
-          if (Object.keys(hdrs).length) init.headers = hdrs;
-          const r = await fetch(url, init);
-          const txt = await r.text();
-          fetchResult = {
-            httpStatus: r.status,
-            bodyPreview: txt.slice(0, 4000),
-            bodyLen: txt.length,
-          };
-        } catch (e) {
-          fetchResult = { error: e && e.message ? String(e.message) : 'fetch_failed' };
-        }
-      }
-
-      return {
-        pageHref: location.href,
-        userAgent: navigator.userAgent,
-        token,
-        tokenKeyHint,
-        tokenLen: token ? token.length : 0,
-        fetchResult,
-      };
-    },
-    eventId,
-    serieId || '',
-    bIdForBrowser,
-    apiRoot || ''
-  );
+    return {
+      pageHref: location.href,
+      userAgent: navigator.userAgent,
+      token,
+      tokenKeyHint,
+      tokenLen: token ? token.length : 0,
+    };
+  });
 }
 
 (async () => {
@@ -256,7 +211,6 @@ async function evaluateTokenAndTestFetch(page, eventId, serieId, blockId, apiRoo
 
   console.log('Tarayici:', browserPath);
   console.log('Etkinlik (www):', eventUrlWww);
-  console.log('API kökü      :', TICKETING_API_BASE, '(mutlak URL + CORS, tw HTML acilmiyor)');
   console.log('eventId       :', eventId);
   console.log('blockId       :', blockIdArg != null && !Number.isNaN(blockIdArg) ? blockIdArg : '(yok — fetch atlanir)');
   console.log('');
@@ -277,9 +231,9 @@ async function evaluateTokenAndTestFetch(page, eventId, serieId, blockId, apiRoo
   });
   await waitForEnter('>>> Giris tamam, ENTER: ');
 
-  console.log('\n[*] www etkinlik sayfasi (kalici)...');
+  console.log('\n[*] www etkinlik...');
   await page.goto(eventUrlWww, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await sleep(3500);
+  await sleep(2500);
 
   let cookiesWww = [];
   let cookiesTw = [];
@@ -290,15 +244,9 @@ async function evaluateTokenAndTestFetch(page, eventId, serieId, blockId, apiRoo
     cookiesTw = await page.cookies('https://ticketingweb.passo.com.tr/');
   } catch {}
   const cookieHeader = mergeCookieHeader([cookiesWww, cookiesTw]);
-  const inner = await evaluateTokenAndTestFetch(
-    page,
-    eventId,
-    '',
-    blockIdArg != null && !Number.isNaN(blockIdArg) ? blockIdArg : null,
-    TICKETING_API_BASE
-  );
+  const inner = await evaluateTokenSnapshot(page);
 
-  const base = TICKETING_API_BASE;
+  const base = 'https://ticketingweb.passo.com.tr';
   const bId =
     blockIdArg != null && !Number.isNaN(blockIdArg)
       ? blockIdArg
@@ -309,11 +257,43 @@ async function evaluateTokenAndTestFetch(page, eventId, serieId, blockId, apiRoo
       )}&serieId=&blockId=${bId}`
     : null;
 
+  let nodeAxiosGetseatstatus = null;
+  if (getSeatUrl) {
+    const headers = {
+      Accept: 'application/json, text/plain, */*',
+      'Content-Type': 'text/plain',
+      Currentculture: 'tr-TR',
+      Referer: 'https://www.passo.com.tr/',
+      Origin: 'https://www.passo.com.tr',
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+    };
+    if (inner.token) {
+      headers.Authorization = `Bearer ${inner.token}`;
+      headers.InComingToken = inner.token;
+      headers.IncomingToken = inner.token;
+    }
+    try {
+      const res = await axios.get(getSeatUrl, {
+        headers,
+        timeout: 20000,
+        validateStatus: () => true,
+        responseType: 'text',
+      });
+      const txt = typeof res.data === 'string' ? res.data : String(res.data || '');
+      nodeAxiosGetseatstatus = {
+        httpStatus: res.status,
+        bodyPreview: txt.slice(0, 4000),
+        bodyLen: txt.length,
+      };
+    } catch (e) {
+      nodeAxiosGetseatstatus = { error: e && e.message ? String(e.message) : 'axios_failed' };
+    }
+  }
+
   const bundle = {
     generatedAt: new Date().toISOString(),
     eventUrlWww,
-    pollMode: 'www_page_absolute_ticketing_api',
-    ticketingApiBase: TICKETING_API_BASE,
+    pollMode: 'www_page_node_axios',
     eventId,
     blockId: bId,
     getSeatStatusUrl: getSeatUrl,
@@ -332,17 +312,21 @@ async function evaluateTokenAndTestFetch(page, eventId, serieId, blockId, apiRoo
     incomingTokenHeader: inner.token || '',
     pageHref: inner.pageHref,
     userAgent: inner.userAgent,
-    inPageFetchGetseatstatus: inner.fetchResult,
+    nodeAxiosGetseatstatus,
     postman: {
       method: 'GET',
       url: getSeatUrl,
       headers: {
+        Accept: 'application/json, text/plain, */*',
+        'Content-Type': 'text/plain',
+        Currentculture: 'tr-TR',
+        Referer: 'https://www.passo.com.tr/',
+        Origin: 'https://www.passo.com.tr',
         Cookie: cookieHeader,
         ...(inner.token
           ? {
               Authorization: `Bearer ${inner.token}`,
               InComingToken: inner.token,
-              Accept: 'application/json, text/plain, */*',
             }
           : {}),
       },
@@ -355,8 +339,8 @@ async function evaluateTokenAndTestFetch(page, eventId, serieId, blockId, apiRoo
   console.log('cookieHeaderLen :', bundle.cookieHeaderLen);
   console.log('tokenLen        :', bundle.tokenLen);
   console.log('tokenKeyHint    :', bundle.tokenKeyHint || '(yok)');
-  if (inner.fetchResult) {
-    console.log('getseatstatus   :', JSON.stringify(inner.fetchResult).slice(0, 500));
+  if (nodeAxiosGetseatstatus) {
+    console.log('getseatstatus   :', JSON.stringify(nodeAxiosGetseatstatus).slice(0, 500));
   }
   console.log('\nTam JSON:', outPath);
   console.log('Tarayiciyi kendin kapatabilirsin.\n');

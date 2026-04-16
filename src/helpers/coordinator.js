@@ -1,9 +1,28 @@
 'use strict';
 
 const EventEmitter = require('events');
+const axios = require('axios');
 const logger       = require('../utils/logger');
 const delay        = require('../utils/delay');
 const { evaluateSafe } = require('../utils/browserEval');
+const { buildPassoApiCookieHeader } = require('./passoSessionCookies');
+
+/**
+ * Gerçek passo.com.tr (Network panel) ile hizalı ek başlıklar.
+ * Not: Tarayıcıda `Origin` / `Referer` fetch ile script’ten set edilemez (forbidden); Node axios’ta eklenebilir.
+ */
+function passoTicketingBrowserLikeHeaders({ forNode = false } = {}) {
+  const h = {
+    Accept: 'application/json, text/plain, */*',
+    'Content-Type': 'text/plain',
+    Currentculture: 'tr-TR',
+  };
+  if (forNode) {
+    h.Referer = 'https://www.passo.com.tr/';
+    h.Origin = 'https://www.passo.com.tr';
+  }
+  return h;
+}
 
 /** Ham gövdeyi log / runStore için kısalt. */
 function previewHttpBody(data, maxLen = 900) {
@@ -83,9 +102,8 @@ function computeSnipeMinIntervalMs(blockCount, accountCount) {
  * Proaktif koltuk tarama motoru.
  *
  * Tasarım ilkeleri:
- *  1. Multi-page polling   — Her idle hesabın Puppeteer sayfasında `fetch(..., credentials:include)`
- *     ile getseatstatus çağrılır. `ticketingApiBase` doluysa mutlak ticketingweb API URL (www sekmesinden
- *     CORS); boşsa relative `/api/...` (ticketingweb ile same-origin).
+ *  1. Multi-page polling   — `pollTransport: 'node'`: Node axios + sayfadan Cookie/JWT (CORS yok; sekme www’de kalabilir).
+ *     `pollTransport: 'browser'` (varsayılan): sayfa içi `fetch('/api/...')` — sekme ticketingweb origin’inde olmalı.
  *     Bloklar hesaplar arasında bölünür; her sekmede pollConcurrency kadar paralel,
  *     kalanı sırayla (429 / Cloudflare rate limit azaltma).
  *  2. Seat TTL tracking    — Boşa düşen koltukların "ilk görülme" zamanı tutulur.
@@ -117,16 +135,26 @@ class SeatCoordinator extends EventEmitter {
    * @param {number}   [opts.intervalMs=1400]
    * @param {number}   [opts.timeoutMs=1800000]  30 dakika default
    * @param {number}   [opts.pollConcurrency=4]  Tek tick’te sekme başına eşzamanlı getseatstatus üst sınırı
-   * @param {string}   [opts.ticketingApiBase=''] ticketingweb kökü (örn. https://ticketingweb.passo.com.tr) — doluysa
-   *                   getseatstatus mutlak URL ile çağrılır (sekme www’de kalabilir; ticketingweb HTML 403/404 kaçınılır).
+   * @param {string}   [opts.ticketingApiBase=''] Node poll kökü (örn. https://ticketingweb.passo.com.tr); boşsa varsayılan.
+   * @param {string}   [opts.pollTransport='browser'] `browser` | `node` — snipe için `node` (www + axios).
    */
-  constructor({ eventId, serieId = '', blockMap, filter = {}, intervalMs = 1400, timeoutMs = 1_800_000, pollConcurrency = 4, ticketingApiBase = '' }) {
+  constructor({
+    eventId,
+    serieId = '',
+    blockMap,
+    filter = {},
+    intervalMs = 1400,
+    timeoutMs = 1_800_000,
+    pollConcurrency = 4,
+    ticketingApiBase = '',
+    pollTransport = 'browser',
+  }) {
     super();
     this.eventId    = eventId;
     this.serieId    = serieId;
     const tab = String(ticketingApiBase || '').trim().replace(/\/+$/, '');
-    /** @type {string|null} */
-    this.ticketingApiBase = tab || null;
+    this.ticketingApiBase = tab || 'https://ticketingweb.passo.com.tr';
+    this.pollTransport = String(pollTransport || 'browser').toLowerCase() === 'node' ? 'node' : 'browser';
     this.blockMap   = blockMap || new Map();
     this.filter     = { adjacentCount: 1, maxPrice: null, rows: null, ...filter };
     let im = Number(intervalMs);
@@ -208,7 +236,13 @@ class SeatCoordinator extends EventEmitter {
       sequentialAccountPoll: seqPoll,
       timeoutMs: this.timeoutMs,
       ticketingApiBase: this.ticketingApiBase,
-      pollFetchMode: this.ticketingApiBase ? 'absolute_cross_origin' : 'relative_same_origin',
+      pollTransport: this.pollTransport,
+      ...(this.pollTransport === 'node'
+        ? {
+            nodePollNote:
+              'getseatstatus Node(axios) ile; tarayici SOCKS proxy otomatik uygulanmaz — gerekirse ayni IP icin HTTP proxy veya CDP eklenebilir.',
+          }
+        : {}),
     });
     this._timer = setInterval(() => this._tick(blockIds), this.intervalMs);
     this._tick(blockIds); // ilk tick hemen
@@ -235,6 +269,162 @@ class SeatCoordinator extends EventEmitter {
       idleCount: this._idlePool.length,
     });
     this.emit('account_done', { accountCtx });
+  }
+
+  /** www (veya mevcut) sekmeden JWT — Node axios poll için. */
+  async _extractPollTokenFromPage(page) {
+    const probe = () => {
+      function extractTokenString(v) {
+        if (!v || typeof v !== 'string') return '';
+        const s = v.trim();
+        if (!s) return '';
+        if (s.charAt(0) === '{') {
+          try {
+            const o = JSON.parse(s);
+            const t = o.access_token || o.token || o.accessToken || o.jwt || o.inComingToken || o.InComingToken;
+            return t ? String(t) : '';
+          } catch (e) {
+            return '';
+          }
+        }
+        if (s.length > 40 && s.indexOf('.') > 0 && s.split('.').length >= 3) return s;
+        return '';
+      }
+      function scan(store) {
+        let best = '';
+        try {
+          for (let i = 0; i < store.length; i++) {
+            const k = store.key(i);
+            if (!k) continue;
+            const lk = String(k).toLowerCase();
+            if (lk.indexOf('token') < 0 && lk.indexOf('auth') < 0 && lk.indexOf('jwt') < 0) continue;
+            const t = extractTokenString(store.getItem(k));
+            if (t && t.length > best.length) best = t;
+          }
+        } catch (e) {}
+        return best;
+      }
+      let token = '';
+      const fixed = ['access_token', 'token', 'jwt', 'id_token', 'accessToken', 'authToken', 'passo_token', 'passoToken', 'pb_token', 'pb-token'];
+      try {
+        for (let fi = 0; fi < fixed.length; fi++) {
+          const fk = fixed[fi];
+          token = extractTokenString(localStorage.getItem(fk) || sessionStorage.getItem(fk) || '');
+          if (token) return token;
+        }
+        token = scan(localStorage) || scan(sessionStorage);
+        if (token) return token;
+        for (let j = 0; j < localStorage.length; j++) {
+          const k2 = localStorage.key(j);
+          if (!k2) continue;
+          const t2 = extractTokenString(localStorage.getItem(k2));
+          if (t2 && t2.length > 50) return t2;
+        }
+      } catch (e) {}
+      return token || '';
+    };
+    try {
+      const t = await evaluateSafe(page, probe);
+      return typeof t === 'string' ? t : '';
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * getseatstatus Node üzerinden (CORS yok). Cookie/JWT tarayıcıdan okunur.
+   * SOCKS proxy tarayıcıda; Node isteği şimdilik doğrudan çıkış — havuz IP’si farklı olabilir.
+   */
+  async _pollChunkNodeHttp(ctx, blocks, eId, sId, effectivePc) {
+    const page = ctx.page;
+    if (!page) return [];
+    let cookieHeader = '';
+    try {
+      cookieHeader = await buildPassoApiCookieHeader(page);
+    } catch {}
+    const token = await this._extractPollTokenFromPage(page);
+    const headers = {
+      ...passoTicketingBrowserLikeHeaders({ forNode: true }),
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+    };
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+      headers.InComingToken = token;
+      headers.IncomingToken = token;
+    }
+    const base = String(this.ticketingApiBase || '').replace(/\/+$/, '') || 'https://ticketingweb.passo.com.tr';
+    const enc = (v) => encodeURIComponent(String(v == null ? '' : v));
+    const reqMs = Math.min(25000, Math.max(8000, Number(this.timeoutMs) || 20000));
+    const lim = Math.max(1, Math.min(12, Number(effectivePc) || 4));
+    const acc = [];
+
+    for (let o = 0; o < blocks.length; o += lim) {
+      if (o > 0) {
+        const gapMs = blocks.length > 5 ? 160 : (blocks.length > 3 ? 110 : 70);
+        await delay(gapMs);
+      }
+      const slice = blocks.slice(o, o + lim);
+      const batch = await Promise.all(
+        slice.map(async (blockId) => {
+          const url = `${base}/api/passoweb/getseatstatus?eventId=${enc(eId)}&serieId=${enc(sId)}&blockId=${Number(blockId)}`;
+          try {
+            const res = await axios.get(url, {
+              headers,
+              timeout: reqMs,
+              validateStatus: () => true,
+              responseType: 'text',
+            });
+            const httpStatus = res.status;
+            const txt = typeof res.data === 'string' ? res.data : String(res.data || '');
+            const ct = String(res.headers?.['content-type'] || res.headers?.['Content-Type'] || '').toLowerCase();
+            if (httpStatus !== 200) {
+              let bodyPreview = null;
+              try {
+                if (/Attention Required!\s*\|\s*Cloudflare/i.test(txt) || /cf-error-details/i.test(txt)) {
+                  bodyPreview = '(Cloudflare HTML)';
+                } else {
+                  bodyPreview = txt.replace(/\s+/g, ' ').trim().slice(0, 400);
+                }
+              } catch (_) {}
+              return { blockId, seats: null, httpStatus, axiosError: null, bodyPreview };
+            }
+            if (!ct.includes('json')) {
+              return {
+                blockId,
+                seats: null,
+                httpStatus,
+                axiosError: null,
+                bodyPreview: txt.replace(/\s+/g, ' ').trim().slice(0, 400) || '(yanıt JSON değil)',
+              };
+            }
+            let data;
+            try {
+              data = JSON.parse(txt);
+            } catch {
+              return {
+                blockId,
+                seats: null,
+                httpStatus,
+                axiosError: null,
+                bodyPreview: txt.replace(/\s+/g, ' ').trim().slice(0, 400),
+              };
+            }
+            const seats = data.valueList || data.value || null;
+            return { blockId, seats, httpStatus: 200, axiosError: null, bodyPreview: null };
+          } catch (e) {
+            return {
+              blockId,
+              seats: null,
+              httpStatus: null,
+              axiosError: e && e.message ? String(e.message) : 'axios_failed',
+              bodyPreview: null,
+            };
+          }
+        })
+      );
+      for (const r of batch) acc.push(r);
+    }
+    return acc;
   }
 
   /**
@@ -291,10 +481,8 @@ class SeatCoordinator extends EventEmitter {
         blockIds.slice(i * chunkSize, (i + 1) * chunkSize)
       );
 
-      // getseatstatus: ticketingApiBase doluysa mutlak URL (www etkinlik sekmesinden CORS+credentials).
       const evId  = this.eventId;
       const seId  = this.serieId;
-      const apiBase = this.ticketingApiBase || '';
 
       const pc = this._effectivePollConcurrency != null ? this._effectivePollConcurrency : this.pollConcurrency;
 
@@ -313,13 +501,23 @@ class SeatCoordinator extends EventEmitter {
         try {
           if (!useSequentialAccounts && i > 0) await delay(90 + 110 * i);
 
+          if (this.pollTransport === 'node') {
+            const rows = await this._pollChunkNodeHttp(ctx, chunk, evId, seId, pc);
+            const list = Array.isArray(rows) ? rows : [];
+            for (const row of list) {
+              if (row.httpStatus === 200 && Array.isArray(row.seats)) {
+                row.bodyPreview = previewSeatStatusPayload({ valueList: row.seats }, 900);
+              }
+            }
+            return list;
+          }
+
           const rows = await evaluateSafe(
               page,
-              function browserPollGetSeatStatus(blocks, eId, sId, maxParallel, ticketingOrigin) {
+              function browserPollGetSeatStatus(blocks, eId, sId, maxParallel) {
                 function enc(v) {
                   return encodeURIComponent(String(v == null ? '' : v));
                 }
-                var apiRoot = String(ticketingOrigin || '').replace(/\/+$/, '');
                 function extractTokenString(v) {
                   if (!v || typeof v !== 'string') return '';
                   var s = v.trim();
@@ -372,6 +570,9 @@ class SeatCoordinator extends EventEmitter {
                     h.IncomingToken = token;
                     h.InComingToken = token;
                   }
+                  h.Accept = 'application/json, text/plain, */*';
+                  h['Content-Type'] = 'text/plain';
+                  h.Currentculture = 'tr-TR';
                   return h;
                 }
                 var lim = Math.max(1, Math.min(12, parseInt(maxParallel, 10) || 4));
@@ -386,8 +587,7 @@ class SeatCoordinator extends EventEmitter {
                     var batch = await Promise.all(slice.map(function (blockId) {
                       return (async function () {
                         try {
-                          var pathQs = '/api/passoweb/getseatstatus?eventId=' + enc(eId) + '&serieId=' + enc(sId) + '&blockId=' + Number(blockId);
-                          var url = apiRoot ? (apiRoot + pathQs) : pathQs;
+                          const url = '/api/passoweb/getseatstatus?eventId=' + enc(eId) + '&serieId=' + enc(sId) + '&blockId=' + Number(blockId);
                           var r;
                           var httpStatus;
                           var ct;
@@ -455,8 +655,7 @@ class SeatCoordinator extends EventEmitter {
               chunk,
               evId,
               seId,
-              pc,
-              apiBase
+              pc
             );
             const list = Array.isArray(rows) ? rows : [];
             for (const row of list) {

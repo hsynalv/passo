@@ -3448,20 +3448,28 @@ async function logSnipePassowebPollDebugBundle({
     const incomingTokenHeader = jwt;
 
     const postmanHeadersRaw = JSON.stringify({
+        Accept: 'application/json, text/plain, */*',
+        'Content-Type': 'text/plain',
+        Currentculture: 'tr-TR',
+        Referer: 'https://www.passo.com.tr/',
+        Origin: 'https://www.passo.com.tr',
         Cookie: cookieHeader,
         Authorization: authorizationHeader,
         InComingToken: incomingTokenHeader,
-        Accept: 'application/json, text/plain, */*',
     }, null, 2);
 
     const psEsc = (s) => String(s).replace(/'/g, "''");
     const powershellSnippet = jwt && cookieHeader
         ? `$uri = '${psEsc(getSeatStatusUrl)}'\n`
         + `$h = @{\n`
+        + `  Accept = 'application/json, text/plain, */*'\n`
+        + `  'Content-Type' = 'text/plain'\n`
+        + `  Currentculture = 'tr-TR'\n`
+        + `  Referer = 'https://www.passo.com.tr/'\n`
+        + `  Origin = 'https://www.passo.com.tr'\n`
         + `  Cookie = '${psEsc(cookieHeader)}'\n`
         + `  Authorization = '${psEsc(authorizationHeader)}'\n`
         + `  InComingToken = '${psEsc(incomingTokenHeader)}'\n`
-        + `  Accept = 'application/json, text/plain, */*'\n`
         + `}\n`
         + `(Invoke-WebRequest -Uri $uri -Headers $h -UseBasicParsing).Content`
         : '(jwt veya cookie bos — sayfa storage veya cookie toplamini kontrol et)';
@@ -13368,7 +13376,14 @@ async function launchSnipeAccountWithManagedProxy({
 
     if (useManualSingleBrowserOnly) {
         logger.info('startSnipe:proxy_selected_manual', { email, idx, proxy: `${manualProxyLaunchConfig.proxyHost}:${manualProxyLaunchConfig.proxyPort}` });
-        return launchAndLogin({ ...baseOpts, ...manualProxyLaunchConfig });
+        const r = await launchAndLogin({ ...baseOpts, ...manualProxyLaunchConfig });
+        r.snipeOutboundProxy = {
+            proxyHost: manualProxyLaunchConfig.proxyHost,
+            proxyPort: manualProxyLaunchConfig.proxyPort,
+            proxyUsername: manualProxyLaunchConfig.proxyUsername || '',
+            proxyPassword: manualProxyLaunchConfig.proxyPassword || '',
+        };
+        return r;
     }
 
     if (manualProxyLaunchConfig && !useManualSingleBrowserOnly) {
@@ -13415,6 +13430,12 @@ async function launchSnipeAccountWithManagedProxy({
                 if (activeProxy?.id) {
                     try { await proxyRepo.markLoginSuccess(activeProxy.id); } catch {}
                 }
+                result.snipeOutboundProxy = {
+                    proxyHost: opts.proxyHost,
+                    proxyPort: opts.proxyPort,
+                    proxyUsername: opts.proxyUsername || '',
+                    proxyPassword: opts.proxyPassword || '',
+                };
                 return result;
             } catch (error) {
                 if (error && error.code === 'RUN_KILLED') throw error;
@@ -13449,7 +13470,9 @@ async function launchSnipeAccountWithManagedProxy({
     }
 
     logger.info('startSnipe:proxy_skipped_direct_connection', { email, idx, reason: 'useProxyPool=false' });
-    return launchAndLogin(baseOpts);
+    const r0 = await launchAndLogin(baseOpts);
+    r0.snipeOutboundProxy = null;
+    return r0;
 }
 
 // ─── Snipe Mode ───────────────────────────────────────────────────────────────
@@ -13633,7 +13656,7 @@ async function startSnipe(req, res) {
                 }
 
                 // Poll için koltuk-secim'e GİTME — Passo SPA orada frame detach yapar.
-                // ticketingweb kökü /tr çoğu ortamda 403/404 HTML; sekme www etkinlikte kalır, getseatstatus mutlak API URL (CORS+credentials).
+                // getseatstatus: Node axios (CORS yok); sekme www etkinlikte kalır — ticketingweb HTML/403/404 acilmaz.
                 const seatSelectionUrl = String(eventAddress).replace(/\/+$/, '') + '/koltuk-secim';
                 const ticketingApiBaseForPoll = String(getCfg().TICKETING_API_BASE || 'https://ticketingweb.passo.com.tr').replace(/\/$/, '');
                 await Promise.allSettled(accountCtxList.map(async (ctx) => {
@@ -13648,11 +13671,11 @@ async function startSnipe(req, res) {
                             });
                         }
                         ctx.seatSelectionUrl = seatSelectionUrl;
-                        logger.info('startSnipe:account_at_event_page_poll', {
+                        logger.info('startSnipe:account_at_event_page', {
                             email: ctx.email,
                             url: eventAddress,
+                            pollTransport: 'node',
                             ticketingApiBase: ticketingApiBaseForPoll,
-                            note: 'getseatstatus cross-origin fetch; ticketingweb HTML acilmiyor',
                         });
                     } catch (e) {
                         logger.warn('startSnipe:account_navigate_failed', { email: ctx.email, error: e?.message });
@@ -13784,6 +13807,7 @@ async function startSnipe(req, res) {
                     filter: mergedFilter,
                     intervalMs, timeoutMs, pollConcurrency,
                     ticketingApiBase: ticketingApiBaseForPoll,
+                    pollTransport: 'node',
                 });
 
                 // Register all accounts as idle
