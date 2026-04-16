@@ -1,7 +1,6 @@
 'use strict';
 
 const EventEmitter = require('events');
-const axios = require('axios');
 const logger       = require('../utils/logger');
 const delay        = require('../utils/delay');
 const { evaluateSafe } = require('../utils/browserEval');
@@ -13,7 +12,8 @@ const {
 
 /**
  * Gerçek passo.com.tr (Network panel) ile hizalı ek başlıklar.
- * Not: Tarayıcıda `Origin` / `Referer` fetch ile script’ten set edilemez (forbidden); Node axios’ta eklenebilir.
+ * Not: Tarayıcıda `Origin` / `Referer` fetch ile script’ten set edilemez (forbidden); Node tarafında
+ * üretilen başlıklar page.evaluate(fetch) ile sayfaya iletilir.
  */
 function passoTicketingBrowserLikeHeaders({ forNode = false } = {}) {
   const h = {
@@ -29,61 +29,50 @@ function passoTicketingBrowserLikeHeaders({ forNode = false } = {}) {
 }
 
 /**
- * Tarayıcı `--proxy-server` ile aynı çıkışı Node axios’a verir (Cloudflare 403 / IP uyumsuzluğu).
- * @returns {{ httpAgent?: import('http').Agent, httpsAgent?: import('http').Agent, proxy: boolean } | { proxy: boolean }}
+ * ticketingweb koltuk listesi GET — Chromium fetch (Node axios değil); TLS + SOCKS tarayıcı ile aynı.
  */
-function buildAxiosAgentsFromSnipeOutboundProxy(snipeOutboundProxy) {
-  const none = { proxy: false };
-  const p = snipeOutboundProxy;
-  if (!p) return none;
-  const portFromOpts = String(p.proxyPort == null ? '' : p.proxyPort).trim();
-  if (!portFromOpts) return none;
-  const user = String(p.proxyUsername || '').trim();
-  const pass = String(p.proxyPassword || '').trim();
-  const auth =
-    user || pass ? `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@` : '';
-
-  let raw = String(p.proxyHost || '').trim();
-  if (!raw) return none;
-
-  let proto = 'socks5';
-  let hostname = '';
-  let port = portFromOpts;
-
-  if (/^(https?|socks4|socks5):\/\//i.test(raw)) {
-    try {
-      const normalized = raw.replace(/^socks5h:/i, 'socks5:');
-      const u = new URL(normalized);
-      proto = (u.protocol || 'socks5:').replace(/:$/, '').toLowerCase();
-      if (proto === 'socks5h') proto = 'socks5';
-      hostname = u.hostname;
-      if (u.port) port = u.port;
-    } catch {
-      return none;
-    }
-  } else {
-    hostname = raw.replace(/^\/+/, '');
+async function fetchPassoSeatListInPage(page, requestUrl, requestHeaders, requestTimeoutMs) {
+  const hdrs = {};
+  for (const [k, v] of Object.entries(requestHeaders || {})) {
+    if (v != null && String(v) !== '') hdrs[k] = String(v);
   }
-  if (!hostname) return none;
-
-  const hostPort = `${hostname}:${port}`;
-  try {
-    if (proto === 'socks4' || proto === 'socks5') {
-      const { SocksProxyAgent } = require('socks-proxy-agent');
-      const url = `${proto}://${auth}${hostPort}`;
-      const agent = new SocksProxyAgent(url);
-      return { httpAgent: agent, httpsAgent: agent, proxy: false };
-    }
-    if (proto === 'http' || proto === 'https') {
-      const { HttpsProxyAgent } = require('https-proxy-agent');
-      const proxyHttpUrl = `http://${auth}${hostPort}`;
-      const agent = new HttpsProxyAgent(proxyHttpUrl);
-      return { httpAgent: agent, httpsAgent: agent, proxy: false };
-    }
-  } catch (e) {
-    logger.warn('buildAxiosAgentsFromSnipeOutboundProxy:failed', { error: e?.message || String(e) });
-  }
-  return none;
+  const tmo = Math.min(60000, Math.max(5000, Number(requestTimeoutMs) || 20000));
+  return evaluateSafe(
+    page,
+    async (url, h, ms) => {
+      const ac = new AbortController();
+      const tid = setTimeout(() => ac.abort(), ms);
+      try {
+        const r = await fetch(url, {
+          method: 'GET',
+          credentials: 'include',
+          mode: 'cors',
+          cache: 'no-store',
+          signal: ac.signal,
+          headers: h,
+        });
+        clearTimeout(tid);
+        const txt = await r.text();
+        return {
+          httpStatus: r.status,
+          txt,
+          ct: String(r.headers.get('content-type') || '').toLowerCase(),
+          err: null,
+        };
+      } catch (e) {
+        clearTimeout(tid);
+        return {
+          httpStatus: null,
+          txt: '',
+          ct: '',
+          err: e && e.message ? String(e.message) : 'fetch_failed',
+        };
+      }
+    },
+    requestUrl,
+    hdrs,
+    tmo
+  );
 }
 
 /** Ham gövdeyi log / runStore için kısalt. */
@@ -164,7 +153,7 @@ function computeSnipeMinIntervalMs(blockCount, accountCount) {
  * Proaktif koltuk tarama motoru.
  *
  * Tasarım ilkeleri:
-   *  1. Multi-page polling   — `pollTransport: 'node'`: Node axios + sayfadan Cookie/JWT (CORS yok; sekme www’de kalabilir).
+   *  1. Multi-page polling   — `pollTransport: 'node'`: sayfada Chromium `fetch` + tam ticketingweb URL (TLS/proxy tarayıcı ile aynı; Cookie/JWT sayfadan).
    *     `pollTransport: 'browser'`: sayfa içi `fetch('/api/...')` — mümkünse ticketingweb / aynı origin; URL `getseats` veya `getseatsbyblockid`.
  *     Bloklar hesaplar arasında bölünür; her sekmede pollConcurrency kadar paralel,
  *     kalanı sırayla (429 / Cloudflare rate limit azaltma).
@@ -198,7 +187,7 @@ class SeatCoordinator extends EventEmitter {
    * @param {number}   [opts.timeoutMs=1800000]  30 dakika default
    * @param {number}   [opts.pollConcurrency=4]  Tek tick’te sekme başına eşzamanlı koltuk listesi isteği üst sınırı
    * @param {string}   [opts.ticketingApiBase=''] Node poll kökü (örn. https://ticketingweb.passo.com.tr); boşsa varsayılan.
-   * @param {string}   [opts.pollTransport='browser'] `browser` | `node` — snipe için `node` (www + axios).
+   * @param {string}   [opts.pollTransport='browser'] `browser` | `node` — snipe için `node` (www + Chromium fetch).
    * @param {string}   [opts.seatListPollMode='legacy'] `svg` → getseatsbyblockid; `legacy` → getseats (Passo web ile aynı).
    */
   constructor({
@@ -307,7 +296,7 @@ class SeatCoordinator extends EventEmitter {
       ...(this.pollTransport === 'node'
         ? {
             nodePollNote:
-              'getseats / getseatsbyblockid Node(axios); hesapta snipeOutboundProxy varsa axios ayni SOCKS/HTTP ile cikar (CF 403 onleme).',
+              'getseats / getseatsbyblockid: Chromium fetch (Node axios yok); SOCKS/proxy tarayici ile ayni TLS.',
           }
         : {}),
     });
@@ -353,7 +342,7 @@ class SeatCoordinator extends EventEmitter {
   }
 
   /**
-   * `getseats` (legacy) veya `getseatsbyblockid` (SVG) — Node axios (CORS yok). Cookie/JWT sayfadan.
+   * `getseats` (legacy) veya `getseatsbyblockid` (SVG) — sayfa içi Chromium fetch. Cookie/JWT sayfadan.
    */
   _buildSeatListPollUrl(blockId, seatCategoryId) {
     const base =
@@ -395,12 +384,11 @@ class SeatCoordinator extends EventEmitter {
       return { blockId, seatCategoryId };
     });
 
-    const axiosAgentOpts = buildAxiosAgentsFromSnipeOutboundProxy(ctx.snipeOutboundProxy);
-    if (axiosAgentOpts.httpsAgent && !ctx._snipeNodePollProxyLogged) {
-      ctx._snipeNodePollProxyLogged = true;
-      logger.info('SeatCoordinator:node_poll_uses_outbound_proxy', {
+    if (!ctx._snipeChromiumSeatPollLogged) {
+      ctx._snipeChromiumSeatPollLogged = true;
+      logger.info('SeatCoordinator:seat_list_poll_via_chromium_fetch', {
         email: ctx.email,
-        hasAuth: !!(ctx.snipeOutboundProxy?.proxyUsername || ctx.snipeOutboundProxy?.proxyPassword),
+        hasOutboundProxy: !!(ctx.snipeOutboundProxy && String(ctx.snipeOutboundProxy.proxyPort || '').trim()),
       });
     }
 
@@ -423,16 +411,19 @@ class SeatCoordinator extends EventEmitter {
           }
           const url = this._buildSeatListPollUrl(blockId, seatCategoryId);
           try {
-            const res = await axios.get(url, {
-              headers,
-              timeout: reqMs,
-              validateStatus: () => true,
-              responseType: 'text',
-              ...axiosAgentOpts,
-            });
-            const httpStatus = res.status;
-            const txt = typeof res.data === 'string' ? res.data : String(res.data || '');
-            const ct = String(res.headers?.['content-type'] || res.headers?.['Content-Type'] || '').toLowerCase();
+            const res = await fetchPassoSeatListInPage(page, url, headers, reqMs);
+            const httpStatus = res != null && res.httpStatus != null ? res.httpStatus : null;
+            const txt = typeof res?.txt === 'string' ? res.txt : String(res?.txt || '');
+            const ct = String(res?.ct || '').toLowerCase();
+            if (res?.err) {
+              return {
+                blockId,
+                seats: null,
+                httpStatus,
+                axiosError: String(res.err),
+                bodyPreview: null,
+              };
+            }
             if (httpStatus !== 200) {
               let bodyPreview = null;
               try {
@@ -472,7 +463,7 @@ class SeatCoordinator extends EventEmitter {
               blockId,
               seats: null,
               httpStatus: null,
-              axiosError: e && e.message ? String(e.message) : 'axios_failed',
+              axiosError: e && e.message ? String(e.message) : 'poll_fetch_failed',
               bodyPreview: null,
             };
           }
@@ -800,8 +791,8 @@ class SeatCoordinator extends EventEmitter {
         );
         if (this.pollTransport === 'node') {
           cf403Hint = hasOutProxy
-            ? 'ticketingweb: tüm yanıtlar 403 (Cloudflare). Axios tarayıcıyla aynı outbound proxy kullanıyor; buna rağmen 403 ise cookie/JWT veya ek CF kuralı deneyin.'
-            : 'ticketingweb: tüm yanıtlar 403 (Cloudflare). Node axios doğrudan makine IP ile çıktı (hesapta proxy yok); tarayıcı SOCKS ile çıkış farklı → CF sık bloklar. Snipe için proxy havuzu veya manuel SOCKS kullanın; axios bu proxy ile eşlenir.';
+            ? 'ticketingweb: tüm yanıtlar 403 (Cloudflare). Poll Chromium fetch ile; buna rağmen 403 ise cookie/JWT, seatCategoryId veya ek CF kuralı deneyin.'
+            : 'ticketingweb: tüm yanıtlar 403 (Cloudflare). Poll Chromium fetch ile; hesapta proxy yoksa çıkış IP tarayıcı ile aynıdır — yine 403 ise oturum/cookie veya istek parametreleri (seatCategoryId) kontrol edin.';
         } else {
           cf403Hint =
             'ticketingweb: tüm yanıtlar 403 (Cloudflare HTML). Sayfayı ticketing alanında yenile veya oturumu doğrula; hâlâ olmazsa IP/bölge kısıtı olabilir.';

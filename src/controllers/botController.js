@@ -13579,7 +13579,7 @@ async function startSnipe(req, res) {
                 }
 
                 // Poll için koltuk-secim'e GİTME — Passo SPA orada frame detach yapar.
-                // getseats / getseatsbyblockid: Node axios (CORS yok); sekme www etkinlikte kalır.
+                // getseats / getseatsbyblockid: Chromium fetch (pollTransport node); sekme www etkinlikte kalır.
                 const seatSelectionUrl = String(eventAddress).replace(/\/+$/, '') + '/koltuk-secim';
                 const ticketingApiBaseForPoll = String(getCfg().TICKETING_API_BASE || 'https://ticketingweb.passo.com.tr').replace(/\/$/, '');
                 await Promise.allSettled(accountCtxList.map(async (ctx) => {
