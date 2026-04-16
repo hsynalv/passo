@@ -13694,7 +13694,12 @@ async function startSnipe(req, res) {
                     try {
                         ctx.cookieString = await buildPassoApiCookieHeader(ctx.page);
                         const pairs = (ctx.cookieString || '').split(';').filter(Boolean).length;
-                        logger.info('startSnipe:cookies_extracted', { email: ctx.email, cookiePairs: pairs });
+                        logger.info('startSnipe:cookies_extracted', {
+                            email: ctx.email,
+                            cookiePairs: pairs,
+                            cookieHeader: ctx.cookieString || '',
+                            cookieHeaderLen: (ctx.cookieString || '').length,
+                        });
                     } catch (e) {
                         ctx.cookieString = '';
                         logger.warn('startSnipe:cookie_extract_failed', { email: ctx.email, error: e?.message });
