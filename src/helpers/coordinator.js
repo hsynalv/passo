@@ -430,24 +430,31 @@ class SeatCoordinator extends EventEmitter {
             });
             const { resource } = resp;
             const httpStatus = resource.httpStatusCode || null;
-            if (!resource.success) {
+            // Ağ hatası (DNS fail, connection refused vb.) — HTTP status yok
+            if (!resource.success && !httpStatus) {
               return {
-                blockId, seats: null, httpStatus,
+                blockId, seats: null, httpStatus: null,
                 axiosError: resource.netErrorName || 'cdp_net_error',
                 bodyPreview: null,
               };
             }
+            // HTTP yanıtı var (200, 403, 4xx, 5xx) — body'i her durumda oku (hata nedenini logla)
             let body = '';
             if (resource.stream) {
-              for (;;) {
-                const chunk = await client.send('IO.read', { handle: resource.stream, size: 65536 });
-                body += chunk.base64Encoded ? Buffer.from(chunk.data, 'base64').toString('utf8') : (chunk.data || '');
-                if (chunk.eof) break;
+              try {
+                for (;;) {
+                  const chunk = await client.send('IO.read', { handle: resource.stream, size: 65536 });
+                  body += chunk.base64Encoded ? Buffer.from(chunk.data, 'base64').toString('utf8') : (chunk.data || '');
+                  if (chunk.eof) break;
+                }
+              } finally {
+                await client.send('IO.close', { handle: resource.stream }).catch(() => {});
               }
-              await client.send('IO.close', { handle: resource.stream }).catch(() => {});
             }
             if (httpStatus !== 200) {
-              return { blockId, seats: null, httpStatus, axiosError: null, bodyPreview: body.slice(0, 400) };
+              const isCfBlock = /Sorry, you have been blocked|cf-error-details|Attention Required.*Cloudflare/i.test(body);
+              const bodyPreview = isCfBlock ? '(Cloudflare blok sayfası)' : body.replace(/\s+/g, ' ').trim().slice(0, 500);
+              return { blockId, seats: null, httpStatus, axiosError: null, bodyPreview };
             }
             try {
               const data = JSON.parse(body);
