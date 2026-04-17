@@ -367,6 +367,108 @@ class SeatCoordinator extends EventEmitter {
     return `${base}/api/passoweb/getseats?eventId=${enc(this.eventId)}&serieId=${enc(this.serieId || '')}&seatCategoryId=${sc}&blockId=${bid}`;
   }
 
+  /**
+   * CDP `Network.loadNetworkResource` ile poll — CORS yok, Chromium TLS, browser cookie jar.
+   * Sayfa www veya ticketingweb'de olsun fark etmez; Puppeteer CDP doğrudan gider.
+   */
+  async _pollChunkCdp(ctx, blocks, eId, sId, effectivePc) {
+    const page = ctx.page;
+    if (!page || typeof page.createCDPSession !== 'function') return [];
+
+    const token = await this._extractPollTokenFromPage(page);
+    const lim = Math.max(1, Math.min(8, Number(effectivePc) || 4));
+
+    let client;
+    let frameId;
+    try {
+      client = await page.createCDPSession();
+      const { frameTree } = await client.send('Page.getFrameTree');
+      frameId = frameTree.frame.id;
+    } catch (e) {
+      logger.warn('SeatCoordinator:cdp_init_failed', { email: ctx.email, error: e?.message });
+      return [];
+    }
+
+    const extraHeaders = {
+      Accept: 'application/json, text/plain, */*',
+      'Content-Type': 'text/plain',
+      Currentculture: 'tr-TR',
+      Referer: 'https://www.passo.com.tr/',
+      Origin: 'https://www.passo.com.tr',
+    };
+    if (token) {
+      extraHeaders.Authorization = `Bearer ${token}`;
+      extraHeaders.InComingToken = token;
+      extraHeaders.IncomingToken = token;
+    }
+
+    try { await client.send('Network.setExtraHTTPHeaders', { headers: extraHeaders }); } catch {}
+
+    const specs = (blocks || []).map((bid) => {
+      const blockId = Number(bid);
+      const meta = this.blockMap.get(blockId) || {};
+      const rawCat = meta.categoryId;
+      const seatCategoryId = rawCat != null && rawCat !== '' ? String(rawCat) : '';
+      return { blockId, seatCategoryId };
+    });
+
+    const results = [];
+    for (let o = 0; o < specs.length; o += lim) {
+      if (o > 0) await delay(100);
+      const slice = specs.slice(o, o + lim);
+      const batch = await Promise.all(
+        slice.map(async ({ blockId, seatCategoryId }) => {
+          if (!seatCategoryId) {
+            return { blockId, seats: null, httpStatus: null, axiosError: 'missing_seatCategoryId', bodyPreview: null };
+          }
+          const url = this._buildSeatListPollUrl(blockId, seatCategoryId);
+          try {
+            const resp = await client.send('Network.loadNetworkResource', {
+              frameId,
+              url,
+              options: { disableCache: true, includeCredentials: true },
+            });
+            const { resource } = resp;
+            const httpStatus = resource.httpStatusCode || null;
+            if (!resource.success) {
+              return {
+                blockId, seats: null, httpStatus,
+                axiosError: resource.netErrorName || 'cdp_net_error',
+                bodyPreview: null,
+              };
+            }
+            let body = '';
+            if (resource.stream) {
+              for (;;) {
+                const chunk = await client.send('IO.read', { handle: resource.stream, size: 65536 });
+                body += chunk.base64Encoded ? Buffer.from(chunk.data, 'base64').toString('utf8') : (chunk.data || '');
+                if (chunk.eof) break;
+              }
+              await client.send('IO.close', { handle: resource.stream }).catch(() => {});
+            }
+            if (httpStatus !== 200) {
+              return { blockId, seats: null, httpStatus, axiosError: null, bodyPreview: body.slice(0, 400) };
+            }
+            try {
+              const data = JSON.parse(body);
+              const seats = data.valueList || data.value || null;
+              return { blockId, seats, httpStatus: 200, axiosError: null, bodyPreview: null };
+            } catch {
+              return { blockId, seats: null, httpStatus, axiosError: 'json_parse_failed', bodyPreview: body.slice(0, 400) };
+            }
+          } catch (e) {
+            return { blockId, seats: null, httpStatus: null, axiosError: e?.message || 'cdp_error', bodyPreview: null };
+          }
+        })
+      );
+      for (const r of batch) results.push(r);
+    }
+
+    try { await client.send('Network.setExtraHTTPHeaders', { headers: {} }); } catch {}
+    try { await client.detach(); } catch {}
+    return results;
+  }
+
   async _pollChunkNodeHttp(ctx, blocks, eId, sId, effectivePc) {
     const page = ctx.page;
     if (!page) return [];
@@ -559,6 +661,19 @@ class SeatCoordinator extends EventEmitter {
 
           if (this.pollTransport === 'node') {
             const rows = await this._pollChunkNodeHttp(ctx, chunk, evId, seId, pc);
+            const list = Array.isArray(rows) ? rows : [];
+            for (const row of list) {
+              if (row.httpStatus === 200 && Array.isArray(row.seats)) {
+                row.bodyPreview = previewSeatStatusPayload({ valueList: row.seats }, 900);
+              }
+            }
+            return list;
+          }
+
+          // 'browser': CDP üzerinden — CORS yok, Chromium TLS, browser cookie jar.
+          // page.evaluate fetch'ten farklı olarak sayfanın nerede olduğundan bağımsız çalışır.
+          if (this.pollTransport === 'browser') {
+            const rows = await this._pollChunkCdp(ctx, chunk, evId, seId, pc);
             const list = Array.isArray(rows) ? rows : [];
             for (const row of list) {
               if (row.httpStatus === 200 && Array.isArray(row.seats)) {

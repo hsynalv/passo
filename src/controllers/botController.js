@@ -13578,29 +13578,27 @@ async function startSnipe(req, res) {
                     return;
                 }
 
-                // Browser fetch (credentials:include, absolute URL) kullanılır; CF Node axios'u bloklar.
-                // SVG: event sayfasından blok seçerek seatmap'e git; Legacy: kategori+blok → seatmap.
-                // Sayfa ticketingweb.passo.com.tr'de olunca CF cookie'leri otomatik eklenir.
+                // CDP (Network.loadNetworkResource) kullanılır: CORS yok, Chromium TLS, browser cookie jar.
+                // Sayfa www etkinlik sayfasında kalır; CDP sayfadan bağımsız istek atar.
                 const seatSelectionUrl = String(eventAddress).replace(/\/+$/, '') + '/koltuk-secim';
                 const ticketingApiBaseForPoll = String(getCfg().TICKETING_API_BASE || 'https://ticketingweb.passo.com.tr').replace(/\/$/, '');
                 await Promise.allSettled(accountCtxList.map(async (ctx) => {
                     try {
-                        // Seatmap sayfasına git: buradan browser fetch credentials:include ile
-                        // ticketingweb.passo.com.tr'ye gider; CF tarayıcıyı bloklamaz.
+                        // Etkinlik sayfasında kal; CDP doğrudan ticketingweb'e gider, CORS kısıtı yok.
                         let currentUrl = '';
                         try { currentUrl = ctx.page.url(); } catch {}
-                        const alreadyAtSeatmap = currentUrl.includes('/koltuk-secim') || currentUrl.includes('ticketingweb.passo.com.tr');
-                        if (!alreadyAtSeatmap) {
-                            await gotoWithRetry(ctx.page, seatSelectionUrl, {
+                        if (!currentUrl.includes('/etkinlik/')) {
+                            await gotoWithRetry(ctx.page, String(eventAddress), {
                                 retries: 2, waitUntil: 'domcontentloaded',
-                                rejectIfHome: false, backoffMs: 800,
+                                rejectIfHome: false, backoffMs: 600,
                             });
                         }
                         ctx.seatSelectionUrl = seatSelectionUrl;
-                        logger.info('startSnipe:account_at_seatmap', {
+                        logger.info('startSnipe:account_at_event_page', {
                             email: ctx.email,
-                            url: seatSelectionUrl,
+                            url: eventAddress,
                             pollTransport: 'browser',
+                            note: 'cdp_poll',
                             ticketingApiBase: ticketingApiBaseForPoll,
                         });
                     } catch (e) {
