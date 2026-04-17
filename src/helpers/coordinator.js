@@ -578,8 +578,18 @@ class SeatCoordinator extends EventEmitter {
 
           const pollToken = await this._extractPollTokenFromPage(page);
           const ticketingBase = String(this.ticketingApiBase || '').replace(/\/+$/, '') || 'https://ticketingweb.passo.com.tr';
+          // ticketingweb.passo.com.tr frame varsa (koltuk-secim iframe), oradan same-origin fetch.
+          // Yoksa main page'den cross-origin; credentials:include ile değil (ACAO:* ile uyumsuz).
+          let evalTarget = page;
+          try {
+            const frames = typeof page.frames === 'function' ? page.frames() : [];
+            const tw = frames.find((f) => {
+              try { return (f.url?.() || '').includes('ticketingweb.passo.com.tr'); } catch { return false; }
+            });
+            if (tw) evalTarget = tw;
+          } catch {}
           const rows = await evaluateSafe(
-              page,
+              evalTarget,
               function browserPollSeatList(blockSpecs, eId, sId, maxParallel, pollModeStr, preResolvedToken, ticketingApiBase) {
                 function enc(v) {
                   return encodeURIComponent(String(v == null ? '' : v));
@@ -631,9 +641,15 @@ class SeatCoordinator extends EventEmitter {
                           var httpStatus;
                           var ct;
                           var lastErrText = '';
+                          // Cross-origin: credentials:'include' + ACAO:* → CORS hata.
+                          // 'same-origin' (varsayılan) kullan: same-origin'de cookie gider,
+                          // cross-origin'de gitmez ama ACAO:* ile bloklanmaz. Auth header'da token var.
+                          var isSameOrigin = (typeof location !== 'undefined') &&
+                            String(ticketingApiBase).replace(/\/+$/, '').replace(/^https?:\/\//, '') === location.hostname;
+                          var credMode = isSameOrigin ? 'include' : 'same-origin';
                           for (var attempt = 0; attempt < 2; attempt++) {
                             var hdrs = buildPassoFetchHeaders();
-                            var init = { credentials: 'include', cache: 'no-store' };
+                            var init = { credentials: credMode, cache: 'no-store' };
                             if (hdrs && Object.keys(hdrs).length) init.headers = hdrs;
                             r = await fetch(url, init);
                             httpStatus = r.status;
