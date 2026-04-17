@@ -320,13 +320,6 @@ class SeatCoordinator extends EventEmitter {
     this._running = false;
     if (this._timer) { clearInterval(this._timer); this._timer = null; }
     if (this._abortCtrl) { this._abortCtrl.abort(); this._abortCtrl = null; }
-    // Poll sayfalarını kapat (ticketingweb sekmesi per hesap)
-    for (const ctx of [...this._idlePool, ...this._busyPool]) {
-      if (ctx._pollPage) {
-        ctx._pollPage.close().catch(() => {});
-        ctx._pollPage = null;
-      }
-    }
     logger.info('SeatCoordinator:stopped', { eventId: this.eventId, totalDispatched: this._totalDispatched });
     this.emit('stopped');
   }
@@ -484,62 +477,28 @@ class SeatCoordinator extends EventEmitter {
   }
 
   /**
-   * ticketingweb.passo.com.tr domain'inde yaşayan ayrı bir Puppeteer sekmesi döndürür.
-   * Aynı browser context → aynı cookie jar (CF clearance paylaşılır).
-   * Same-origin fetch → CORS yok, Authorization header serbestçe eklenebilir.
+   * www.passo.com.tr sayfasından cross-origin fetch + CDP Fetch.enable interceptor ile auth header enjeksiyonu.
+   *
+   * Sorun: ticketingweb.passo.com.tr'ye doğrudan sekme navigate etmek CF'i tetikler (API domain, doğrudan
+   * tarayıcı erişimine kapalı). CDP loadNetworkResource iç kanal kullandığından setExtraHTTPHeaders uygulanmaz.
+   *
+   * Çözüm:
+   *  1. JS fetch sadece Accept headerı ile istek atar (GET + basit header = preflight yok).
+   *  2. Browser otomatik Origin: https://www.passo.com.tr ekler → CF WAF bu origin'e izin verir.
+   *  3. CDP Fetch.enable interceptor network katmanında Authorization + Cookie + diğer auth headerları ekler.
+   *  4. CF sunucuya: Origin✓ + CF cookie✓ + auth header → izin.
+   *  5. Server: ACAO:* döner; JS fetch credentials:omit (default) → CORS geçer.
    */
-  async _ensurePollPage(ctx) {
-    if (ctx._pollPage) {
-      try {
-        if (typeof ctx._pollPage.isClosed === 'function' && !ctx._pollPage.isClosed()) {
-          return ctx._pollPage;
-        }
-      } catch {}
-      ctx._pollPage = null;
-    }
-    try {
-      const browser = typeof ctx.page.browser === 'function' ? ctx.page.browser() : null;
-      if (!browser || typeof browser.newPage !== 'function') return null;
+  async _pollChunkBrowserIntercept(ctx, blocks, eId, sId, effectivePc) {
+    const page = ctx.page;
+    if (!page || typeof page.createCDPSession !== 'function') return [];
 
-      const pp = await browser.newPage();
-      // ticketingweb domain'ine navigate et — CF cookie'leri shared context'ten gelir.
-      // Sayfa içeriği önemli değil; origin = ticketingweb.passo.com.tr olması yeterli.
-      try {
-        await pp.goto('https://ticketingweb.passo.com.tr/', {
-          waitUntil: 'domcontentloaded',
-          timeout: 12000,
-        });
-      } catch {}
+    const token = await this._extractPollTokenFromPage(page);
+    let cookieHeader = '';
+    try { cookieHeader = await buildPassoApiCookieHeader(page); } catch {}
 
-      const finalUrl = typeof pp.url === 'function' ? pp.url() : '';
-      if (!finalUrl.includes('ticketingweb.passo.com.tr')) {
-        logger.warn('SeatCoordinator:poll_page_wrong_origin', {
-          email: ctx.email,
-          finalUrl,
-          note: 'ticketingweb.passo.com.tr redirect oldu — poll_page kullanılamaz',
-        });
-        await pp.close().catch(() => {});
-        return null;
-      }
-      ctx._pollPage = pp;
-      logger.info('SeatCoordinator:poll_page_created', { email: ctx.email, url: finalUrl });
-      return pp;
-    } catch (e) {
-      logger.warn('SeatCoordinator:poll_page_create_failed', { email: ctx.email, error: e?.message });
-      return null;
-    }
-  }
-
-  /**
-   * ticketingweb.passo.com.tr'deki ayrı sekmeden same-origin fetch ile koltuk listesi çeker.
-   * Gerçek Chromium TLS + shared CF cookie jar + açık Authorization header → 403 bitmeli.
-   */
-  async _pollChunkPollPage(ctx, blocks, eId, sId, effectivePc) {
-    const pollPage = await this._ensurePollPage(ctx);
-    if (!pollPage) return [];
-
-    const token = await this._extractPollTokenFromPage(ctx.page);
-    const lim   = Math.max(1, Math.min(8, Number(effectivePc) || 4));
+    const lim = Math.max(1, Math.min(8, Number(effectivePc) || 4));
+    const ticketingBase = String(this.ticketingApiBase || '').replace(/\/+$/, '') || 'https://ticketingweb.passo.com.tr';
 
     const chunkSpecs = blocks.map((bid) => {
       const blockId = Number(bid);
@@ -549,28 +508,49 @@ class SeatCoordinator extends EventEmitter {
       return { blockId, seatCategoryId };
     });
 
-    let rows;
+    let client;
+    let fetchEnabled = false;
     try {
-      rows = await evaluateSafe(
-        pollPage,
+      client = await page.createCDPSession();
+
+      // Sadece ticketingweb isteklerini yakala (request aşamasında)
+      await client.send('Fetch.enable', {
+        patterns: [{ urlPattern: 'https://ticketingweb.passo.com.tr/*', requestStage: 'Request' }],
+      });
+      fetchEnabled = true;
+
+      // Her yakalanan ticketingweb isteğine auth + cookie headerları enjekte et
+      client.on('Fetch.requestPaused', async ({ requestId, request }) => {
+        try {
+          const inject = [];
+          inject.push({ name: 'Content-Type',   value: 'text/plain' });
+          inject.push({ name: 'Currentculture', value: 'tr-TR' });
+          if (token) {
+            inject.push({ name: 'Authorization', value: `Bearer ${token}` });
+            inject.push({ name: 'InComingToken',  value: token });
+            inject.push({ name: 'IncomingToken',  value: token });
+          }
+          if (cookieHeader) {
+            inject.push({ name: 'Cookie', value: cookieHeader });
+          }
+          // Var olan headerları koru; bizimkilerle çakışanları yenileriyle değiştir
+          const injectKeys = new Set(inject.map(h => h.name.toLowerCase()));
+          const existing = Object.entries(request.headers || {})
+            .filter(([k]) => !injectKeys.has(k.toLowerCase()))
+            .map(([k, v]) => ({ name: k, value: v }));
+          await client.send('Fetch.continueRequest', { requestId, headers: [...existing, ...inject] });
+        } catch {
+          try { await client.send('Fetch.failRequest', { requestId, errorReason: 'Failed' }); } catch {}
+        }
+      });
+
+      const rows = await evaluateSafe(
+        page,
         /* istanbul ignore next */
-        function pollPageSeatList(blockSpecs, eId, sId, maxParallel, pollModeStr, tok) {
+        function interceptedFetchSeatList(blockSpecs, eId, sId, maxParallel, pollModeStr, base) {
           function enc(v) { return encodeURIComponent(String(v == null ? '' : v)); }
           var lim  = Math.max(1, Math.min(12, parseInt(maxParallel, 10) || 4));
           var mode = String(pollModeStr || 'legacy').toLowerCase() === 'svg' ? 'svg' : 'legacy';
-          var token = String(tok || '').trim();
-          var hdrs = {
-            'Accept': 'application/json, text/plain, */*',
-            'Content-Type': 'text/plain',
-            'Currentculture': 'tr-TR',
-            'Referer': 'https://www.passo.com.tr/',
-            'Origin': 'https://www.passo.com.tr',
-          };
-          if (token) {
-            hdrs['Authorization']  = 'Bearer ' + token;
-            hdrs['IncomingToken']  = token;
-            hdrs['InComingToken']  = token;
-          }
           return (async function () {
             var acc = [];
             for (var o = 0; o < blockSpecs.length; o += lim) {
@@ -578,17 +558,19 @@ class SeatCoordinator extends EventEmitter {
               var slice = blockSpecs.slice(o, o + lim);
               var batch = await Promise.all(slice.map(function (spec) {
                 return (async function () {
-                  var blockId  = spec.blockId;
-                  var seatCat  = String(spec.seatCategoryId || '');
+                  var blockId = spec.blockId;
+                  var seatCat = String(spec.seatCategoryId || '');
                   if (!seatCat) {
                     return { blockId: blockId, seats: null, httpStatus: null, axiosError: 'missing_seatCategoryId', bodyPreview: null };
                   }
-                  // Relative URL — sayfa ticketingweb.passo.com.tr'de, same-origin.
+                  // Sadece Accept ile basit GET — preflight tetiklenmiyor.
+                  // Authorization + Cookie CDP interceptor tarafından network katmanında ekleniyor.
+                  // Browser Origin: https://www.passo.com.tr otomatik ekliyor → CF WAF izin veriyor.
                   var url = mode === 'svg'
-                    ? '/api/passoweb/getseatsbyblockid?eventId=' + enc(eId) + '&serieId=' + enc(sId) + '&seatCategoryId=' + enc(seatCat) + '&blockId=' + Number(blockId) + '&campaignId=undefined'
-                    : '/api/passoweb/getseats?eventId='          + enc(eId) + '&serieId=' + enc(sId) + '&seatCategoryId=' + enc(seatCat) + '&blockId=' + Number(blockId);
+                    ? base + '/api/passoweb/getseatsbyblockid?eventId=' + enc(eId) + '&serieId=' + enc(sId) + '&seatCategoryId=' + enc(seatCat) + '&blockId=' + Number(blockId) + '&campaignId=undefined'
+                    : base + '/api/passoweb/getseats?eventId='          + enc(eId) + '&serieId=' + enc(sId) + '&seatCategoryId=' + enc(seatCat) + '&blockId=' + Number(blockId);
                   try {
-                    var r = await fetch(url, { credentials: 'include', headers: hdrs, cache: 'no-store' });
+                    var r = await fetch(url, { headers: { Accept: 'application/json, text/plain, */*' } });
                     var httpStatus = r.status;
                     if (httpStatus !== 200) {
                       var body = ''; try { body = await r.text(); } catch {}
@@ -607,21 +589,23 @@ class SeatCoordinator extends EventEmitter {
             return acc;
           })();
         },
-        chunkSpecs, eId, sId, lim, this.seatListPollMode, token,
+        chunkSpecs, eId, sId, lim, this.seatListPollMode, ticketingBase,
       );
-    } catch (e) {
-      logger.warn('SeatCoordinator:poll_page_eval_failed', { email: ctx.email, error: e?.message });
-      ctx._pollPage = null; // bir sonraki tick'te yeniden oluşturulur
-      return [];
-    }
 
-    const list = Array.isArray(rows) ? rows : [];
-    for (const row of list) {
-      if (row.httpStatus === 200 && Array.isArray(row.seats)) {
-        row.bodyPreview = previewSeatStatusPayload({ valueList: row.seats }, 900);
+      const list = Array.isArray(rows) ? rows : [];
+      for (const row of list) {
+        if (row.httpStatus === 200 && Array.isArray(row.seats)) {
+          row.bodyPreview = previewSeatStatusPayload({ valueList: row.seats }, 900);
+        }
       }
+      return list;
+    } catch (e) {
+      logger.warn('SeatCoordinator:browser_intercept_failed', { email: ctx.email, error: e?.message });
+      return [];
+    } finally {
+      if (fetchEnabled && client) { try { await client.send('Fetch.disable'); } catch {} }
+      if (client)                 { try { await client.detach(); }             catch {} }
     }
-    return list;
   }
 
   async _pollChunkNodeHttp(ctx, blocks, eId, sId, effectivePc) {
@@ -825,10 +809,10 @@ class SeatCoordinator extends EventEmitter {
             return list;
           }
 
-          // 'browser': ticketingweb.passo.com.tr'de ayrı sekme → same-origin fetch.
-          // Gerçek Chromium TLS + shared CF cookie jar + auth header → CF bypass.
+          // 'browser': www.passo.com.tr'den cross-origin fetch + CDP Fetch interceptor ile auth enjeksiyonu.
+          // CF WAF: Origin: https://www.passo.com.tr → izin. CORS: ACAO:* + no-credentials → geçer.
           if (this.pollTransport === 'browser') {
-            const rows = await this._pollChunkPollPage(ctx, chunk, evId, seId, pc);
+            const rows = await this._pollChunkBrowserIntercept(ctx, chunk, evId, seId, pc);
             const list = Array.isArray(rows) ? rows : [];
             for (const row of list) {
               if (row.httpStatus === 200 && Array.isArray(row.seats)) {
