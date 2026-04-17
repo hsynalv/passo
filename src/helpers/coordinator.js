@@ -320,6 +320,13 @@ class SeatCoordinator extends EventEmitter {
     this._running = false;
     if (this._timer) { clearInterval(this._timer); this._timer = null; }
     if (this._abortCtrl) { this._abortCtrl.abort(); this._abortCtrl = null; }
+    // Poll sayfalarını kapat (ticketingweb sekmesi per hesap)
+    for (const ctx of [...this._idlePool, ...this._busyPool]) {
+      if (ctx._pollPage) {
+        ctx._pollPage.close().catch(() => {});
+        ctx._pollPage = null;
+      }
+    }
     logger.info('SeatCoordinator:stopped', { eventId: this.eventId, totalDispatched: this._totalDispatched });
     this.emit('stopped');
   }
@@ -474,6 +481,147 @@ class SeatCoordinator extends EventEmitter {
     try { await client.send('Network.setExtraHTTPHeaders', { headers: {} }); } catch {}
     try { await client.detach(); } catch {}
     return results;
+  }
+
+  /**
+   * ticketingweb.passo.com.tr domain'inde yaşayan ayrı bir Puppeteer sekmesi döndürür.
+   * Aynı browser context → aynı cookie jar (CF clearance paylaşılır).
+   * Same-origin fetch → CORS yok, Authorization header serbestçe eklenebilir.
+   */
+  async _ensurePollPage(ctx) {
+    if (ctx._pollPage) {
+      try {
+        if (typeof ctx._pollPage.isClosed === 'function' && !ctx._pollPage.isClosed()) {
+          return ctx._pollPage;
+        }
+      } catch {}
+      ctx._pollPage = null;
+    }
+    try {
+      const browser = typeof ctx.page.browser === 'function' ? ctx.page.browser() : null;
+      if (!browser || typeof browser.newPage !== 'function') return null;
+
+      const pp = await browser.newPage();
+      // ticketingweb domain'ine navigate et — CF cookie'leri shared context'ten gelir.
+      // Sayfa içeriği önemli değil; origin = ticketingweb.passo.com.tr olması yeterli.
+      try {
+        await pp.goto('https://ticketingweb.passo.com.tr/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 12000,
+        });
+      } catch {}
+
+      const finalUrl = typeof pp.url === 'function' ? pp.url() : '';
+      if (!finalUrl.includes('ticketingweb.passo.com.tr')) {
+        logger.warn('SeatCoordinator:poll_page_wrong_origin', {
+          email: ctx.email,
+          finalUrl,
+          note: 'ticketingweb.passo.com.tr redirect oldu — poll_page kullanılamaz',
+        });
+        await pp.close().catch(() => {});
+        return null;
+      }
+      ctx._pollPage = pp;
+      logger.info('SeatCoordinator:poll_page_created', { email: ctx.email, url: finalUrl });
+      return pp;
+    } catch (e) {
+      logger.warn('SeatCoordinator:poll_page_create_failed', { email: ctx.email, error: e?.message });
+      return null;
+    }
+  }
+
+  /**
+   * ticketingweb.passo.com.tr'deki ayrı sekmeden same-origin fetch ile koltuk listesi çeker.
+   * Gerçek Chromium TLS + shared CF cookie jar + açık Authorization header → 403 bitmeli.
+   */
+  async _pollChunkPollPage(ctx, blocks, eId, sId, effectivePc) {
+    const pollPage = await this._ensurePollPage(ctx);
+    if (!pollPage) return [];
+
+    const token = await this._extractPollTokenFromPage(ctx.page);
+    const lim   = Math.max(1, Math.min(8, Number(effectivePc) || 4));
+
+    const chunkSpecs = blocks.map((bid) => {
+      const blockId = Number(bid);
+      const meta = this.blockMap.get(blockId) || {};
+      const rawCat = meta.categoryId;
+      const seatCategoryId = rawCat != null && rawCat !== '' ? String(rawCat) : '';
+      return { blockId, seatCategoryId };
+    });
+
+    let rows;
+    try {
+      rows = await evaluateSafe(
+        pollPage,
+        /* istanbul ignore next */
+        function pollPageSeatList(blockSpecs, eId, sId, maxParallel, pollModeStr, tok) {
+          function enc(v) { return encodeURIComponent(String(v == null ? '' : v)); }
+          var lim  = Math.max(1, Math.min(12, parseInt(maxParallel, 10) || 4));
+          var mode = String(pollModeStr || 'legacy').toLowerCase() === 'svg' ? 'svg' : 'legacy';
+          var token = String(tok || '').trim();
+          var hdrs = {
+            'Accept': 'application/json, text/plain, */*',
+            'Content-Type': 'text/plain',
+            'Currentculture': 'tr-TR',
+            'Referer': 'https://www.passo.com.tr/',
+            'Origin': 'https://www.passo.com.tr',
+          };
+          if (token) {
+            hdrs['Authorization']  = 'Bearer ' + token;
+            hdrs['IncomingToken']  = token;
+            hdrs['InComingToken']  = token;
+          }
+          return (async function () {
+            var acc = [];
+            for (var o = 0; o < blockSpecs.length; o += lim) {
+              if (o > 0) await new Promise(function (r) { setTimeout(r, 100); });
+              var slice = blockSpecs.slice(o, o + lim);
+              var batch = await Promise.all(slice.map(function (spec) {
+                return (async function () {
+                  var blockId  = spec.blockId;
+                  var seatCat  = String(spec.seatCategoryId || '');
+                  if (!seatCat) {
+                    return { blockId: blockId, seats: null, httpStatus: null, axiosError: 'missing_seatCategoryId', bodyPreview: null };
+                  }
+                  // Relative URL — sayfa ticketingweb.passo.com.tr'de, same-origin.
+                  var url = mode === 'svg'
+                    ? '/api/passoweb/getseatsbyblockid?eventId=' + enc(eId) + '&serieId=' + enc(sId) + '&seatCategoryId=' + enc(seatCat) + '&blockId=' + Number(blockId) + '&campaignId=undefined'
+                    : '/api/passoweb/getseats?eventId='          + enc(eId) + '&serieId=' + enc(sId) + '&seatCategoryId=' + enc(seatCat) + '&blockId=' + Number(blockId);
+                  try {
+                    var r = await fetch(url, { credentials: 'include', headers: hdrs, cache: 'no-store' });
+                    var httpStatus = r.status;
+                    if (httpStatus !== 200) {
+                      var body = ''; try { body = await r.text(); } catch {}
+                      return { blockId: blockId, seats: null, httpStatus: httpStatus, axiosError: null, bodyPreview: body.replace(/\s+/g, ' ').trim().slice(0, 400) || null };
+                    }
+                    var data  = await r.json();
+                    var seats = (data && (data.valueList || data.value)) || null;
+                    return { blockId: blockId, seats: seats, httpStatus: 200, axiosError: null, bodyPreview: null };
+                  } catch (e) {
+                    return { blockId: blockId, seats: null, httpStatus: null, axiosError: e ? String(e.message || 'fetch_failed') : 'fetch_failed', bodyPreview: null };
+                  }
+                })();
+              }));
+              for (var j = 0; j < batch.length; j++) acc.push(batch[j]);
+            }
+            return acc;
+          })();
+        },
+        chunkSpecs, eId, sId, lim, this.seatListPollMode, token,
+      );
+    } catch (e) {
+      logger.warn('SeatCoordinator:poll_page_eval_failed', { email: ctx.email, error: e?.message });
+      ctx._pollPage = null; // bir sonraki tick'te yeniden oluşturulur
+      return [];
+    }
+
+    const list = Array.isArray(rows) ? rows : [];
+    for (const row of list) {
+      if (row.httpStatus === 200 && Array.isArray(row.seats)) {
+        row.bodyPreview = previewSeatStatusPayload({ valueList: row.seats }, 900);
+      }
+    }
+    return list;
   }
 
   async _pollChunkNodeHttp(ctx, blocks, eId, sId, effectivePc) {
@@ -677,10 +825,10 @@ class SeatCoordinator extends EventEmitter {
             return list;
           }
 
-          // 'browser': CDP üzerinden — CORS yok, Chromium TLS, browser cookie jar.
-          // page.evaluate fetch'ten farklı olarak sayfanın nerede olduğundan bağımsız çalışır.
+          // 'browser': ticketingweb.passo.com.tr'de ayrı sekme → same-origin fetch.
+          // Gerçek Chromium TLS + shared CF cookie jar + auth header → CF bypass.
           if (this.pollTransport === 'browser') {
-            const rows = await this._pollChunkCdp(ctx, chunk, evId, seId, pc);
+            const rows = await this._pollChunkPollPage(ctx, chunk, evId, seId, pc);
             const list = Array.isArray(rows) ? rows : [];
             for (const row of list) {
               if (row.httpStatus === 200 && Array.isArray(row.seats)) {
